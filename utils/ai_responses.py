@@ -8,6 +8,16 @@ logger = logging.getLogger(__name__)
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
+FALLBACK_MODELS = [
+    "deepseek/deepseek-chat-v3-0324:free",
+    "deepseek/deepseek-chat:free",
+    "google/gemini-2.5-flash-preview:free",
+    "google/gemini-2.0-flash-exp:free",
+    "meta-llama/llama-4-maverick:free",
+    "qwen/qwen3-235b-a22b:free",
+    "mistralai/mistral-small-3.1-24b-instruct:free",
+]
+
 response_cache = TTLCache(maxsize=100, ttl=300)
 image_prompt_cache = TTLCache(maxsize=50, ttl=600)
 
@@ -44,6 +54,25 @@ async def get_llm_response(user_prompt: str, system_prompt: str, model: str, api
             if response.status_code == 429:
                 logger.warning("Превышен лимит API")
                 return "Слишком много запросов! Дай мне минутку передохнуть..."
+                
+            if response.status_code != 200:
+                logger.error(f"OpenRouter API error {response.status_code}: {response.text[:500]}")
+                if response.status_code in (400, 404):
+                    for fallback_model in FALLBACK_MODELS:
+                        if fallback_model == model:
+                            continue
+                        logger.info(f"Пробуем модель: {fallback_model}")
+                        payload["model"] = fallback_model
+                        response = await client.post(OPENROUTER_URL, json=payload, headers=headers)
+                        if response.status_code == 200:
+                            data = response.json()
+                            result = data["choices"][0]["message"]["content"]
+                            response_cache[cache_key] = result[:2000]
+                            logger.info(f"Модель {fallback_model} работает!")
+                            return result
+                        else:
+                            logger.error(f"Модель {fallback_model} тоже не работает: {response.status_code}")
+                    return "Все модели временно недоступны. Попробуй позже!"
                 
             response.raise_for_status()
             data = response.json()
