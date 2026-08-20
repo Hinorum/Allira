@@ -168,6 +168,12 @@ def main():
             handle_message
         ))
 
+    # Обработчик сообщений в групповых чатах
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.GROUPS & ~filters.COMMAND,
+        handle_message
+    ))
+
     # Обработчик личных сообщений
     application.add_handler(MessageHandler(
         filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
