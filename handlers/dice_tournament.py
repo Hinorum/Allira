@@ -637,7 +637,7 @@ async def end_registration_and_start_round(update: Update, context: ContextTypes
         return
     
     if not state["active"]:
-        msg_text = "Турнир не активен. Начни новый через /start_tournament."</
+        msg_text = "Турнир не активен. Начни новый через /start_tournament."
         try:
             await message_to_interact_with.edit_text(msg_text, reply_markup=None)
         except Exception: # Если редактирование не удалось
