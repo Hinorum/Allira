@@ -19,7 +19,7 @@ from threading import Thread
 # Инициализация модулей
 from utils.common import setup_logging
 from prompts.loader import preload_all_prompts
-from handlers.start_command import start_command
+from handlers.start_command import start_command, help_command, show_help_callback
 from handlers.message_handler import handle_message, handle_private_message
 from handlers.dice_tournament import (
     start_dice_tournament_registration,
@@ -141,10 +141,14 @@ def main():
 
     # Регистрация обработчиков команд
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("start_tournament", start_dice_tournament_registration))
     application.add_handler(CommandHandler("stop_tournament", stop_tournament_command))
 
-    # Callback обработчики для турнира
+    # Callback обработчики
+    application.add_handler(CallbackQueryHandler(
+        show_help_callback, pattern="^show_help$"
+    ))
     application.add_handler(CallbackQueryHandler(
         start_tournament_from_menu, pattern="^start_tournament_from_menu$"
     ))

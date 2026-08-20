@@ -27,32 +27,32 @@ dice_tournament_state = {
 def get_tournament_status_message() -> str:
     """Формирует сообщение о текущем статусе турнира."""
     if not dice_tournament_state["active"]:
-        return "🎲 Турнир на кубиках не активен."
+        return "=> Турнир не активен. Запусти через /start_tournament"
 
     state = dice_tournament_state
-    message_lines = [f"🎲 **Турнир на Кубиках - Раунд {state['current_round']}** 🎲\n"]
+    message_lines = [f"🎲 **АРЕНА КУБИКОВ — Раунд {state['current_round']}** 🎲\n"]
 
     if state["registration_open"]:
-        message_lines.append("⚡️ **Регистрация открыта!** Нажмите 'Участвовать', чтобы присоединиться.")
+        message_lines.append("**Регистрация открыта!** Жми 'Войти на арену' чтобы войти в игру.")
         if state["players"]:
-            message_lines.append("\nУже зарегистрированы:")
+            message_lines.append("\n**На арене:**")
             for user_id, data in state["players"].items():
-                message_lines.append(f" - {data['username']} (Очки: {data.get('total_score', 0)})")
+                message_lines.append(f"    -> {data['username']} (Очки: {data.get('total_score', 0)})")
         else:
-            message_lines.append("\nПока нет зарегистрированных игроков.")
+            message_lines.append("\n_Пока пусто. Будь первым._")
         
         if len(state["players"]) >= 2:
-            message_lines.append("\n\n_Администратор может завершить набор и начать турнир, нажав соответствующую кнопку._")
+            message_lines.append("\n\n_Админ: жми 'Завершить набор' когда все готовы._")
         else:
-            message_lines.append("\n\n_Нужно как минимум 2 игрока для начала турнира._")
+            message_lines.append("\n\n_Нужно минимум 2 игрока._")
 
     else: # Registration is closed
         mode_text = "Не выбран"
         if state['tournament_mode'] == 'pair_match':
-            mode_text = "Парные поединки (1 на 1)"
+            mode_text = "1 на 1"
         elif state['tournament_mode'] == 'all_vs_all':
-            mode_text = "Каждый против каждого"
-        message_lines.append(f"🏆 **Режим:** {mode_text}")
+            mode_text = "Все против всех"
+        message_lines.append(f"**Режим:** {mode_text}")
 
         active_players_list = []
         eliminated_players_list = []
@@ -73,29 +73,29 @@ def get_tournament_status_message() -> str:
                         # roll_info = "" 
 
             if data.get("is_eliminated"):
-                eliminated_players_list.append(f"❌ {data['username']} (выбыл в раунде {data.get('eliminated_round', 'N/A')})")
+                eliminated_players_list.append(f"    ❌ {data['username']} (р. {data.get('eliminated_round', '?')})")
             else:
-                active_players_list.append(f"🟢 {data['username']} (Очки: {data.get('total_score', 0)}{roll_info})")
+                active_players_list.append(f"    {data['username']} — {data.get('total_score', 0)} очк.{roll_info}")
         
         if active_players_list:
-            message_lines.append("\n**Активные игроки:**")
+            message_lines.append("\n**На арене:**")
             message_lines.extend(active_players_list)
         else:
             if state["current_round"] > 0 and not any(not p_data.get("is_eliminated") for p_data in state["players"].values()):
-                message_lines.append("\n**Все игроки выбыли. Турнир завершен.**")
-            elif state["current_round"] == 0: # Should not happen if registration is closed and round 0
-                message_lines.append("\n**Ожидание начала первого раунда...**")
+                message_lines.append("\n_Все выбыли. Турнир окончен._")
+            elif state["current_round"] == 0:
+                message_lines.append("\n_Ждём начала..._")
             else:
-                message_lines.append("\n**Активных игроков нет.**")
+                message_lines.append("\n_Никого на арене._")
 
 
         if eliminated_players_list:
-            message_lines.append("\n**Выбывшие игроки:**")
+            message_lines.append("\n**Выбывшие:**")
             message_lines.extend(eliminated_players_list)
 
         if state["current_round"] > 0 and not state["registration_open"]:
             if state["tournament_mode"] == "pair_match" and state["round_matches"]:
-                message_lines.append("\n**Текущие матчи:**")
+                message_lines.append("\n**Матчи:**")
                 for p1_id, p2_id in state["round_matches"]:
                     p1_data = state["players"].get(p1_id, {})
                     p2_data = state["players"].get(p2_id, {})
@@ -103,21 +103,21 @@ def get_tournament_status_message() -> str:
                     p2_name = p2_data.get("username", "Игрок2")
                     p1_roll = state["player_rolls_in_round"].get(p1_id, "?")
                     p2_roll = state["player_rolls_in_round"].get(p2_id, "?")
-                    match_status = f" - {p1_name} ({p1_roll}) vs {p2_name} ({p2_roll})"
+                    match_status = f"    {p1_name} ({p1_roll}) vs {p2_name} ({p2_roll})"
                     
                     if p1_id in state["player_rolls_in_round"] and p2_id in state["player_rolls_in_round"]:
                         if p1_roll > p2_roll:
-                            match_status += f" → Победитель: {p1_name}"
+                            match_status += f" -> {p1_name} побеждает"
                         elif p2_roll > p1_roll:
-                            match_status += f" → Победитель: {p2_name}"
+                            match_status += f" -> {p2_name} побеждает"
                         else:
-                            match_status += " → Ничья! Переигровка"
+                            match_status += " -> Ничья"
                     
                     message_lines.append(match_status)
             
             if state.get("player_with_bye"):
                 player_bye_name = state["players"].get(state["player_with_bye"], {}).get("username", "Игрок")
-                message_lines.append(f"\n{player_bye_name} проходит в следующий раунд без игры (бай).")
+                message_lines.append(f"\n{player_bye_name} проходит без игры (бай).")
 
             if state["active_players_in_round"]:
                 waiting_for_roll_users = [
@@ -126,16 +126,16 @@ def get_tournament_status_message() -> str:
                     if pid in state["players"] # Ensure player data exists
                 ]
                 if waiting_for_roll_users:
-                    message_lines.append(f"\nОжидаем бросок от: {', '.join(waiting_for_roll_users)}")
+                    message_lines.append(f"\n_Ждём броска от: {', '.join(waiting_for_roll_users)}_")
             elif not state["active_players_in_round"] and any(not p_data.get("is_eliminated") for p_data in state["players"].values()):
                  # All players have rolled, or it's the start of a new round after results
                  # Check if more than 1 player remains to offer "Start Next Round"
                 remaining_active_players = sum(1 for p_data in state["players"].values() if not p_data.get("is_eliminated"))
                 if remaining_active_players > 1:
-                     message_lines.append("\n\n_Администратор может начать следующий раунд._")
+                     message_lines.append("\n\n_Админ, жми 'Следующий раунд'._")
                 elif remaining_active_players == 1:
                     winner_name = [p['username'] for p in state["players"].values() if not p.get("is_eliminated")][0]
-                    message_lines.append(f"\n\n**Турнир близится к завершению! Победитель: {winner_name}**")
+                    message_lines.append(f"\n\n**Почти готово. Финалист: {winner_name}**")
 
 
     return "\n".join(message_lines)
@@ -169,23 +169,23 @@ async def update_tournament_message(context: ContextTypes.DEFAULT_TYPE, chat_id_
         buttons = []
 
         if state["registration_open"]:
-            buttons.append([InlineKeyboardButton("Участвовать 🚀", callback_data="register_for_tournament")])
+            buttons.append([InlineKeyboardButton("Войти на арену", callback_data="register_for_tournament")])
             # Кнопка для администратора для завершения регистрации
             # Эту кнопку должен видеть только администратор, но проверка user_id здесь затруднительна.
             # Предполагаем, что обработчик callback_data="end_registration_and_start_round" проверит права администратора.
             if len(state["players"]) >= 2:
-                buttons.append([InlineKeyboardButton("Завершить набор и выбрать режим ⚙️", callback_data="end_registration_and_start_round")])
+                buttons.append([InlineKeyboardButton("Завершить набор", callback_data="end_registration_and_start_round")])
             reply_markup = InlineKeyboardMarkup(buttons)
         
         elif state["active"] and not state["registration_open"]: # Регистрация закрыта, турнир идет
             if state["active_players_in_round"]: # Если есть игроки, которые должны бросить кубик
-                buttons.append([InlineKeyboardButton("Бросить кубик 🎲", callback_data="make_tournament_roll")])
+                buttons.append([InlineKeyboardButton("Бросить кубик", callback_data="make_tournament_roll")])
                 reply_markup = InlineKeyboardMarkup(buttons)
             else: # Все бросили кубики в текущем раунде или раунд еще не начался (после выбора режима)
                 active_players_count = sum(1 for p_data in state["players"].values() if not p_data.get("is_eliminated"))
                 if active_players_count > 1 and state["current_round"] > 0 : # Если есть активные игроки и это не первый раунд (где режим только что выбран)
                     # Кнопка для администратора для начала следующего раунда
-                    buttons.append([InlineKeyboardButton("Начать следующий раунд ➡️", callback_data="end_registration_and_start_round")])
+                    buttons.append([InlineKeyboardButton("Следующий раунд", callback_data="end_registration_and_start_round")])
                     reply_markup = InlineKeyboardMarkup(buttons)
                 elif active_players_count <=1 and state["current_round"] > 0:
                     # Турнир завершен или есть победитель, кнопки не нужны, будет сообщение о завершении
@@ -216,12 +216,12 @@ async def update_tournament_message(context: ContextTypes.DEFAULT_TYPE, chat_id_
                     new_reply_markup = None
                     new_buttons = []
                     if state["registration_open"]:
-                        new_buttons.append([InlineKeyboardButton("Участвовать 🚀", callback_data="register_for_tournament")])
+                        new_buttons.append([InlineKeyboardButton("Войти на арену", callback_data="register_for_tournament")])
                         if len(state["players"]) >= 2:
-                             new_buttons.append([InlineKeyboardButton("Завершить набор и выбрать режим ⚙️", callback_data="end_registration_and_start_round")])
+                             new_buttons.append([InlineKeyboardButton("Завершить набор", callback_data="end_registration_and_start_round")])
                         new_reply_markup = InlineKeyboardMarkup(new_buttons)
                     elif state["active"] and not state["registration_open"] and state["active_players_in_round"]:
-                         new_buttons.append([InlineKeyboardButton("Бросить кубик 🎲", callback_data="make_tournament_roll")])
+                         new_buttons.append([InlineKeyboardButton("Бросить кубик", callback_data="make_tournament_roll")])
                          new_reply_markup = InlineKeyboardMarkup(new_buttons)
                     # ... (добавить другие состояния для кнопок при необходимости)
 
@@ -247,7 +247,7 @@ async def announce_round_results(context: ContextTypes.DEFAULT_TYPE):
         return
 
     round_num = state["current_round"]
-    message_lines = [f"--- **Результаты Раунда {round_num}** ---\n"]
+    message_lines = [f"**=> Итоги раунда {round_num}:**\n"]
     eliminated_this_round_ids = set()
 
     if state["tournament_mode"] == "pair_match":
@@ -283,8 +283,8 @@ async def announce_round_results(context: ContextTypes.DEFAULT_TYPE):
             if p1_roll == p2_roll:
                 rematch_matches.append((p1_id, p2_id))
                 message_lines.append(
-                    f"⚔️ {p1_data['username']} ({p1_roll}) vs {p2_data['username']} ({p2_roll}) -> "
-                    f"Ничья! Переигровка в следующем раунде."
+                    f"    {p1_data['username']} ({p1_roll}) vs {p2_data['username']} ({p2_roll}) -> "
+                    f"Ничья"
                 )
             elif p1_roll > p2_roll:
                 state["players"][p1_id]["total_score"] += 1
@@ -292,9 +292,8 @@ async def announce_round_results(context: ContextTypes.DEFAULT_TYPE):
                 state["players"][p2_id]["eliminated_round"] = round_num
                 eliminated_this_round_ids.add(p2_id)
                 message_lines.append(
-                    f"⚔️ {p1_data['username']} ({p1_roll}) vs {p2_data['username']} ({p2_roll}) -> "
-                    f"Победитель: **{p1_data['username']}**! "
-                    f"{p2_data['username']} выбывает."
+                    f"    {p1_data['username']} ({p1_roll}) vs {p2_data['username']} ({p2_roll}) -> "
+                    f"**{p1_data['username']}** побеждает"
                 )
             else: # p2_roll > p1_roll
                 state["players"][p2_id]["total_score"] += 1
@@ -302,9 +301,8 @@ async def announce_round_results(context: ContextTypes.DEFAULT_TYPE):
                 state["players"][p1_id]["eliminated_round"] = round_num
                 eliminated_this_round_ids.add(p1_id)
                 message_lines.append(
-                    f"⚔️ {p1_data['username']} ({p1_roll}) vs {p2_data['username']} ({p2_roll}) -> "
-                    f"Победитель: **{p2_data['username']}**! "
-                    f"{p1_data['username']} выбывает."
+                    f"    {p1_data['username']} ({p1_roll}) vs {p2_data['username']} ({p2_roll}) -> "
+                    f"**{p2_data['username']}** побеждает"
                 )
         
         state["round_matches"] = rematch_matches # Обновляем список матчей (только для переигровок)
@@ -320,10 +318,10 @@ async def announce_round_results(context: ContextTypes.DEFAULT_TYPE):
         else:
             active_round_players.sort(key=lambda x: state["player_rolls_in_round"].get(x["user_id"], 0))
             
-            message_lines.append("\n**Результаты бросков (Каждый против каждого):**")
+            message_lines.append("\n**Броски:**")
             for p_data in active_round_players:
                 roll = state["player_rolls_in_round"].get(p_data["user_id"], "?")
-                message_lines.append(f" - {p_data['username']}: {roll}")
+                message_lines.append(f"    {p_data['username']}: {roll}")
                 # В режиме "все против всех" очки могут начисляться по-другому, например, за сам бросок или за позицию.
                 # Текущая логика просто +1 очко за участие в раунде. Это можно изменить.
                 state["players"][p_data["user_id"]]["total_score"] += 1 
@@ -349,11 +347,11 @@ async def announce_round_results(context: ContextTypes.DEFAULT_TYPE):
                         eliminated_names_this_round.append(p_data_to_elim["username"])
                 
                 if eliminated_names_this_round:
-                    message_lines.append(f"\n🚫 Выбывают: {', '.join(eliminated_names_this_round)}")
-                elif len(active_round_players) > 1 : # Если никого не выбили, но игроки есть
-                    message_lines.append("\nВ этом раунде никто не выбывает (по результатам бросков).")
+                    message_lines.append(f"\n_Выбывают: {', '.join(eliminated_names_this_round)}_")
+                elif len(active_round_players) > 1:
+                    message_lines.append("\n_Никто не выбывает._")
             elif len(active_round_players) <=2 and len(active_round_players) > 0 :
-                 message_lines.append("\nВ этом раунде никто не выбывает (мало игроков).")
+                 message_lines.append("\n_Мало игроков — все проходят._")
 
 
     await context.bot.send_message(chat_id=chat_id, text="\n".join(message_lines), parse_mode="Markdown")
@@ -397,7 +395,7 @@ async def end_tournament(context: ContextTypes.DEFAULT_TYPE, winner_data: dict =
         logger.error("end_tournament: chat_id не найден.")
         return
 
-    message = "**🎉 Турнир на Кубиках ЗАВЕРШЕН! 🎉**\n\n"
+    message = "**=> ИГРА ОКОНЧЕНА**\n\n"
     
     final_winner = None
     if winner_data and not winner_data.get("is_eliminated"):
@@ -420,14 +418,13 @@ async def end_tournament(context: ContextTypes.DEFAULT_TYPE, winner_data: dict =
 
 
     if final_winner:
-        message += f"🌟 **Победитель:** {final_winner['username']} с {final_winner.get('total_score', 0)} очками!"
-    elif not state["players"]: # Если вообще не было игроков
-        message += "Турнир завершен, но не было зарегистрировано ни одного игрока."
-    else: # Если есть игроки, но победитель не ясен (например, несколько невыбывших с одинаковыми очками - маловероятно с текущей логикой)
-        message += "Турнир завершен. Победитель не определен однозначно или все игроки выбыли."
-        # Можно добавить вывод таблицы лидеров
+        message += f"**Чемпион:** {final_winner['username']} — {final_winner.get('total_score', 0)} очков. Заслуженно. 👑"
+    elif not state["players"]:
+        message += "Никто не пришёл. Пустая арена — грустно."
+    else:
+        message += "Победитель не определён. Все выбыли — хаос."
         if state["players"]:
-            message += "\n\n**Итоговая таблица:**\n"
+            message += "\n\n**Таблица:**\n"
             sorted_players = sorted(state["players"].values(), key=lambda p: p.get("total_score", 0), reverse=True)
             for p_data in sorted_players:
                 status = "выбыл" if p_data.get("is_eliminated") else "активен"
@@ -453,6 +450,18 @@ async def end_tournament(context: ContextTypes.DEFAULT_TYPE, winner_data: dict =
 
 
     logger.info(f"Турнир в чате {chat_id} завершен. Сброс состояния.")
+    
+    # Снимаем закрепление сообщения турнира
+    if message_id and chat_id:
+        try:
+            await context.bot.unpin_chat_message(
+                chat_id=chat_id,
+                message_id=message_id
+            )
+            logger.info(f"Сообщение турнира откреплено в чате {chat_id}")
+        except Exception as unpin_err:
+            logger.warning(f"Не удалось открепить сообщение турнира: {unpin_err}")
+    
     # Сброс состояния турнира
     dice_tournament_state.clear()
     dice_tournament_state.update({
@@ -487,7 +496,7 @@ async def start_dice_tournament_registration(update: Update, context: ContextTyp
 
     if dice_tournament_state["active"]:
         existing_admin = dice_tournament_state.get("admin_user_id")
-        reply_text = f"Турнир уже активен (администратор: ID {existing_admin}). Сначала завершите текущий турнир (/stop_tournament)."
+        reply_text = f"=> Турнир уже идёт. Сначала заверши текущий (/stop_tournament)."
         if message_to_reply:
             await message_to_reply.reply_text(reply_text)
         elif chat_id: # Если нет message_to_reply, но есть chat_id
@@ -506,7 +515,7 @@ async def start_dice_tournament_registration(update: Update, context: ContextTyp
     status_message_text = get_tournament_status_message()
     
     # Кнопки для начального сообщения
-    initial_buttons = [[InlineKeyboardButton("Участвовать 🚀", callback_data="register_for_tournament")]]
+    initial_buttons = [[InlineKeyboardButton("Войти на арену", callback_data="register_for_tournament")]]
     # Кнопка "Завершить набор" появится, когда будет >= 2 игроков, через update_tournament_message
 
     initial_reply_markup = InlineKeyboardMarkup(initial_buttons)
@@ -539,13 +548,25 @@ async def start_dice_tournament_registration(update: Update, context: ContextTyp
             )
             dice_tournament_state["tournament_message_id"] = sent_message.message_id
         
+        # Закрепляем сообщение турнира
+        if dice_tournament_state.get("tournament_message_id") and chat_id:
+            try:
+                await context.bot.pin_chat_message(
+                    chat_id=chat_id,
+                    message_id=dice_tournament_state["tournament_message_id"],
+                    disable_notification=True
+                )
+                logger.info(f"Сообщение турнира закреплено в чате {chat_id}")
+            except Exception as pin_err:
+                logger.warning(f"Не удалось закрепить сообщение турнира: {pin_err}")
+        
         logger.info(f"Регистрация на турнир начата в чате {chat_id} администратором {user_id}. ID сообщения: {dice_tournament_state['tournament_message_id']}")
 
     except Exception as e:
         logger.error(f"Ошибка при отправке начального сообщения турнира: {e}", exc_info=True)
         # Попытка уведомить пользователя об ошибке, если возможно
         if chat_id:
-            await context.bot.send_message(chat_id=chat_id, text="Не удалось начать турнир. Попробуйте позже.")
+            await context.bot.send_message(chat_id=chat_id, text="=> Что-то пошло не так. Попробуй позже.")
 
 
 async def register_for_tournament(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -572,7 +593,7 @@ async def register_for_tournament(update: Update, context: ContextTypes.DEFAULT_
         return
 
     if user.id in state["players"]:
-        await query.answer(f"{user.first_name}, вы уже зарегистрированы!", show_alert=False)
+        await query.answer(f"{user.first_name}, ты уже на арене!", show_alert=False)
     else:
         state["players"][user.id] = {
             "user_id": user.id,
@@ -583,7 +604,7 @@ async def register_for_tournament(update: Update, context: ContextTypes.DEFAULT_
             "is_eliminated": False,
             "eliminated_round": 0,
         }
-        await query.answer(f"Вы зарегистрированы, {user.first_name}!", show_alert=False)
+        await query.answer(f"{user.first_name}, ты на арене!", show_alert=False)
         logger.info(f"Пользователь {user.first_name} ({user.id}) зарегистрировался на турнир.")
         await update_tournament_message(context, chat_id_override=query.message.chat_id, message_id_override=query.message.message_id)
 
@@ -612,11 +633,11 @@ async def end_registration_and_start_round(update: Update, context: ContextTypes
     
     state = dice_tournament_state
     if user_id != state.get("admin_user_id"):
-        await query.answer("Только администратор турнира может выполнять это действие.", show_alert=True)
+        await query.answer("Только админ может это сделать.", show_alert=True)
         return
     
     if not state["active"]:
-        msg_text = "Турнир не активен. Начните новый с /start_tournament или через меню /start."
+        msg_text = "Турнир не активен. Начни новый через /start_tournament."</
         try:
             await message_to_interact_with.edit_text(msg_text, reply_markup=None)
         except Exception: # Если редактирование не удалось
@@ -626,18 +647,18 @@ async def end_registration_and_start_round(update: Update, context: ContextTypes
     # --- Сценарий 1: Завершение регистрации и выбор режима ---
     if state["registration_open"]:
         if len(state["players"]) < 2:
-            await query.answer("Недостаточно игроков для начала турнира (нужно минимум 2).", show_alert=True)
-            # Сообщение не меняем, чтобы кнопка "Участвовать" осталась
+            await query.answer("Мало игроков (нужно минимум 2).", show_alert=True)
+            # Сообщение не меняем, чтобы кнопка "Войти на арену" осталась
             return
 
         state["registration_open"] = False # Закрываем регистрацию
         logger.info(f"Регистрация завершена администратором {user_id}.")
         
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Парные поединки (1 на 1)", callback_data="set_tournament_mode:pair_match")],
-            [InlineKeyboardButton("Каждый против каждого", callback_data="set_tournament_mode:all_vs_all")]
+            [InlineKeyboardButton("1 на 1", callback_data="set_tournament_mode:pair_match")],
+            [InlineKeyboardButton("Все против всех", callback_data="set_tournament_mode:all_vs_all")]
         ])
-        msg_to_send = "Регистрация завершена! ✅\n\nТеперь выберите режим турнира:"
+        msg_to_send = "=> Набор окончен. Выбирай режим:"
         try:
             await message_to_interact_with.edit_text(text=msg_to_send, reply_markup=keyboard, parse_mode="Markdown")
         except Exception as e:
@@ -686,7 +707,7 @@ async def end_registration_and_start_round(update: Update, context: ContextTypes
                 bye_player_name = state["players"].get(state["player_with_bye"], {}).get("username", "Игрок")
                 await context.bot.send_message(
                     chat_id=message_to_interact_with.chat_id, # Отправляем в чат турнира
-                    text=f"ℹ️ В раунде {round_num} игрок {bye_player_name} получает 'бай' и проходит дальше автоматически."
+                    text=f"_{bye_player_name} получает бай и проходит автоматически._"
                 )
                 logger.info(f"Игрок {state['player_with_bye']} ({bye_player_name}) получает 'бай' в раунде {round_num}.")
             
@@ -711,7 +732,7 @@ async def end_registration_and_start_round(update: Update, context: ContextTypes
 
     # Если ни один из сценариев не подошел (маловероятно при правильной логике кнопок)
     logger.warning(f"end_registration_and_start_round: Неопределенное состояние турнира для пользователя {user_id}. State: {state}")
-    await query.answer("Не удалось определить действие. Проверьте состояние турнира.", show_alert=True)
+    await query.answer("Что-то пошло не так. Проверь состояние турнира.", show_alert=True)
 
 
 async def set_tournament_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -727,22 +748,22 @@ async def set_tournament_mode(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     state = dice_tournament_state
     if user_id != state.get("admin_user_id"):
-        await query.edit_message_text("Только администратор, запустивший турнир, может выбрать режим.", reply_markup=None)
+        await query.edit_message_text("Только админ может выбрать режим.", reply_markup=None)
         return
     
     if state["tournament_mode"] is not None: # Режим уже установлен
-        await query.edit_message_text(f"Режим турнира уже установлен: {state['tournament_mode']}. Чтобы изменить, перезапустите турнир.", reply_markup=None)
+        await query.edit_message_text(f"Режим уже выбран: {state['tournament_mode']}. Перезапусти турнир, чтобы изменить.", reply_markup=None)
         return
     
     if state["registration_open"]: # Регистрация еще не закрыта
-        await query.edit_message_text("Сначала завершите регистрацию игроков.", reply_markup=None)
+        await query.edit_message_text("Сначала заверши набор игроков.", reply_markup=None)
         return
 
     try:
         _, mode = query.data.split(":")
     except ValueError:
         logger.error(f"Ошибка разбора callback_data для set_tournament_mode: {query.data}")
-        await query.edit_message_text("Ошибка выбора режима. Попробуйте снова.", reply_markup=None)
+        await query.edit_message_text("Ошибка. Попробуй снова.", reply_markup=None)
         return
 
     state["tournament_mode"] = mode
@@ -755,7 +776,7 @@ async def set_tournament_mode(update: Update, context: ContextTypes.DEFAULT_TYPE
     ]
     
     if not active_player_ids or len(active_player_ids) < 2: # Проверка на случай, если все игроки "выбыли" до начала
-        await query.edit_message_text("Нет достаточного количества активных игроков для начала турнира.", reply_markup=None)
+        await query.edit_message_text("Мало игроков. Турнир не может начаться.", reply_markup=None)
         await end_tournament(context) # Завершаем турнир, так как играть некому
         return
 
@@ -775,7 +796,7 @@ async def set_tournament_mode(update: Update, context: ContextTypes.DEFAULT_TYPE
             # Отправляем отдельное сообщение о "бай", так как edit_message_text перезатрет его
             await context.bot.send_message(
                 chat_id=query.message.chat_id,
-                text=f"ℹ️ Нечетное количество игроков. {bye_player_name} получает 'бай' в раунде {round_num} и проходит дальше автоматически."
+                text=f"_{bye_player_name} получает бай и проходит автоматически._"
             )
             logger.info(f"Игрок {state['player_with_bye']} ({bye_player_name}) получает 'бай' в раунде {round_num}.")
 
@@ -806,17 +827,17 @@ async def make_tournament_roll(update: Update, context: ContextTypes.DEFAULT_TYP
     
     state = dice_tournament_state
     if not state["active"] or state["registration_open"]:
-        await query.answer("Турнир не активен или еще идет регистрация.", show_alert=True)
+        await query.answer("Турнир не начат или регистрация открыта.", show_alert=True)
         return
 
     if user.id not in state["players"] or state["players"][user.id].get("is_eliminated"):
-        await query.answer(f"{user.first_name}, вы не участвуете в этом раунде или уже выбыли.", show_alert=True)
+        await query.answer(f"{user.first_name}, ты не в этом раунде или уже выбыл.", show_alert=True)
         return
 
     if user.id not in state["active_players_in_round"]:
         # Проверяем, может игрок уже бросил кубик
         if user.id in state["player_rolls_in_round"]:
-            await query.answer(f"{user.first_name}, вы уже сделали бросок в этом раунде: {state['player_rolls_in_round'][user.id]}.", show_alert=True)
+            await query.answer(f"{user.first_name}, ты уже бросил: {state['player_rolls_in_round'][user.id]}.", show_alert=True)
         else:
             await query.answer(f"{user.first_name}, сейчас не ваша очередь бросать или вы не участвуете в текущем матче/раунде.", show_alert=True)
         return
@@ -841,7 +862,7 @@ async def make_tournament_roll(update: Update, context: ContextTypes.DEFAULT_TYP
         # Сообщаем о результате броска (можно сделать reply на сообщение с кубиком)
         await context.bot.send_message(
             chat_id=query.message.chat_id,
-            text=f"🎲 {user.first_name} бросил(а) кубик и получил(а): **{dice_value}**!",
+            text=f"_{user.first_name} бросил кубик: **{dice_value}**!_",
             reply_to_message_id=dice_message.message_id, # Отвечаем на сам кубик
             parse_mode="Markdown"
         )
@@ -854,7 +875,7 @@ async def make_tournament_roll(update: Update, context: ContextTypes.DEFAULT_TYP
             logger.info(f"Все игроки ({list(state['player_rolls_in_round'].keys())}) сделали броски в раунде {state['current_round']}.")
             await context.bot.send_message(
                 chat_id=query.message.chat_id,
-                text=f"Все активные игроки сделали броски в раунде {state['current_round']}! Подведение итогов..."
+                text=f"Все бросили в раунде {state['current_round']}. Подсчитываю..."
             )
             await asyncio.sleep(2) # Небольшая задержка для наглядности
             await announce_round_results(context)
@@ -878,15 +899,15 @@ async def stop_tournament_command(update: Update, context: ContextTypes.DEFAULT_
     state = dice_tournament_state
 
     if not state["active"]:
-        await update.message.reply_text("Нет активного турнира для остановки.")
+        await update.message.reply_text("Нет активного турнира.")
         return
 
     if user_id != state.get("admin_user_id"):
-        await update.message.reply_text("Только администратор, запустивший турнир, может его остановить.")
+        await update.message.reply_text("Только админ может остановить турнир.")
         return
 
     logger.info(f"Администратор {user_id} останавливает турнир в чате {state.get('tournament_chat_id')}.")
     # end_tournament отправит сообщение о завершении и сбросит состояние
     await end_tournament(context, winner_data=None) # Передаем None, так как это принудительная остановка
     # Дополнительное сообщение о том, что турнир остановлен администратором, если end_tournament не достаточно ясно это говорит
-    await update.message.reply_text("Турнир был принудительно остановлен администратором.")
+    await update.message.reply_text("Турнир остановлен.")
