@@ -42,9 +42,9 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "deepseek/deepseek-chat:free")
-FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "meta-llama/llama-4-maverick:free")
-LANE_MODEL = os.getenv("LANE_MODEL", "google/gemini-2.5-flash-preview:free")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
+FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
+LANE_MODEL = os.getenv("LANE_MODEL", "google/gemma-4-31b-it:free")
 NEWS_CHANNEL_ID = os.getenv("NEWS_CHANNEL_ID")
 PORT = int(os.getenv("PORT", "10000"))
 
@@ -64,31 +64,6 @@ def home():
 @flask_app.route('/health')
 def health():
     return "OK", 200
-
-@flask_app.route('/models')
-def list_models():
-    import httpx
-    api_key = os.getenv("OPENROUTER_API_KEY", "")
-    if not api_key:
-        return "No API key", 500
-    try:
-        r = httpx.get(
-            'https://openrouter.ai/api/v1/models',
-            headers={'Authorization': f'Bearer {api_key}'},
-            timeout=30
-        )
-        if r.status_code != 200:
-            return f"API error: {r.status_code} {r.text[:200]}", 500
-        data = r.json()
-        free = [m['id'] for m in data.get('data', []) if ':free' in m['id']]
-        free.sort()
-        lines = [f"<h2>Free models ({len(free)}):</h2><ul>"]
-        for m in free:
-            lines.append(f"<li><code>{m}</code></li>")
-        lines.append("</ul>")
-        return "\n".join(lines), 200
-    except Exception as e:
-        return f"Error: {e}", 500
 
 def run_flask():
     """Запуск Flask сервера для health-check"""

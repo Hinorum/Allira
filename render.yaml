@@ -22,11 +22,11 @@ services:
       - key: WEBHOOK_SECRET_TOKEN
         sync: false
       - key: DEFAULT_MODEL
-        value: "deepseek/deepseek-chat:free"
+        value: "nvidia/nemotron-3-super-120b-a12b:free"
       - key: LANE_MODEL
-        value: "google/gemini-2.5-flash-preview:free"
+        value: "google/gemma-4-31b-it:free"
       - key: FALLBACK_MODEL
-        value: "meta-llama/llama-4-maverick:free"
+        value: "nvidia/nemotron-3-ultra-550b-a55b:free"
       - key: PORT
         value: "10000"
       - key: LOG_LEVEL

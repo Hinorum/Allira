@@ -9,13 +9,11 @@ logger = logging.getLogger(__name__)
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 FALLBACK_MODELS = [
-    "deepseek/deepseek-chat-v3-0324:free",
-    "deepseek/deepseek-chat:free",
-    "google/gemini-2.5-flash-preview:free",
-    "google/gemini-2.0-flash-exp:free",
-    "meta-llama/llama-4-maverick:free",
-    "qwen/qwen3-235b-a22b:free",
-    "mistralai/mistral-small-3.1-24b-instruct:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "google/gemma-4-31b-it:free",
+    "z-ai/glm-5.2:free",
+    "nvidia/nemotron-3.5-lightning:free",
 ]
 
 response_cache = TTLCache(maxsize=100, ttl=300)
