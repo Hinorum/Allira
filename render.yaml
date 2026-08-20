@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: allira-bot
+    env: python
+    region: frankfurt
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python main.py
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.11"
+      - key: BOT_TOKEN
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: PEXELS_API_KEY
+        sync: false
+      - key: NEWS_CHANNEL_ID
+        sync: false
+      - key: WEBHOOK_SECRET_TOKEN
+        sync: false
+      - key: DEFAULT_MODEL
+        value: "deepseek/deepseek-chat-v3-0324:free"
+      - key: LANE_MODEL
+        value: "google/gemini-2.0-flash-exp:free"
+      - key: FALLBACK_MODEL
+        value: "qwen/qwen3-235b-a22b:free"
+      - key: PORT
+        value: "10000"
+      - key: LOG_LEVEL
+        value: "INFO"
+      - key: TZ
+        value: "Europe/Moscow"
