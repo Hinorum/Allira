@@ -1,5 +1,6 @@
 import logging
 import re
+import random
 from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
@@ -8,6 +9,8 @@ from utils.ai_responses import get_llm_response, decide_speaker
 from prompts.loader import load_prompt
 
 logger = logging.getLogger(__name__)
+
+RESPONSE_CHANCE = 0.3
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -21,10 +24,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_reply = (message.reply_to_message and 
                 message.reply_to_message.from_user.id == bot_data.get("bot_id"))
     
-    trigger_words = ["аллира", "лейн", "allira", "lane", "бот"]
-    has_trigger = any(word in message.text.lower() for word in trigger_words)
+    trigger_words = ["аллира", "лейн", "allira", "lane"]
+    has_trigger = any(re.search(rf'\b{word}\b', message.text.lower()) for word in trigger_words)
     
     if not (is_mention or is_reply or has_trigger):
+        return
+    
+    if not (is_mention or is_reply) and random.random() > RESPONSE_CHANCE:
+        logger.info(f"Пропущено (шанс {RESPONSE_CHANCE}): {message.text[:30]}")
         return
     
     clean_text = re.sub(f"@{bot_username}", "", message.text, flags=re.IGNORECASE).strip()
