@@ -16,6 +16,70 @@ FALLBACK_MODELS = [
     "nvidia/nemotron-3.5-lightning:free",
 ]
 
+REASONING_PATTERNS = [
+    r'Хорошо[,.].*?пользователь',
+    r'Сначала разберу',
+    r'Проверяю.*?реакци',
+    r'Варианты ответа',
+    r'Нужно сохранить.*?голос',
+    r'Итоговый ответ.*?:',
+    r'Проверяю.*?кодекс',
+    r'Останавливаюсь на',
+    r'Финальный вариант',
+    r'Попробую собрать',
+    r'Можно усилить',
+    r'Также важно',
+    r'Добавляю эмодзи',
+    r'Убедиться[,.] что нет',
+]
+
+def strip_reasoning(text: str) -> str:
+    """Убирает internal reasoning/thinking из ответов моделей"""
+    if not text:
+        return text
+
+    lines = text.split('\n')
+    result_lines = []
+    skip_mode = False
+
+    for line in lines:
+        stripped = line.strip()
+        is_reasoning = False
+
+        for pattern in REASONING_PATTERNS:
+            if re.search(pattern, stripped, re.IGNORECASE):
+                is_reasoning = True
+                skip_mode = True
+                break
+
+        if skip_mode and not is_reasoning:
+            if stripped and len(stripped) > 20 and any(c.isalpha() for c in stripped):
+                if not any(re.search(p, stripped, re.IGNORECASE) for p in REASONING_PATTERNS):
+                    skip_mode = False
+                    result_lines.append(line)
+            continue
+
+        if not is_reasoning:
+            result_lines.append(line)
+
+    result = '\n'.join(result_lines).strip()
+
+    result = re.sub(r'```[\s\S]*?```', '', result)
+
+    result = re.sub(r'\n{3,}', '\n\n', result).strip()
+
+    if len(result) < 10 and len(text) > 50:
+        paragraphs = text.split('\n\n')
+        for p in reversed(paragraphs):
+            p = p.strip()
+            if p and len(p) > 10:
+                skip_words = ['проверяю', 'вариант', 'нужно', 'важно', 'добавляю', 'убедиться', 'останавливаюсь', 'финальный', 'попробую', 'можно']
+                if not any(w in p.lower() for w in skip_words):
+                    return p
+        return text
+
+    return result
+
 response_cache = TTLCache(maxsize=100, ttl=300)
 image_prompt_cache = TTLCache(maxsize=50, ttl=600)
 
@@ -65,6 +129,7 @@ async def get_llm_response(user_prompt: str, system_prompt: str, model: str, api
                         if response.status_code == 200:
                             data = response.json()
                             result = data["choices"][0]["message"]["content"]
+                            result = strip_reasoning(result)
                             response_cache[cache_key] = result[:2000]
                             logger.info(f"Модель {fallback_model} работает!")
                             return result
@@ -75,6 +140,7 @@ async def get_llm_response(user_prompt: str, system_prompt: str, model: str, api
             response.raise_for_status()
             data = response.json()
             result = data["choices"][0]["message"]["content"]
+            result = strip_reasoning(result)
             
             response_cache[cache_key] = result[:2000]
             return result
