@@ -22,11 +22,11 @@ services:
       - key: WEBHOOK_SECRET_TOKEN
         sync: false
       - key: DEFAULT_MODEL
-        value: "deepseek/deepseek-chat-v3-0324:free"
+        value: "deepseek/deepseek-chat:free"
       - key: LANE_MODEL
-        value: "google/gemini-2.0-flash-exp:free"
+        value: "google/gemini-2.5-flash-preview:free"
       - key: FALLBACK_MODEL
-        value: "qwen/qwen3-235b-a22b:free"
+        value: "meta-llama/llama-4-maverick:free"
       - key: PORT
         value: "10000"
       - key: LOG_LEVEL
