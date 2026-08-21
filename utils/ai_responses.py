@@ -117,33 +117,71 @@ async def get_llm_response(user_prompt: str, system_prompt: str, model: str, api
                 logger.warning("Превышен лимит API")
                 return "Слишком много запросов! Дай мне минутку передохнуть..."
                 
+            def _extract_content(data: dict) -> str | None:
+                choices = data.get("choices")
+                if not choices or not isinstance(choices, list) or len(choices) == 0:
+                    return None
+                msg = choices[0].get("message", {})
+                content = msg.get("content")
+                if not content or not isinstance(content, str):
+                    return None
+                return content
+
+            def _parse_ok(resp) -> str | None:
+                data = resp.json()
+                content = _extract_content(data)
+                if content:
+                    return strip_reasoning(content)
+                logger.warning(f"Нет content в ответе модели: {str(data)[:300]}")
+                return None
+
+            async def _try_models(primary: str) -> str | None:
+                payload["model"] = primary
+                resp = await client.post(OPENROUTER_URL, json=payload, headers=headers)
+                if resp.status_code == 200:
+                    result = _parse_ok(resp)
+                    if result:
+                        logger.info(f"Модель {primary} работает!")
+                        return result
+                else:
+                    logger.warning(f"Модель {primary} вернула {resp.status_code}")
+
+                for fallback_model in FALLBACK_MODELS:
+                    if fallback_model == primary:
+                        continue
+                    payload["model"] = fallback_model
+                    resp = await client.post(OPENROUTER_URL, json=payload, headers=headers)
+                    if resp.status_code == 200:
+                        result = _parse_ok(resp)
+                        if result:
+                            logger.info(f"Модель {fallback_model} работает (fallback)!")
+                            return result
+                    else:
+                        logger.warning(f"Модель {fallback_model} вернула {resp.status_code}")
+                return None
+
             if response.status_code != 200:
                 logger.error(f"OpenRouter API error {response.status_code}: {response.text[:500]}")
-                if response.status_code in (400, 404):
-                    for fallback_model in FALLBACK_MODELS:
-                        if fallback_model == model:
-                            continue
-                        logger.info(f"Пробуем модель: {fallback_model}")
-                        payload["model"] = fallback_model
-                        response = await client.post(OPENROUTER_URL, json=payload, headers=headers)
-                        if response.status_code == 200:
-                            data = response.json()
-                            result = data["choices"][0]["message"]["content"]
-                            result = strip_reasoning(result)
-                            response_cache[cache_key] = result[:2000]
-                            logger.info(f"Модель {fallback_model} работает!")
-                            return result
-                        else:
-                            logger.error(f"Модель {fallback_model} тоже не работает: {response.status_code}")
+                if response.status_code in (400, 404, 402):
+                    result = await _try_models(model)
+                    if result:
+                        response_cache[cache_key] = result[:2000]
+                        return result
                     return "Все модели временно недоступны. Попробуй позже!"
-                
-            response.raise_for_status()
-            data = response.json()
-            result = data["choices"][0]["message"]["content"]
-            result = strip_reasoning(result)
-            
-            response_cache[cache_key] = result[:2000]
-            return result
+                response.raise_for_status()
+                return "Сервис временно недоступен. Попробуй позже!"
+
+            result = _parse_ok(response)
+            if result:
+                response_cache[cache_key] = result[:2000]
+                return result
+
+            logger.warning(f"Некорректный ответ, пробуем fallback модели")
+            result = await _try_models(model)
+            if result:
+                response_cache[cache_key] = result[:2000]
+                return result
+            return "Модель вернула пустой ответ. Попробуй переформулировать!"
             
     except httpx.TimeoutException:
         logger.error("Таймаут API")
