@@ -109,6 +109,7 @@ async def post_init(application: Application):
     if RENDER_EXTERNAL_URL and WEBHOOK_SECRET_TOKEN:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
         try:
+            await application.bot.delete_webhook()
             await application.bot.set_webhook(
                 url=webhook_url,
                 secret_token=WEBHOOK_SECRET_TOKEN,
@@ -127,12 +128,11 @@ async def post_init(application: Application):
 
 async def post_shutdown(application: Application):
     logger.info("Завершение работы бота...")
-    if RENDER_EXTERNAL_URL:
-        try:
-            await application.bot.delete_webhook()
-            logger.info("Вебхук удален")
-        except Exception as e:
-            logger.error(f"Ошибка удаления вебхука: {e}")
+    try:
+        await application.bot.delete_webhook()
+        logger.info("Вебхук удален")
+    except Exception:
+        pass
 
 
 async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
