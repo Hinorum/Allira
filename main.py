@@ -217,7 +217,6 @@ def main():
 
     logger.info("Запуск в режиме polling")
     application.run_polling(
-        drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
     )
 
