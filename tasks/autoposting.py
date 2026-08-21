@@ -163,10 +163,10 @@ async def generate_image(post_text: str) -> bytes | None:
     try:
         prompt_response = await get_llm_response(
             user_prompt=f"Based on this text's mood and energy, write ONE short image prompt (5-10 words). "
-                        f"NO crypto, NO coins, NO Bitcoin, NO charts, NO graphs. "
-                        f"Translate the emotion into a visual scene.\n\nText: {post_text[:500]}",
+                        f"Crypto elements (coins, charts, blockchain) are welcome but should be subtle, "
+                        f"part of the scene, not the main focus. Translate the emotion into a visual scene.\n\nText: {post_text[:500]}",
             system_prompt="You are an image prompt generator. Reply with ONLY the English prompt, no other text. "
-                          "Focus on mood, energy, movement. Never mention cryptocurrency, coins, logos, or text.",
+                          "Focus on mood, energy, movement. Crypto can be present but subtle, not dominant.",
             model="nvidia/nemotron-3.5-lightning:free",
             api_key=os.getenv("OPENROUTER_API_KEY", "")
         )
