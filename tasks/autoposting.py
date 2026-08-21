@@ -3,6 +3,8 @@ import random
 import asyncio
 import httpx
 import time
+import os
+import re
 import urllib.parse
 from datetime import datetime
 from telegram.ext import ContextTypes
@@ -16,18 +18,6 @@ POLLINATIONS_URL = "https://image.pollinations.ai/prompt"
 
 last_request_time = 0
 
-IMAGE_STYLES = [
-    "cinematic drone shot, epic landscape, golden hour lighting, dramatic clouds, no text no letters no logos",
-    "macro photography, dewdrops on spider web, soft bokeh background, morning light, nature detail",
-    "aerial view, geometric city blocks at night, light trails, long exposure, urban patterns",
-    "abstract fluid art, swirling paint colors, marble texture, macro detail, vibrant gradients",
-    "silhouette figure standing on cliff edge, vast sky, sunset colors, cinematic composition",
-    "northern lights over frozen lake, reflection, stars, long exposure photography",
-    "neon tunnel, perspective lines, fog, atmospheric lighting, cyberpunk mood",
-    "underwater scene, light rays through water surface, bubbles, deep blue tones",
-    "japanese garden, zen stones, bamboo, misty morning, peaceful atmosphere",
-    "futuristic highway, flying vehicles, neon signs, rain-soaked street, blade runner mood",
-]
 
 
 def get_smart_interval() -> int:
@@ -153,11 +143,40 @@ def format_global_data(data):
     return "\n".join(lines)
 
 
-async def generate_image(topic: str) -> bytes | None:
-    """Генерирует картинку через Pollinations.ai по теме поста."""
-    style = random.choice(IMAGE_STYLES)
-    prompt = style
+async def generate_image(post_text: str) -> bytes | None:
+    """Генерирует картинку через Pollinations.ai по настроению поста."""
+    from utils.ai_responses import get_llm_response
 
+    fallback_styles = [
+        "cinematic drone shot, epic storm clouds over open road, dramatic lighting",
+        "aerial view of rushing river through canyon, golden hour, motion blur",
+        "macro shot of cracked earth with single green sprout, resilience, hope",
+        "figure standing at crossroads in fog, two paths diverging, mysterious atmosphere",
+        "waves crashing against rocky shore, spray, powerful ocean energy",
+        "vast desert with single road stretching to horizon, freedom, journey",
+        "thunderstorm over city skyline, lightning, electric atmosphere",
+        "northern lights dance over snowy mountains, cosmic energy, awe",
+        "wind blowing through tall grass field, golden light, natural movement",
+        "lighthouse beam cutting through dense fog, guiding light, determination",
+    ]
+
+    try:
+        prompt_response = await get_llm_response(
+            user_prompt=f"Based on this text's mood and energy, write ONE short image prompt (5-10 words). "
+                        f"NO crypto, NO coins, NO Bitcoin, NO charts, NO graphs. "
+                        f"Translate the emotion into a visual scene.\n\nText: {post_text[:500]}",
+            system_prompt="You are an image prompt generator. Reply with ONLY the English prompt, no other text. "
+                          "Focus on mood, energy, movement. Never mention cryptocurrency, coins, logos, or text.",
+            model="nvidia/nemotron-3.5-lightning:free",
+            api_key=os.getenv("OPENROUTER_API_KEY", "")
+        )
+        prompt_response = re.sub(r'[^a-zA-Z\s,-]', '', prompt_response).strip()
+        if len(prompt_response.split()) < 3:
+            prompt_response = random.choice(fallback_styles)
+    except Exception:
+        prompt_response = random.choice(fallback_styles)
+
+    prompt = f"{prompt_response}, cinematic photography, high quality, no text no letters no logos no watermark"
     encoded = urllib.parse.quote(prompt)
     url = f"{POLLINATIONS_URL}/{encoded}?width=1280&height=720&nologo=true&seed={random.randint(1, 99999)}"
 
@@ -197,7 +216,7 @@ async def do_autoposting(context: ContextTypes.DEFAULT_TYPE):
 
         final_caption = f"{post_content}\n\n{crypto_text}\n\n#CryptoNews #AlliraBot"
 
-        image_bytes = await generate_image(crypto_text)
+        image_bytes = await generate_image(post_content)
 
         if image_bytes:
             from io import BytesIO
