@@ -47,10 +47,6 @@ FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:
 LANE_MODEL = os.getenv("LANE_MODEL", "google/gemma-4-31b-it:free")
 NEWS_CHANNEL_ID = os.getenv("NEWS_CHANNEL_ID")
 PORT = int(os.getenv("PORT", "10000"))
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("RENDER_EXTERNAL_HOSTNAME")
-if RENDER_EXTERNAL_URL and not RENDER_EXTERNAL_URL.startswith("http"):
-    RENDER_EXTERNAL_URL = f"https://{RENDER_EXTERNAL_URL}"
-WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "allira_secret_token_change_me")
 
 BOT_START_TIME = time.time()
 
@@ -106,33 +102,15 @@ async def post_init(application: Application):
         "NEWS_CHANNEL_ID": NEWS_CHANNEL_ID,
     })
 
-    if RENDER_EXTERNAL_URL and WEBHOOK_SECRET_TOKEN:
-        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-        try:
-            await application.bot.delete_webhook()
-            await application.bot.set_webhook(
-                url=webhook_url,
-                secret_token=WEBHOOK_SECRET_TOKEN,
-                allowed_updates=Update.ALL_TYPES
-            )
-            logger.info(f"Вебхук установлен: {webhook_url}")
-        except Exception as e:
-            logger.error(f"Ошибка установки вебхука: {e}")
-    else:
-        logger.warning("RENDER_EXTERNAL_URL не задан, вебхук не установлен")
+    try:
+        await application.bot.delete_webhook()
+        logger.info("Старый вебхук удалён")
+    except Exception:
+        pass
 
     if NEWS_CHANNEL_ID:
         setup_autoposting(application)
         logger.info(f"Автопостинг настроен для {NEWS_CHANNEL_ID}")
-
-
-async def post_shutdown(application: Application):
-    logger.info("Завершение работы бота...")
-    try:
-        await application.bot.delete_webhook()
-        logger.info("Вебхук удален")
-    except Exception:
-        pass
 
 
 async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -189,7 +167,6 @@ def main():
     application = Application.builder() \
         .token(BOT_TOKEN) \
         .post_init(post_init) \
-        .post_shutdown(post_shutdown) \
         .build()
 
     application.add_handler(CommandHandler("start", start_command))
@@ -238,19 +215,11 @@ def main():
         handle_private_message
     ))
 
-    if RENDER_EXTERNAL_URL and WEBHOOK_SECRET_TOKEN:
-        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-        logger.info(f"Запуск в режиме вебхука: {webhook_url}")
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            webhook_url=webhook_url,
-            secret_token=WEBHOOK_SECRET_TOKEN,
-            url_path="/webhook"
-        )
-    else:
-        logger.info("Запуск в режиме polling")
-        application.run_polling()
+    logger.info("Запуск в режиме polling")
+    application.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 
 if __name__ == "__main__":
