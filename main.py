@@ -103,8 +103,8 @@ async def post_init(application: Application):
     })
 
     try:
-        await application.bot.delete_webhook()
-        logger.info("Старый вебхук удалён")
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Старый вебхук и pending updates удалены")
     except Exception:
         pass
 
