@@ -17,23 +17,21 @@ POLLINATIONS_URL = "https://image.pollinations.ai/prompt"
 last_request_time = 0
 
 IMAGE_STYLES = [
-    "digital art, neon lights, cyberpunk style, dark background",
-    "abstract visualization, glowing charts, futuristic",
-    "minimalist design, clean lines, tech aesthetic",
-    "photorealistic, financial district, modern architecture",
-    "watercolor style, abstract financial concept",
-    "3D render, floating crypto symbols, volumetric lighting",
+    "cinematic drone shot, epic landscape, golden hour lighting, dramatic clouds, no text no letters no logos",
+    "macro photography, dewdrops on spider web, soft bokeh background, morning light, nature detail",
+    "aerial view, geometric city blocks at night, light trails, long exposure, urban patterns",
+    "abstract fluid art, swirling paint colors, marble texture, macro detail, vibrant gradients",
+    "silhouette figure standing on cliff edge, vast sky, sunset colors, cinematic composition",
+    "northern lights over frozen lake, reflection, stars, long exposure photography",
+    "neon tunnel, perspective lines, fog, atmospheric lighting, cyberpunk mood",
+    "underwater scene, light rays through water surface, bubbles, deep blue tones",
+    "japanese garden, zen stones, bamboo, misty morning, peaceful atmosphere",
+    "futuristic highway, flying vehicles, neon signs, rain-soaked street, blade runner mood",
 ]
 
 
 def get_smart_interval() -> int:
-    hour = datetime.now().hour
-    if 8 <= hour <= 22:
-        return 21600
-    elif 6 <= hour < 8 or 22 < hour <= 24:
-        return 25200
-    else:
-        return 43200
+    return random.choice([43200, 50400])
 
 
 async def get_crypto_data():
@@ -158,10 +156,10 @@ def format_global_data(data):
 async def generate_image(topic: str) -> bytes | None:
     """Генерирует картинку через Pollinations.ai по теме поста."""
     style = random.choice(IMAGE_STYLES)
-    prompt = f"{topic[:100]}, {style}"
+    prompt = style
 
     encoded = urllib.parse.quote(prompt)
-    url = f"{POLLINATIONS_URL}/{encoded}?width=1200&height=675&nologo=true&seed={random.randint(1, 99999)}"
+    url = f"{POLLINATIONS_URL}/{encoded}?width=1280&height=720&nologo=true&seed={random.randint(1, 99999)}"
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
