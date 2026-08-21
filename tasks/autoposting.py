@@ -214,7 +214,7 @@ async def do_autoposting(context: ContextTypes.DEFAULT_TYPE):
             bot_data["OPENROUTER_API_KEY"]
         )
 
-        final_caption = f"{post_content}\n\n{crypto_text}\n\n#CryptoNews #AlliraBot"
+        final_caption = f"{post_content}\n\n#CryptoNews #AlliraBot"
 
         image_bytes = await generate_image(post_content)
 
