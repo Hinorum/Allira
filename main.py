@@ -41,7 +41,6 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
 LANE_MODEL = os.getenv("LANE_MODEL", "google/gemma-4-31b-it:free")
@@ -98,7 +97,6 @@ async def post_init(application: Application):
         "LANE_MODEL": LANE_MODEL,
         "FALLBACK_MODEL": FALLBACK_MODEL,
         "OPENROUTER_API_KEY": OPENROUTER_API_KEY,
-        "PEXELS_API_KEY": PEXELS_API_KEY,
         "NEWS_CHANNEL_ID": NEWS_CHANNEL_ID,
     })
 

@@ -3,37 +3,37 @@ import random
 import asyncio
 import httpx
 import time
+import urllib.parse
 from datetime import datetime
 from telegram.ext import ContextTypes
-from telegram.constants import ChatAction
-from utils.ai_responses import generate_image_description, generate_post_content
+from utils.ai_responses import generate_post_content
 from utils.database import increment_stat
 
 logger = logging.getLogger(__name__)
 
 COINGECKO_URL = "https://api.coingecko.com/api/v3"
-PEXELS_URL = "https://api.pexels.com/v1/search"
+POLLINATIONS_URL = "https://image.pollinations.ai/prompt"
 
-used_images = set()
 last_request_time = 0
 
-POSTING_SCHEDULE = {
-    "peak": {"hours": [9, 12, 15, 18, 21], "interval": 21600},
-    "normal": {"hours": [7, 10, 14, 17, 20], "interval": 25200},
-    "quiet": {"hours": [0, 3, 6], "interval": 43200},
-}
+IMAGE_STYLES = [
+    "digital art, neon lights, cyberpunk style, dark background",
+    "abstract visualization, glowing charts, futuristic",
+    "minimalist design, clean lines, tech aesthetic",
+    "photorealistic, financial district, modern architecture",
+    "watercolor style, abstract financial concept",
+    "3D render, floating crypto symbols, volumetric lighting",
+]
 
 
 def get_smart_interval() -> int:
-    now = datetime.now()
-    hour = now.hour
-
+    hour = datetime.now().hour
     if 8 <= hour <= 22:
-        return POSTING_SCHEDULE["peak"]["interval"]
+        return 21600
     elif 6 <= hour < 8 or 22 < hour <= 24:
-        return POSTING_SCHEDULE["normal"]["interval"]
+        return 25200
     else:
-        return POSTING_SCHEDULE["quiet"]["interval"]
+        return 43200
 
 
 async def get_crypto_data():
@@ -97,11 +97,11 @@ async def get_crypto_data():
 
 def get_fallback_crypto_data():
     messages = [
-        "Крипторынок сегодня показывает интересную динамику! Bitcoin держится уверенно, альткоины готовятся к рывку. Следим за трендами!",
-        "Анализ рынка: волатильность растет, что открывает возможности для трейдеров. Важно следить за уровнями поддержки и сопротивления.",
-        "HODL или трейдить? Вечный вопрос криптоэнтузиастов. Диверсификация - ключ к успеху в долгосрочной перспективе.",
-        "DeFi сектор продолжает развиваться! Новые протоколы предлагают инновационные решения для кредитования и стейкинга.",
-        "Web3 и метавселенные набирают обороты. Следим за проектами, которые меняют правила игры в цифровом пространстве."
+        "Крипторынок сегодня показывает интересную динамику! Bitcoin держится уверенно, альткоины готовятся к рывку.",
+        "Анализ рынка: волатильность растет, что открывает возможности для трейдеров.",
+        "HODL или трейдить? Вечный вопрос криптоэнтузиастов. Диверсификация - ключ к успеху.",
+        "DeFi сектор продолжает развиваться! Новые протоколы предлагают инновационные решения.",
+        "Web3 и метавселенные набирают обороты. Следим за проектами, которые меняют правила игры."
     ]
     return random.choice(messages)
 
@@ -119,7 +119,6 @@ def format_market_data(coins):
         price = coin['current_price']
         change = coin.get('price_change_percentage_24h', 0) or 0
         emoji = "\U0001f7e2" if change > 0 else "\U0001f534" if change < 0 else "\u26aa"
-
         lines.append(f"{i}. {name}: ${price:,.2f} {emoji} {change:+.2f}%")
 
     lines.append(f"\n<i>Данные CoinGecko на {time.strftime('%H:%M UTC')}</i>")
@@ -156,52 +155,25 @@ def format_global_data(data):
     return "\n".join(lines)
 
 
-async def get_pexels_image(query: str, api_key: str):
-    global used_images
+async def generate_image(topic: str) -> bytes | None:
+    """Генерирует картинку через Pollinations.ai по теме поста."""
+    style = random.choice(IMAGE_STYLES)
+    prompt = f"{topic[:100]}, {style}"
 
-    if len(used_images) > 100:
-        used_images = set(list(used_images)[-50:])
+    encoded = urllib.parse.quote(prompt)
+    url = f"{POLLINATIONS_URL}/{encoded}?width=1200&height=675&nologo=true&seed={random.randint(1, 99999)}"
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(
-                PEXELS_URL,
-                params={
-                    "query": query,
-                    "per_page": 10,
-                    "orientation": "landscape",
-                    "size": "medium"
-                },
-                headers={"Authorization": api_key}
-            )
-
-            response.raise_for_status()
-            data = response.json()
-
-            if not data.get("photos"):
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.get(url, follow_redirects=True)
+            if response.status_code == 200 and len(response.content) > 1000:
+                logger.info(f"Картинка сгенерирована ({len(response.content)} bytes)")
+                return response.content
+            else:
+                logger.warning(f"Pollinations: плохой ответ ({response.status_code})")
                 return None
-
-            for photo in data["photos"]:
-                image_url = photo["src"]["large"]
-                if image_url not in used_images:
-                    used_images.add(image_url)
-                    return {
-                        "url": image_url,
-                        "photographer": photo.get("photographer", "Unknown"),
-                        "photographer_url": photo.get("photographer_url", "")
-                    }
-
-            used_images.clear()
-            image_url = data["photos"][0]["src"]["large"]
-            used_images.add(image_url)
-            return {
-                "url": image_url,
-                "photographer": data["photos"][0].get("photographer", "Unknown"),
-                "photographer_url": data["photos"][0].get("photographer_url", "")
-            }
-
     except Exception as e:
-        logger.error(f"Pexels error: {e}")
+        logger.error(f"Pollinations error: {e}")
         return None
 
 
@@ -227,34 +199,29 @@ async def do_autoposting(context: ContextTypes.DEFAULT_TYPE):
 
         final_caption = f"{post_content}\n\n{crypto_text}\n\n#CryptoNews #AlliraBot"
 
-        image_query = await generate_image_description(
-            crypto_text,
-            bot_data["DEFAULT_MODEL"],
-            bot_data["OPENROUTER_API_KEY"]
-        )
+        image_bytes = await generate_image(crypto_text)
 
-        image_data = await get_pexels_image(image_query, bot_data["PEXELS_API_KEY"])
+        if image_bytes:
+            from io import BytesIO
+            photo_file = BytesIO(image_bytes)
+            photo_file.name = "crypto_post.jpg"
 
-        if image_data:
             await context.bot.send_photo(
                 chat_id=channel_id,
-                photo=image_data["url"],
+                photo=photo_file,
                 caption=final_caption[:1024],
                 parse_mode="HTML"
             )
-            logger.info(f"Пост с картинкой отправлен. Фото: {image_data['photographer']}")
+            logger.info("Пост с AI- картинкой отправлен")
         else:
             await context.bot.send_message(
                 chat_id=channel_id,
                 text=final_caption,
                 parse_mode="HTML"
             )
-            logger.info("Текстовый пост отправлен")
+            logger.info("Текстовый пост отправлен (картинка не сгенерировалась)")
 
         increment_stat("total_posts")
-        global used_images
-        if len(used_images) > 50:
-            used_images = set(list(used_images)[-25:])
 
     except Exception as e:
         logger.error(f"Ошибка автопостинга: {e}", exc_info=True)

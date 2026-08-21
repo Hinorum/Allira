@@ -15,11 +15,7 @@ services:
         sync: false
       - key: OPENROUTER_API_KEY
         sync: false
-      - key: PEXELS_API_KEY
-        sync: false
       - key: NEWS_CHANNEL_ID
-        sync: false
-      - key: WEBHOOK_SECRET_TOKEN
         sync: false
       - key: PORT
         value: "10000"
