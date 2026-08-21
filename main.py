@@ -47,7 +47,9 @@ FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:
 LANE_MODEL = os.getenv("LANE_MODEL", "google/gemma-4-31b-it:free")
 NEWS_CHANNEL_ID = os.getenv("NEWS_CHANNEL_ID")
 PORT = int(os.getenv("PORT", "10000"))
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("RENDER_EXTERNAL_HOSTNAME")
+if RENDER_EXTERNAL_URL and not RENDER_EXTERNAL_URL.startswith("http"):
+    RENDER_EXTERNAL_URL = f"https://{RENDER_EXTERNAL_URL}"
 WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "allira_secret_token_change_me")
 
 BOT_START_TIME = time.time()
