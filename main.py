@@ -1,9 +1,10 @@
 # main.py
 import os
+import time
 import logging
-import asyncio
+import json
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -11,16 +12,17 @@ from telegram.ext import (
     filters,
     ContextTypes,
     CallbackQueryHandler,
+    InlineQueryHandler,
 )
-from telegram.constants import ChatAction
 from flask import Flask
 from threading import Thread
 
-# Инициализация модулей
 from utils.common import setup_logging
+from utils.database import init_db, increment_stat, get_stat, get_total_users, get_messages_today
 from prompts.loader import preload_all_prompts
 from handlers.start_command import start_command, help_command, show_help_callback
 from handlers.message_handler import handle_message, handle_private_message
+from handlers.stats_command import stats_command, history_command, leaderboard_command
 from handlers.dice_tournament import (
     start_dice_tournament_registration,
     register_for_tournament,
@@ -32,13 +34,11 @@ from handlers.dice_tournament import (
 )
 from tasks.autoposting import setup_autoposting
 
-# Загрузка конфигурации
 load_dotenv()
 setup_logging()
 
 logger = logging.getLogger(__name__)
 
-# Конфигурация бота
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
@@ -47,33 +47,46 @@ FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:
 LANE_MODEL = os.getenv("LANE_MODEL", "google/gemma-4-31b-it:free")
 NEWS_CHANNEL_ID = os.getenv("NEWS_CHANNEL_ID")
 PORT = int(os.getenv("PORT", "10000"))
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
+WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "allira_secret_token_change_me")
 
-# Настройка вебхука для Railway
-RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN")
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"https://{RAILWAY_PUBLIC_DOMAIN}{WEBHOOK_PATH}" if RAILWAY_PUBLIC_DOMAIN else None
-WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN")
+BOT_START_TIME = time.time()
 
-# Flask для health-check
 flask_app = Flask(__name__)
+
 
 @flask_app.route('/')
 def home():
     return "Allira Bot is running!", 200
 
+
 @flask_app.route('/health')
 def health():
-    return "OK", 200
+    uptime = int(time.time() - BOT_START_TIME)
+    hours = uptime // 3600
+    minutes = (uptime % 3600) // 60
+    data = {
+        "status": "ok",
+        "uptime": f"{hours}h {minutes}m",
+        "uptime_seconds": uptime,
+        "total_messages": get_stat("total_messages"),
+        "messages_today": get_messages_today(),
+        "total_users": get_total_users(),
+    }
+    return json.dumps(data), 200, {"Content-Type": "application/json"}
+
 
 def run_flask():
-    """Запуск Flask сервера для health-check"""
     logging.getLogger('werkzeug').setLevel(logging.ERROR)
     flask_app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
 
+
 async def post_init(application: Application):
-    """Инициализация после запуска"""
     logger.info("Инициализация бота...")
-    
+
+    init_db()
+    preload_all_prompts()
+
     try:
         bot_info = await application.bot.get_me()
         application.bot_data["bot_username"] = bot_info.username
@@ -82,7 +95,6 @@ async def post_init(application: Application):
     except Exception as e:
         logger.error(f"Ошибка получения информации о боте: {e}")
 
-    # Сохраняем конфигурацию
     application.bot_data.update({
         "DEFAULT_MODEL": DEFAULT_MODEL,
         "LANE_MODEL": LANE_MODEL,
@@ -92,60 +104,101 @@ async def post_init(application: Application):
         "NEWS_CHANNEL_ID": NEWS_CHANNEL_ID,
     })
 
-    # Предзагрузка промптов
-    preload_all_prompts()
-
-    # Настройка вебхука
-    if WEBHOOK_URL and WEBHOOK_SECRET_TOKEN:
+    if RENDER_EXTERNAL_URL and WEBHOOK_SECRET_TOKEN:
+        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
         try:
             await application.bot.set_webhook(
-                url=WEBHOOK_URL,
+                url=webhook_url,
                 secret_token=WEBHOOK_SECRET_TOKEN,
                 allowed_updates=Update.ALL_TYPES
             )
-            logger.info(f"Вебхук установлен: {WEBHOOK_URL}")
+            logger.info(f"Вебхук установлен: {webhook_url}")
         except Exception as e:
             logger.error(f"Ошибка установки вебхука: {e}")
+    else:
+        logger.warning("RENDER_EXTERNAL_URL не задан, вебхук не установлен")
 
-    # Настройка автопостинга
     if NEWS_CHANNEL_ID:
         setup_autoposting(application)
         logger.info(f"Автопостинг настроен для {NEWS_CHANNEL_ID}")
 
+
 async def post_shutdown(application: Application):
-    """Действия при завершении"""
     logger.info("Завершение работы бота...")
-    if WEBHOOK_URL:
+    if RENDER_EXTERNAL_URL:
         try:
             await application.bot.delete_webhook()
             logger.info("Вебхук удален")
         except Exception as e:
             logger.error(f"Ошибка удаления вебхука: {e}")
 
+
+async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.inline_query.query.strip()
+    if not query:
+        return
+
+    from utils.ai_responses import decide_speaker
+    from prompts.loader import load_prompt
+    from utils.ai_responses import get_llm_response
+
+    speaker = decide_speaker(query)
+    model = context.bot_data["LANE_MODEL"] if speaker == "lane" else context.bot_data["DEFAULT_MODEL"]
+
+    try:
+        response = await get_llm_response(
+            user_prompt=query,
+            system_prompt=load_prompt(speaker),
+            model=model,
+            api_key=context.bot_data["OPENROUTER_API_KEY"]
+        )
+        if len(response) > 1000:
+            response = response[:997] + "..."
+
+        results = [
+            InlineQueryResultArticle(
+                id=f"allira_{hash(query)}",
+                title=f"⚡ {speaker.title()}",
+                description=response[:100],
+                input_message_content=InputTextMessageContent(
+                    message_text=f"*{speaker.title()}:* {response}",
+                    parse_mode="Markdown"
+                )
+            )
+        ]
+        await update.inline_query.answer(results, cache_time=300, is_personal=True)
+    except Exception as e:
+        logger.error(f"Inline error: {e}")
+
+
+async def clear_context_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("=> Контекст сброшен. Начинай с чистого листа.")
+
+
 def main():
-    """Главная функция запуска"""
     if not BOT_TOKEN:
         logger.critical("BOT_TOKEN не найден!")
         return
 
-    # Запуск Flask для health-check
     Thread(target=run_flask, daemon=True).start()
     logger.info("Health-check сервер запущен")
 
-    # Создание приложения
     application = Application.builder() \
         .token(BOT_TOKEN) \
         .post_init(post_init) \
         .post_shutdown(post_shutdown) \
         .build()
 
-    # Регистрация обработчиков команд
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("start_tournament", start_dice_tournament_registration))
     application.add_handler(CommandHandler("stop_tournament", stop_tournament_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("history", history_command))
+    application.add_handler(CommandHandler("leaderboard", leaderboard_command))
+    application.add_handler(CommandHandler("clear", clear_context_command))
 
-    # Callback обработчики
     application.add_handler(CallbackQueryHandler(
         show_help_callback, pattern="^show_help$"
     ))
@@ -165,38 +218,38 @@ def main():
         set_tournament_mode, pattern="^set_tournament_mode:"
     ))
 
-    # Обработчик сообщений в канале (только для новостного канала)
+    application.add_handler(InlineQueryHandler(handle_inline_query))
+
     if NEWS_CHANNEL_ID:
         application.add_handler(MessageHandler(
             filters.TEXT & filters.Chat(chat_id=NEWS_CHANNEL_ID) & ~filters.COMMAND,
             handle_message
         ))
 
-    # Обработчик сообщений в групповых чатах
     application.add_handler(MessageHandler(
         filters.TEXT & filters.ChatType.GROUPS & ~filters.COMMAND,
         handle_message
     ))
 
-    # Обработчик личных сообщений
     application.add_handler(MessageHandler(
         filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
         handle_private_message
     ))
 
-    # Запуск бота
-    if WEBHOOK_URL:
-        logger.info(f"Запуск в режиме вебхука: {WEBHOOK_URL}")
+    if RENDER_EXTERNAL_URL and WEBHOOK_SECRET_TOKEN:
+        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
+        logger.info(f"Запуск в режиме вебхука: {webhook_url}")
         application.run_webhook(
             listen="0.0.0.0",
             port=PORT,
-            webhook_url=WEBHOOK_URL,
+            webhook_url=webhook_url,
             secret_token=WEBHOOK_SECRET_TOKEN,
-            url_path=WEBHOOK_PATH
+            url_path="/webhook"
         )
     else:
         logger.info("Запуск в режиме polling")
         application.run_polling()
+
 
 if __name__ == "__main__":
     main()

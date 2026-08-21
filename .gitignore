@@ -3,3 +3,6 @@ bot.log
 logs/
 __pycache__/
 *.pyc
+*.db
+*.db-wal
+*.db-shm

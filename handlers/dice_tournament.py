@@ -1,12 +1,17 @@
 import logging
 import asyncio
 import random
+import time
 from collections import defaultdict
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, CallbackContext
 from telegram.constants import DiceEmoji
+from utils.database import save_tournament, save_tournament_players, increment_stat
 
 logger = logging.getLogger(__name__)
+
+last_roll_times = {}
+ROLL_COOLDOWN = 2.0
 
 # Состояние турнира
 dice_tournament_state = {
@@ -462,6 +467,30 @@ async def end_tournament(context: ContextTypes.DEFAULT_TYPE, winner_data: dict =
         except Exception as unpin_err:
             logger.warning(f"Не удалось открепить сообщение турнира: {unpin_err}")
     
+    # Сохраняем турнир в БД
+    try:
+        winner_id = None
+        winner_name = None
+        if final_winner:
+            for uid, data in state["players"].items():
+                if data.get("username") == final_winner.get("username"):
+                    winner_id = uid
+                    winner_name = final_winner.get("username")
+                    break
+
+        total_rounds = state.get("current_round", 0)
+        total_players = len(state.get("players", {}))
+        admin_id = state.get("admin_user_id", 0)
+
+        tid = save_tournament(chat_id, admin_id, state.get("tournament_mode", ""),
+                               total_rounds, total_players, winner_id, winner_name)
+        if tid:
+            save_tournament_players(tid, state["players"])
+            increment_stat("total_tournaments")
+            logger.info(f"Турнир #{tid} сохранён в БД")
+    except Exception as db_err:
+        logger.error(f"Ошибка сохранения турнира в БД: {db_err}")
+
     # Сброс состояния турнира
     dice_tournament_state.clear()
     dice_tournament_state.update({
@@ -835,14 +864,20 @@ async def make_tournament_roll(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if user.id not in state["active_players_in_round"]:
-        # Проверяем, может игрок уже бросил кубик
         if user.id in state["player_rolls_in_round"]:
             await query.answer(f"{user.first_name}, ты уже бросил: {state['player_rolls_in_round'][user.id]}.", show_alert=True)
         else:
-            await query.answer(f"{user.first_name}, сейчас не ваша очередь бросать или вы не участвуете в текущем матче/раунде.", show_alert=True)
+            await query.answer(f"{user.first_name}, сейчас не твоя очередь.", show_alert=True)
         return
+
+    now = time.time()
+    last_roll = last_roll_times.get(user.id, 0)
+    if now - last_roll < ROLL_COOLDOWN:
+        remaining = round(ROLL_COOLDOWN - (now - last_roll), 1)
+        await query.answer(f"Подожди {remaining}с перед следующим броском.", show_alert=True)
+        return
+    last_roll_times[user.id] = now
     
-    # Отвечаем на callback до отправки кубика, чтобы кнопка не "зависала"
     await query.answer("Бросаем кубик...")
 
     try:

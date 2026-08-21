@@ -3,9 +3,11 @@ import random
 import asyncio
 import httpx
 import time
+from datetime import datetime
 from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
 from utils.ai_responses import generate_image_description, generate_post_content
+from utils.database import increment_stat
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +16,24 @@ PEXELS_URL = "https://api.pexels.com/v1/search"
 
 used_images = set()
 last_request_time = 0
+
+POSTING_SCHEDULE = {
+    "peak": {"hours": [9, 12, 15, 18, 21], "interval": 21600},
+    "normal": {"hours": [7, 10, 14, 17, 20], "interval": 25200},
+    "quiet": {"hours": [0, 3, 6], "interval": 43200},
+}
+
+
+def get_smart_interval() -> int:
+    now = datetime.now()
+    hour = now.hour
+
+    if 8 <= hour <= 22:
+        return POSTING_SCHEDULE["peak"]["interval"]
+    elif 6 <= hour < 8 or 22 < hour <= 24:
+        return POSTING_SCHEDULE["normal"]["interval"]
+    else:
+        return POSTING_SCHEDULE["quiet"]["interval"]
 
 
 async def get_crypto_data():
@@ -87,7 +107,6 @@ def get_fallback_crypto_data():
 
 
 def _escape_html(text: str) -> str:
-    """Экранирует спецсимволы для Telegram HTML parse_mode"""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
@@ -232,6 +251,7 @@ async def do_autoposting(context: ContextTypes.DEFAULT_TYPE):
             )
             logger.info("Текстовый пост отправлен")
 
+        increment_stat("total_posts")
         global used_images
         if len(used_images) > 50:
             used_images = set(list(used_images)[-25:])
@@ -265,10 +285,11 @@ def setup_autoposting(application):
         for job in jobs:
             job.schedule_removal()
 
+    interval = get_smart_interval()
     application.job_queue.run_repeating(
         do_autoposting,
-        interval=28800,
-        first=random.randint(60, 1800),
+        interval=interval,
+        first=random.randint(60, 300),
         name="autoposting"
     )
 
@@ -279,4 +300,4 @@ def setup_autoposting(application):
         name="wakeup"
     )
 
-    logger.info("Автопостинг настроен")
+    logger.info(f"Автопостинг настроен (интервал: {interval//3600}ч)")

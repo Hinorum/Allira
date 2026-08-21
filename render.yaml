@@ -21,12 +21,6 @@ services:
         sync: false
       - key: WEBHOOK_SECRET_TOKEN
         sync: false
-      - key: DEFAULT_MODEL
-        value: "nvidia/nemotron-3-super-120b-a12b:free"
-      - key: LANE_MODEL
-        value: "google/gemma-4-31b-it:free"
-      - key: FALLBACK_MODEL
-        value: "nvidia/nemotron-3-ultra-550b-a55b:free"
       - key: PORT
         value: "10000"
       - key: LOG_LEVEL
