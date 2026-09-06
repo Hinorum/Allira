@@ -23,3 +23,7 @@ services:
         value: "INFO"
       - key: TZ
         value: "Europe/Moscow"
+      - key: MARKETAPP_API_KEY
+        sync: false
+      - key: MARKETAPP_WALLET
+        sync: false

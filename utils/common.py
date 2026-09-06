@@ -19,3 +19,7 @@ def setup_logging():
     
     logger = logging.getLogger(__name__)
     logger.info(f"Логирование настроено на уровень {log_level}")
+
+
+def escape_html(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")

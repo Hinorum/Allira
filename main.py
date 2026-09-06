@@ -1,8 +1,8 @@
-# main.py
 import os
 import time
 import logging
 import json
+import uuid
 from dotenv import load_dotenv
 from telegram import Update, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import (
@@ -16,9 +16,12 @@ from telegram.ext import (
 )
 from flask import Flask
 from threading import Thread
+from cachetools import TTLCache
 
 from utils.common import setup_logging
-from utils.database import init_db, increment_stat, get_stat, get_total_users, get_messages_today
+from utils.database import init_db, increment_stat, get_stat, get_total_users, get_messages_today, close_all
+from utils.config import BotConfig
+from utils.http_client import close_client
 from prompts.loader import preload_all_prompts
 from handlers.start_command import start_command, help_command, show_help_callback
 from handlers.message_handler import handle_message, handle_private_message
@@ -33,23 +36,19 @@ from handlers.dice_tournament import (
     start_tournament_from_menu,
 )
 from tasks.autoposting import setup_autoposting
+from tasks.marketapp_reports import setup_marketapp_jobs
 
 load_dotenv()
 setup_logging()
 
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
-FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
-LANE_MODEL = os.getenv("LANE_MODEL", "google/gemma-4-31b-it:free")
-NEWS_CHANNEL_ID = os.getenv("NEWS_CHANNEL_ID")
-PORT = int(os.getenv("PORT", "10000"))
-
+config = BotConfig.from_env()
 BOT_START_TIME = time.time()
 
 flask_app = Flask(__name__)
+
+_inline_rate_limit = TTLCache(maxsize=200, ttl=60)
 
 
 @flask_app.route('/')
@@ -75,7 +74,7 @@ def health():
 
 def run_flask():
     logging.getLogger('werkzeug').setLevel(logging.ERROR)
-    flask_app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
+    flask_app.run(host='0.0.0.0', port=config.port, debug=False, use_reloader=False)
 
 
 async def post_init(application: Application):
@@ -86,6 +85,8 @@ async def post_init(application: Application):
 
     try:
         bot_info = await application.bot.get_me()
+        config.bot_username = bot_info.username
+        config.bot_id = bot_info.id
         application.bot_data["bot_username"] = bot_info.username
         application.bot_data["bot_id"] = bot_info.id
         logger.info(f"Бот @{bot_info.username} запущен")
@@ -93,28 +94,48 @@ async def post_init(application: Application):
         logger.error(f"Ошибка получения информации о боте: {e}")
 
     application.bot_data.update({
-        "DEFAULT_MODEL": DEFAULT_MODEL,
-        "LANE_MODEL": LANE_MODEL,
-        "FALLBACK_MODEL": FALLBACK_MODEL,
-        "OPENROUTER_API_KEY": OPENROUTER_API_KEY,
-        "NEWS_CHANNEL_ID": NEWS_CHANNEL_ID,
+        "DEFAULT_MODEL": config.default_model,
+        "LANE_MODEL": config.lane_model,
+        "FALLBACK_MODEL": config.fallback_model,
+        "OPENROUTER_API_KEY": config.openrouter_api_key,
+        "NEWS_CHANNEL_ID": config.news_channel_id,
+        "MARKETAPP_API_KEY": config.marketapp_api_key,
+        "MARKETAPP_WALLET": config.marketapp_wallet,
     })
 
     try:
         await application.bot.delete_webhook(drop_pending_updates=True)
         logger.info("Старый вебхук и pending updates удалены")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Ошибка удаления вебхука: {e}")
 
-    if NEWS_CHANNEL_ID:
+    if config.news_channel_id:
         setup_autoposting(application)
-        logger.info(f"Автопостинг настроен для {NEWS_CHANNEL_ID}")
+        logger.info(f"Автопостинг настроен для {config.news_channel_id}")
+
+    if config.marketapp_api_key and config.marketapp_wallet:
+        setup_marketapp_jobs(application)
+        logger.info("Marketapp отчеты настроены")
+
+
+async def post_shutdown(application: Application):
+    logger.info("Завершение работы бота...")
+    await close_client()
+    close_all()
+    logger.info("Бот остановлен")
 
 
 async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.inline_query.query.strip()
     if not query:
         return
+
+    user_id = update.inline_query.from_user.id
+    now = time.time()
+    last_call = _inline_rate_limit.get(user_id, 0)
+    if now - last_call < 3.0:
+        return
+    _inline_rate_limit[user_id] = now
 
     from utils.ai_responses import decide_speaker
     from prompts.loader import load_prompt
@@ -130,12 +151,16 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
             model=model,
             api_key=context.bot_data["OPENROUTER_API_KEY"]
         )
+
+        if response.startswith("Технические") or response.startswith("Слишком") or response.startswith("Сервис") or response.startswith("Все модели") or response.startswith("Модель вернула"):
+            return
+
         if len(response) > 1000:
             response = response[:997] + "..."
 
         results = [
             InlineQueryResultArticle(
-                id=f"allira_{hash(query)}",
+                id=str(uuid.uuid4()),
                 title=f"⚡ {speaker.title()}",
                 description=response[:100],
                 input_message_content=InputTextMessageContent(
@@ -155,7 +180,7 @@ async def clear_context_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 def main():
-    if not BOT_TOKEN:
+    if not config.bot_token:
         logger.critical("BOT_TOKEN не найден!")
         return
 
@@ -163,8 +188,9 @@ def main():
     logger.info("Health-check сервер запущен")
 
     application = Application.builder() \
-        .token(BOT_TOKEN) \
+        .token(config.bot_token) \
         .post_init(post_init) \
+        .post_shutdown(post_shutdown) \
         .build()
 
     application.add_handler(CommandHandler("start", start_command))
@@ -197,9 +223,9 @@ def main():
 
     application.add_handler(InlineQueryHandler(handle_inline_query))
 
-    if NEWS_CHANNEL_ID:
+    if config.news_channel_id:
         application.add_handler(MessageHandler(
-            filters.TEXT & filters.Chat(chat_id=NEWS_CHANNEL_ID) & ~filters.COMMAND,
+            filters.TEXT & filters.Chat(chat_id=config.news_channel_id) & ~filters.COMMAND,
             handle_message
         ))
 

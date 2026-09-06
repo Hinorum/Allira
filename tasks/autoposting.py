@@ -1,86 +1,33 @@
 import logging
 import random
 import asyncio
-import httpx
-import time
-import os
 import re
 import urllib.parse
+import time
+import os
+from io import BytesIO
 from datetime import datetime
+from cachetools import TTLCache
 from telegram.ext import ContextTypes
 from utils.ai_responses import generate_post_content
 from utils.database import increment_stat
+from utils.http_client import get_client, with_retry
 
 logger = logging.getLogger(__name__)
 
 COINGECKO_URL = "https://api.coingecko.com/api/v3"
 POLLINATIONS_URL = "https://image.pollinations.ai/prompt"
 
+_coingecko_cache = TTLCache(maxsize=5, ttl=600)
 last_request_time = 0
-
 
 
 def get_smart_interval() -> int:
     return random.choice([43200, 50400])
 
 
-async def get_crypto_data():
-    global last_request_time
-
-    current_time = time.time()
-    if current_time - last_request_time < 3.0:
-        await asyncio.sleep(3.0)
-    last_request_time = time.time()
-
-    endpoints = [
-        {
-            "url": f"{COINGECKO_URL}/coins/markets",
-            "params": {
-                "vs_currency": "usd",
-                "order": "market_cap_desc",
-                "per_page": 10,
-                "page": 1,
-                "sparkline": False,
-                "price_change_percentage": "24h,7d"
-            }
-        },
-        {
-            "url": f"{COINGECKO_URL}/trending",
-            "params": {}
-        },
-        {
-            "url": f"{COINGECKO_URL}/global",
-            "params": {}
-        }
-    ]
-
-    endpoint = random.choice(endpoints)
-
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(
-                endpoint["url"],
-                params=endpoint["params"],
-                headers={"User-Agent": "AlliraCryptoBot/1.0"}
-            )
-
-            if response.status_code == 429:
-                logger.warning("CoinGecko rate limit")
-                return get_fallback_crypto_data()
-
-            response.raise_for_status()
-            data = response.json()
-
-            if endpoint["url"].endswith("markets"):
-                return format_market_data(data)
-            elif endpoint["url"].endswith("trending"):
-                return format_trending_data(data)
-            else:
-                return format_global_data(data)
-
-    except Exception as e:
-        logger.error(f"CoinGecko error: {e}")
-        return get_fallback_crypto_data()
+def _escape_html(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def get_fallback_crypto_data():
@@ -92,10 +39,6 @@ def get_fallback_crypto_data():
         "Web3 и метавселенные набирают обороты. Следим за проектами, которые меняют правила игры."
     ]
     return random.choice(messages)
-
-
-def _escape_html(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def format_market_data(coins):
@@ -143,8 +86,79 @@ def format_global_data(data):
     return "\n".join(lines)
 
 
+@with_retry(max_retries=2, base_delay=2.0)
+async def _fetch_coingecko(url: str, params: dict):
+    client = await get_client()
+    return await client.get(
+        url,
+        params=params,
+        headers={"User-Agent": "AlliraCryptoBot/1.0"},
+        timeout=15.0
+    )
+
+
+async def get_crypto_data():
+    global last_request_time
+
+    cache_key = "coingecko_data"
+    if cache_key in _coingecko_cache:
+        return _coingecko_cache[cache_key]
+
+    current_time = time.time()
+    if current_time - last_request_time < 3.0:
+        await asyncio.sleep(3.0)
+    last_request_time = time.time()
+
+    endpoints = [
+        {
+            "url": f"{COINGECKO_URL}/coins/markets",
+            "params": {
+                "vs_currency": "usd",
+                "order": "market_cap_desc",
+                "per_page": 10,
+                "page": 1,
+                "sparkline": False,
+                "price_change_percentage": "24h,7d"
+            }
+        },
+        {
+            "url": f"{COINGECKO_URL}/trending",
+            "params": {}
+        },
+        {
+            "url": f"{COINGECKO_URL}/global",
+            "params": {}
+        }
+    ]
+
+    endpoint = random.choice(endpoints)
+
+    try:
+        response = await _fetch_coingecko(endpoint["url"], endpoint["params"])
+
+        if response.status_code == 429:
+            logger.warning("CoinGecko rate limit")
+            return get_fallback_crypto_data()
+
+        response.raise_for_status()
+        data = response.json()
+
+        if endpoint["url"].endswith("markets"):
+            result = format_market_data(data)
+        elif endpoint["url"].endswith("trending"):
+            result = format_trending_data(data)
+        else:
+            result = format_global_data(data)
+
+        _coingecko_cache[cache_key] = result
+        return result
+
+    except Exception as e:
+        logger.error(f"CoinGecko error: {e}")
+        return get_fallback_crypto_data()
+
+
 async def generate_image(post_text: str) -> bytes | None:
-    """Генерирует картинку через Pollinations.ai по настроению поста."""
     from utils.ai_responses import get_llm_response
 
     fallback_styles = [
@@ -181,14 +195,14 @@ async def generate_image(post_text: str) -> bytes | None:
     url = f"{POLLINATIONS_URL}/{encoded}?width=1280&height=720&nologo=true&seed={random.randint(1, 99999)}"
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.get(url, follow_redirects=True)
-            if response.status_code == 200 and len(response.content) > 1000:
-                logger.info(f"Картинка сгенерирована ({len(response.content)} bytes)")
-                return response.content
-            else:
-                logger.warning(f"Pollinations: плохой ответ ({response.status_code})")
-                return None
+        client = await get_client()
+        response = await client.get(url, follow_redirects=True, timeout=60.0)
+        if response.status_code == 200 and len(response.content) > 1000:
+            logger.info(f"Картинка сгенерирована ({len(response.content)} bytes)")
+            return response.content
+        else:
+            logger.warning(f"Pollinations: плохой ответ ({response.status_code})")
+            return None
     except Exception as e:
         logger.error(f"Pollinations error: {e}")
         return None
@@ -219,7 +233,6 @@ async def do_autoposting(context: ContextTypes.DEFAULT_TYPE):
         image_bytes = await generate_image(post_content)
 
         if image_bytes:
-            from io import BytesIO
             photo_file = BytesIO(image_bytes)
             photo_file.name = "crypto_post.jpg"
 
@@ -253,12 +266,11 @@ async def do_autoposting(context: ContextTypes.DEFAULT_TYPE):
 
 async def wakeup_task(context: ContextTypes.DEFAULT_TYPE):
     try:
-        import os
         port = int(os.getenv("PORT", "10000"))
-        async with httpx.AsyncClient() as client:
-            response = await client.get(f"http://localhost:{port}/health", timeout=5)
-            if response.status_code == 200:
-                logger.debug("Health-check OK")
+        client = await get_client()
+        response = await client.get(f"http://localhost:{port}/health", timeout=5)
+        if response.status_code == 200:
+            logger.debug("Health-check OK")
     except Exception as e:
         logger.error(f"Health-check failed: {e}")
 

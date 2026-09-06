@@ -1,6 +1,7 @@
 import sqlite3
 import logging
 import time
+import asyncio
 import threading
 from contextlib import contextmanager
 from datetime import datetime
@@ -29,6 +30,15 @@ def get_db():
     except Exception:
         conn.rollback()
         raise
+
+
+def close_all():
+    if hasattr(_local, "conn") and _local.conn is not None:
+        try:
+            _local.conn.close()
+        except Exception:
+            pass
+        _local.conn = None
 
 
 def init_db():
@@ -93,15 +103,28 @@ def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS marketapp_profit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                period TEXT NOT NULL,
+                profit_ton REAL NOT NULL,
+                recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                raw_response TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id);
             CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
             CREATE INDEX IF NOT EXISTS idx_tournaments_chat ON tournaments(chat_id);
             CREATE INDEX IF NOT EXISTS idx_tournament_players_tid ON tournament_players(tournament_id);
+            CREATE INDEX IF NOT EXISTS idx_marketapp_profit_period ON marketapp_profit(period, recorded_at);
         """)
     logger.info("База данных инициализирована")
 
 
-def upsert_user(user_id: int, username: str = None, first_name: str = None):
+def _sync_init_db():
+    init_db()
+
+
+def _sync_upsert_user(user_id: int, username: str = None, first_name: str = None):
     with get_db() as conn:
         conn.execute("""
             INSERT INTO users (user_id, username, first_name, last_seen, message_count)
@@ -114,7 +137,7 @@ def upsert_user(user_id: int, username: str = None, first_name: str = None):
         """, (user_id, username, first_name))
 
 
-def log_message(user_id: int, chat_id: int, chat_type: str, speaker: str):
+def _sync_log_message(user_id: int, chat_id: int, chat_type: str, speaker: str):
     with get_db() as conn:
         conn.execute("""
             INSERT INTO messages (user_id, chat_id, chat_type, speaker)
@@ -123,7 +146,7 @@ def log_message(user_id: int, chat_id: int, chat_type: str, speaker: str):
         increment_stat("total_messages")
 
 
-def check_rate_limit(user_id: int, chat_id: int, cooldown: float = 3.0, max_per_minute: int = 5) -> bool:
+def _sync_check_rate_limit(user_id: int, chat_id: int, cooldown: float = 3.0, max_per_minute: int = 5) -> bool:
     now = time.time()
     with get_db() as conn:
         row = conn.execute(
@@ -159,7 +182,19 @@ def check_rate_limit(user_id: int, chat_id: int, cooldown: float = 3.0, max_per_
         return True
 
 
-def save_tournament(chat_id: int, admin_id: int, mode: str, total_rounds: int,
+async def upsert_user(user_id: int, username: str = None, first_name: str = None):
+    await asyncio.to_thread(_sync_upsert_user, user_id, username, first_name)
+
+
+async def log_message(user_id: int, chat_id: int, chat_type: str, speaker: str):
+    await asyncio.to_thread(_sync_log_message, user_id, chat_id, chat_type, speaker)
+
+
+async def check_rate_limit(user_id: int, chat_id: int, cooldown: float = 3.0, max_per_minute: int = 5) -> bool:
+    return await asyncio.to_thread(_sync_check_rate_limit, user_id, chat_id, cooldown, max_per_minute)
+
+
+def _sync_save_tournament(chat_id: int, admin_id: int, mode: str, total_rounds: int,
                      total_players: int, winner_id: int = None, winner_name: str = None) -> int:
     with get_db() as conn:
         cursor = conn.execute("""
@@ -169,7 +204,7 @@ def save_tournament(chat_id: int, admin_id: int, mode: str, total_rounds: int,
         return cursor.lastrowid
 
 
-def save_tournament_players(tournament_id: int, players: dict):
+def _sync_save_tournament_players(tournament_id: int, players: dict):
     with get_db() as conn:
         for user_id, data in players.items():
             conn.execute("""
@@ -183,7 +218,16 @@ def save_tournament_players(tournament_id: int, players: dict):
             ))
 
 
-def get_tournament_history(limit: int = 10) -> list:
+async def save_tournament(chat_id: int, admin_id: int, mode: str, total_rounds: int,
+                     total_players: int, winner_id: int = None, winner_name: str = None) -> int:
+    return await asyncio.to_thread(_sync_save_tournament, chat_id, admin_id, mode, total_rounds, total_players, winner_id, winner_name)
+
+
+async def save_tournament_players(tournament_id: int, players: dict):
+    await asyncio.to_thread(_sync_save_tournament_players, tournament_id, players)
+
+
+def _sync_get_tournament_history(limit: int = 10) -> list:
     with get_db() as conn:
         rows = conn.execute("""
             SELECT t.*, 
@@ -195,7 +239,7 @@ def get_tournament_history(limit: int = 10) -> list:
         return [dict(r) for r in rows]
 
 
-def get_tournament_leaderboard(limit: int = 10) -> list:
+def _sync_get_tournament_leaderboard(limit: int = 10) -> list:
     with get_db() as conn:
         rows = conn.execute("""
             SELECT username, 
@@ -211,7 +255,7 @@ def get_tournament_leaderboard(limit: int = 10) -> list:
         return [dict(r) for r in rows]
 
 
-def get_top_speakers(limit: int = 10) -> list:
+def _sync_get_top_speakers(limit: int = 10) -> list:
     with get_db() as conn:
         rows = conn.execute("""
             SELECT speaker, COUNT(*) as count
@@ -224,7 +268,7 @@ def get_top_speakers(limit: int = 10) -> list:
         return [dict(r) for r in rows]
 
 
-def get_active_users(days: int = 7, limit: int = 10) -> list:
+def _sync_get_active_users(days: int = 7, limit: int = 10) -> list:
     with get_db() as conn:
         rows = conn.execute("""
             SELECT username, first_name, message_count
@@ -236,7 +280,23 @@ def get_active_users(days: int = 7, limit: int = 10) -> list:
         return [dict(r) for r in rows]
 
 
-def increment_stat(key: str, amount: int = 1):
+async def get_tournament_history(limit: int = 10) -> list:
+    return await asyncio.to_thread(_sync_get_tournament_history, limit)
+
+
+async def get_tournament_leaderboard(limit: int = 10) -> list:
+    return await asyncio.to_thread(_sync_get_tournament_leaderboard, limit)
+
+
+async def get_top_speakers(limit: int = 10) -> list:
+    return await asyncio.to_thread(_sync_get_top_speakers, limit)
+
+
+async def get_active_users(days: int = 7, limit: int = 10) -> list:
+    return await asyncio.to_thread(_sync_get_active_users, days, limit)
+
+
+def _sync_increment_stat(key: str, amount: int = 1):
     with get_db() as conn:
         conn.execute("""
             INSERT INTO bot_stats (key, value, updated_at)
@@ -247,25 +307,41 @@ def increment_stat(key: str, amount: int = 1):
         """, (key, amount, amount))
 
 
-def get_stat(key: str) -> int:
+def increment_stat(key: str, amount: int = 1):
+    _sync_increment_stat(key, amount)
+
+
+def _sync_get_stat(key: str) -> int:
     with get_db() as conn:
         row = conn.execute("SELECT value FROM bot_stats WHERE key=?", (key,)).fetchone()
         return row["value"] if row else 0
 
 
-def get_total_users() -> int:
+def get_stat(key: str) -> int:
+    return _sync_get_stat(key)
+
+
+def _sync_get_total_users() -> int:
     with get_db() as conn:
         row = conn.execute("SELECT COUNT(*) as cnt FROM users").fetchone()
         return row["cnt"] if row else 0
 
 
-def get_total_tournaments() -> int:
+def get_total_users() -> int:
+    return _sync_get_total_users()
+
+
+def _sync_get_total_tournaments() -> int:
     with get_db() as conn:
         row = conn.execute("SELECT COUNT(*) as cnt FROM tournaments").fetchone()
         return row["cnt"] if row else 0
 
 
-def get_messages_today() -> int:
+def get_total_tournaments() -> int:
+    return _sync_get_total_tournaments()
+
+
+def _sync_get_messages_today() -> int:
     with get_db() as conn:
         row = conn.execute(
             "SELECT COUNT(*) as cnt FROM messages WHERE timestamp > datetime('now', 'start of day')"
@@ -273,7 +349,74 @@ def get_messages_today() -> int:
         return row["cnt"] if row else 0
 
 
-def is_user_banned(user_id: int) -> bool:
+def get_messages_today() -> int:
+    return _sync_get_messages_today()
+
+
+def _sync_is_user_banned(user_id: int) -> bool:
     with get_db() as conn:
         row = conn.execute("SELECT is_banned FROM users WHERE user_id=?", (user_id,)).fetchone()
         return bool(row["is_banned"]) if row else False
+
+
+def is_user_banned(user_id: int) -> bool:
+    return _sync_is_user_banned(user_id)
+
+
+def _sync_save_marketapp_profit(period: str, profit_ton: float, raw_response: str = None):
+    with get_db() as conn:
+        conn.execute("""
+            INSERT INTO marketapp_profit (period, profit_ton, raw_response)
+            VALUES (?, ?, ?)
+        """, (period, profit_ton, raw_response))
+
+
+def _sync_get_latest_profit(period: str) -> dict | None:
+    with get_db() as conn:
+        row = conn.execute("""
+            SELECT profit_ton, recorded_at
+            FROM marketapp_profit
+            WHERE period = ?
+            ORDER BY recorded_at DESC
+            LIMIT 1
+        """, (period,)).fetchone()
+        return dict(row) if row else None
+
+
+def _sync_get_profit_for_period(period: str, days_back: int) -> list:
+    with get_db() as conn:
+        rows = conn.execute("""
+            SELECT profit_ton, recorded_at
+            FROM marketapp_profit
+            WHERE period = ? AND recorded_at > datetime('now', ?)
+            ORDER BY recorded_at DESC
+        """, (period, f"-{days_back} days")).fetchall()
+        return [dict(r) for r in rows]
+
+
+def _sync_get_previous_profit(period: str) -> dict | None:
+    with get_db() as conn:
+        row = conn.execute("""
+            SELECT profit_ton, recorded_at
+            FROM marketapp_profit
+            WHERE period = ?
+            ORDER BY recorded_at DESC
+            LIMIT 1 OFFSET 1
+        """, (period,)).fetchone()
+        return dict(row) if row else None
+
+
+async def save_marketapp_profit(period: str, profit_ton: float, raw_response: str = None):
+    await asyncio.to_thread(_sync_save_marketapp_profit, period, profit_ton, raw_response)
+
+
+async def get_latest_profit(period: str) -> dict | None:
+    return await asyncio.to_thread(_sync_get_latest_profit, period)
+
+
+async def get_profit_for_period(period: str, days_back: int) -> list:
+    return await asyncio.to_thread(_sync_get_profit_for_period, period, days_back)
+
+
+async def get_previous_profit(period: str) -> dict | None:
+    return await asyncio.to_thread(_sync_get_previous_profit, period)

@@ -1,8 +1,9 @@
 import logging
 import random
-import httpx
 import re
+import uuid
 from cachetools import TTLCache
+from utils.http_client import get_client, with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +16,10 @@ FALLBACK_MODELS = [
     "z-ai/glm-5.2:free",
     "nvidia/nemotron-3.5-lightning:free",
 ]
+
+_model_failures: dict[str, int] = {}
+CIRCUIT_BREAKER_THRESHOLD = 3
+CIRCUIT_BREAKER_RESET = 300
 
 REASONING_PATTERNS = [
     r'Хорошо[,.].*?пользователь',
@@ -34,7 +39,6 @@ REASONING_PATTERNS = [
 ]
 
 def strip_reasoning(text: str) -> str:
-    """Убирает internal reasoning/thinking из ответов моделей"""
     if not text:
         return text
 
@@ -63,9 +67,7 @@ def strip_reasoning(text: str) -> str:
             result_lines.append(line)
 
     result = '\n'.join(result_lines).strip()
-
     result = re.sub(r'```[\s\S]*?```', '', result)
-
     result = re.sub(r'\n{3,}', '\n\n', result).strip()
 
     if len(result) < 10 and len(text) > 50:
@@ -81,22 +83,36 @@ def strip_reasoning(text: str) -> str:
     return result
 
 response_cache = TTLCache(maxsize=100, ttl=300)
-image_prompt_cache = TTLCache(maxsize=50, ttl=600)
+
+def _is_circuit_open(model: str) -> bool:
+    failures = _model_failures.get(model, 0)
+    return failures >= CIRCUIT_BREAKER_THRESHOLD
+
+def _record_failure(model: str):
+    _model_failures[model] = _model_failures.get(model, 0) + 1
+
+def _record_success(model: str):
+    _model_failures.pop(model, None)
+
+@with_retry(max_retries=2, base_delay=1.0)
+async def _call_openrouter(payload: dict, headers: dict, timeout: float = 25.0):
+    client = await get_client()
+    return await client.post(OPENROUTER_URL, json=payload, headers=headers, timeout=timeout)
 
 async def get_llm_response(user_prompt: str, system_prompt: str, model: str, api_key: str) -> str:
-    cache_key = f"{model}:{hash(user_prompt[:100] + system_prompt[:100])}"
-    
+    cache_key = f"{model}:{uuid.uuid5(uuid.NAMESPACE_DNS, user_prompt[:100] + system_prompt[:100])}"
+
     if cache_key in response_cache:
         logger.debug("Использован кэшированный ответ")
         return response_cache[cache_key]
-    
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://t.me/AlliraCryptoBot",
         "X-Title": "AlliraCryptoBot"
     }
-    
+
     payload = {
         "model": model,
         "messages": [
@@ -108,172 +124,116 @@ async def get_llm_response(user_prompt: str, system_prompt: str, model: str, api
         "top_p": 0.9,
         "frequency_penalty": 0.5
     }
-    
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(OPENROUTER_URL, json=payload, headers=headers)
-            
-            if response.status_code == 429:
-                logger.warning("Превышен лимит API")
-                return "Слишком много запросов! Дай мне минутку передохнуть..."
-                
-            def _extract_content(data: dict) -> str | None:
-                choices = data.get("choices")
-                if not choices or not isinstance(choices, list) or len(choices) == 0:
-                    return None
-                msg = choices[0].get("message", {})
-                content = msg.get("content")
-                if not content or not isinstance(content, str):
-                    return None
-                return content
 
-            def _parse_ok(resp) -> str | None:
-                data = resp.json()
-                content = _extract_content(data)
-                if content:
-                    return strip_reasoning(content)
-                logger.warning(f"Нет content в ответе модели: {str(data)[:300]}")
-                return None
+    def _extract_content(data: dict) -> str | None:
+        choices = data.get("choices")
+        if not choices or not isinstance(choices, list) or len(choices) == 0:
+            return None
+        msg = choices[0].get("message", {})
+        content = msg.get("content")
+        if not content or not isinstance(content, str):
+            return None
+        return content
 
-            async def _try_models(primary: str) -> str | None:
-                payload["model"] = primary
-                resp = await client.post(OPENROUTER_URL, json=payload, headers=headers)
+    def _parse_ok(resp) -> str | None:
+        data = resp.json()
+        content = _extract_content(data)
+        if content:
+            return strip_reasoning(content)
+        logger.warning(f"Нет content в ответе модели: {str(data)[:300]}")
+        return None
+
+    async def _try_models(primary: str) -> str | None:
+        models_to_try = [primary] + [m for m in FALLBACK_MODELS if m != primary]
+
+        for m in models_to_try:
+            if _is_circuit_open(m):
+                logger.warning(f"Модель {m} заблокирована circuit breaker")
+                continue
+
+            payload["model"] = m
+            try:
+                resp = await _call_openrouter(payload, headers, timeout=25.0)
                 if resp.status_code == 200:
                     result = _parse_ok(resp)
                     if result:
-                        logger.info(f"Модель {primary} работает!")
+                        _record_success(m)
+                        logger.info(f"Модель {m} работает!")
                         return result
                 else:
-                    logger.warning(f"Модель {primary} вернула {resp.status_code}")
+                    logger.warning(f"Модель {m} вернула {resp.status_code}")
+                    _record_failure(m)
+            except Exception as e:
+                logger.warning(f"Модель {m} ошибка: {e}")
+                _record_failure(m)
 
-                for fallback_model in FALLBACK_MODELS:
-                    if fallback_model == primary:
-                        continue
-                    payload["model"] = fallback_model
-                    resp = await client.post(OPENROUTER_URL, json=payload, headers=headers)
-                    if resp.status_code == 200:
-                        result = _parse_ok(resp)
-                        if result:
-                            logger.info(f"Модель {fallback_model} работает (fallback)!")
-                            return result
-                    else:
-                        logger.warning(f"Модель {fallback_model} вернула {resp.status_code}")
-                return None
+        return None
 
-            if response.status_code != 200:
-                logger.error(f"OpenRouter API error {response.status_code}: {response.text[:500]}")
-                if response.status_code in (400, 404, 402):
-                    result = await _try_models(model)
-                    if result:
-                        response_cache[cache_key] = result[:2000]
-                        return result
-                    return "Все модели временно недоступны. Попробуй позже!"
-                response.raise_for_status()
-                return "Сервис временно недоступен. Попробуй позже!"
+    try:
+        resp = await _call_openrouter(payload, headers, timeout=30.0)
 
-            result = _parse_ok(response)
-            if result:
-                response_cache[cache_key] = result[:2000]
-                return result
+        if resp.status_code == 429:
+            logger.warning("Превышен лимит API")
+            return "Слишком много запросов! Дай мне минутку передохнуть..."
 
-            logger.warning(f"Некорректный ответ, пробуем fallback модели")
-            result = await _try_models(model)
-            if result:
-                response_cache[cache_key] = result[:2000]
-                return result
-            return "Модель вернула пустой ответ. Попробуй переформулировать!"
-            
-    except httpx.TimeoutException:
-        logger.error("Таймаут API")
-        return "Что-то я сегодня медленная... Попробуй позже!"
+        if resp.status_code != 200:
+            logger.error(f"OpenRouter API error {resp.status_code}: {resp.text[:500]}")
+            if resp.status_code in (400, 404, 402):
+                result = await _try_models(model)
+                if result:
+                    response_cache[cache_key] = result[:2000]
+                    return result
+                return "Все модели временно недоступны. Попробуй позже!"
+            return "Сервис временно недоступен. Попробуй позже!"
+
+        result = _parse_ok(resp)
+        if result:
+            _record_success(model)
+            response_cache[cache_key] = result[:2000]
+            return result
+
+        logger.warning(f"Некорректный ответ, пробуем fallback модели")
+        result = await _try_models(model)
+        if result:
+            response_cache[cache_key] = result[:2000]
+            return result
+        return "Модель вернула пустой ответ. Попробуй переформулировать!"
+
     except Exception as e:
         logger.error(f"Ошибка LLM: {e}")
         return "Технические неполадки! Попробуй еще раз."
 
 def decide_speaker(text: str) -> str:
     text_lower = text.lower()
-    
+
     if re.search(r'\b(лейн|lane)\b', text_lower):
         return "lane"
     if re.search(r'\b(аллира|allira)\b', text_lower):
         return "allira"
-    
+
     lane_keywords = [
         'технологи', 'техно', 'ai', 'ии', 'искусственный интеллект',
         'нейросет', 'алгоритм', 'инноваци', 'футур',
         'робот', 'автоматизаци', 'квантов', 'метавселен', 'web3',
         'сингулярност', 'цифровой', 'кибер', 'наука'
     ]
-    
+
     allira_keywords = [
         'крипт', 'crypto', 'биткоин', 'bitcoin', 'эфир', 'eth',
         'блокчейн', 'blockchain', 'nft', 'децентрализаци', 'майнинг',
         'токен', 'coin', 'бирж', 'wallet', 'кошелек', 'инвестици',
         'трейд', 'торгов', 'рынок', 'курс', 'дип', 'памп', 'дам'
     ]
-    
+
     lane_score = sum(1 for kw in lane_keywords if kw in text_lower)
     allira_score = sum(1 for kw in allira_keywords if kw in text_lower)
-    
+
     if lane_score > allira_score:
         return "lane"
     elif allira_score > lane_score:
         return "allira"
-    
+
     return "allira" if random.random() > 0.4 else "lane"
-
-async def generate_image_description(text: str, model: str, api_key: str) -> str:
-    cache_key = f"img_{hash(text[:200])}"
-    
-    if cache_key in image_prompt_cache:
-        return image_prompt_cache[cache_key]
-    
-    prompt_styles = [
-        "abstract digital art about",
-        "minimalist illustration of",
-        "futuristic concept of",
-        "data visualization style for",
-        "neon cyberpunk scene with",
-        "professional business visualization of",
-        "artistic representation of"
-    ]
-    
-    style = random.choice(prompt_styles)
-    
-    prompt = f"""Generate a short English image description (3-5 words) in style: "{style}"
-Topic: {text[:200]}
-Rules:
-- No cryptocurrency names
-- Focus on visual elements
-- Be creative and varied
-- Use different styles each time"""
-
-    try:
-        description = await get_llm_response(
-            user_prompt=prompt,
-            system_prompt="You are an image prompt generator. Reply with ONLY the description, no other text.",
-            model=model,
-            api_key=api_key
-        )
-        
-        description = re.sub(r'[^a-zA-Z\s]', '', description).strip()
-        
-        if not description or len(description.split()) < 2:
-            fallbacks = [
-                "cryptocurrency market analysis",
-                "digital finance technology",
-                "blockchain innovation concept",
-                "modern trading dashboard",
-                "financial data visualization"
-            ]
-            description = random.choice(fallbacks)
-        
-        image_prompt_cache[cache_key] = description
-        return description
-        
-    except Exception as e:
-        logger.error(f"Ошибка генерации описания: {e}")
-        return "abstract digital finance"
 
 async def generate_post_content(topic: str, speaker: str, model: str, api_key: str) -> str:
     if speaker == "allira":

@@ -17,8 +17,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     messages_today = get_messages_today()
     total_messages = get_stat("total_messages")
 
-    top_users = get_active_users(days=30, limit=5)
-    top_speakers = get_top_speakers(limit=3)
+    top_users = await get_active_users(days=30, limit=5)
+    top_speakers = await get_top_speakers(limit=3)
 
     lines = [
         "**=> СТАТИСТИКА БОТА**\n",
@@ -44,7 +44,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    history = get_tournament_history(limit=10)
+    history = await get_tournament_history(limit=10)
 
     if not history:
         await update.message.reply_text("=> Турниров пока не было. Запусти первый: /start_tournament")
@@ -67,7 +67,7 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    leaders = get_tournament_leaderboard(limit=10)
+    leaders = await get_tournament_leaderboard(limit=10)
 
     if not leaders:
         await update.message.reply_text("=> Пока нет чемпионов. Сыграй турнир!")

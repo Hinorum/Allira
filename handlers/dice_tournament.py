@@ -13,21 +13,58 @@ logger = logging.getLogger(__name__)
 last_roll_times = {}
 ROLL_COOLDOWN = 2.0
 
-# Состояние турнира
+_tournament_states: dict[int, dict] = {}
+
 dice_tournament_state = {
     "active": False,
     "registration_open": False,
-    "players": {},  # {user_id: {"user_id": int, "username": str, "current_roll": int, "total_score": int, "rounds_won": int, "is_eliminated": bool, "eliminated_round": int}}
+    "players": {},
     "current_round": 0,
-    "round_matches": [],  # Список кортежей (p1_id, p2_id)
-    "tournament_mode": None,  # "pair_match" или "all_vs_all"
+    "round_matches": [],
+    "tournament_mode": None,
     "tournament_message_id": None,
     "tournament_chat_id": None,
-    "active_players_in_round": set(),  # Игроки, которые должны бросить кубик
-    "player_rolls_in_round": {},  # {user_id: roll_value} для текущего раунда
+    "active_players_in_round": set(),
+    "player_rolls_in_round": {},
     "admin_user_id": None,
-    "player_with_bye": None,  # Игрок с пропуском раунда
+    "player_with_bye": None,
 }
+
+
+def _get_state(chat_id: int) -> dict:
+    if chat_id not in _tournament_states:
+        _tournament_states[chat_id] = {
+            "active": False,
+            "registration_open": False,
+            "players": {},
+            "current_round": 0,
+            "round_matches": [],
+            "tournament_mode": None,
+            "tournament_message_id": None,
+            "tournament_chat_id": None,
+            "active_players_in_round": set(),
+            "player_rolls_in_round": {},
+            "admin_user_id": None,
+            "player_with_bye": None,
+        }
+    return _tournament_states[chat_id]
+
+
+def _reset_state(chat_id: int):
+    _tournament_states[chat_id] = {
+        "active": False,
+        "registration_open": False,
+        "players": {},
+        "current_round": 0,
+        "round_matches": [],
+        "tournament_mode": None,
+        "tournament_message_id": None,
+        "tournament_chat_id": chat_id,
+        "active_players_in_round": set(),
+        "player_rolls_in_round": {},
+        "admin_user_id": None,
+        "player_with_bye": None,
+    }
 
 def get_tournament_status_message() -> str:
     """Формирует сообщение о текущем статусе турнира."""
@@ -615,7 +652,8 @@ async def register_for_tournament(update: Update, context: ContextTypes.DEFAULT_
         if state.get("tournament_message_id") and state.get("tournament_chat_id"):
             try:
                 await query.message.edit_text("Турнир не активен.", reply_markup=None)
-            except Exception: pass # Игнорируем ошибку редактирования, если сообщение уже удалено/изменено
+            except Exception:
+                pass
         return
     if not state["registration_open"]:
         await query.answer("Регистрация на турнир уже завершена.", show_alert=True)
@@ -669,7 +707,7 @@ async def end_registration_and_start_round(update: Update, context: ContextTypes
         msg_text = "Турнир не активен. Начни новый через /start_tournament."
         try:
             await message_to_interact_with.edit_text(msg_text, reply_markup=None)
-        except Exception: # Если редактирование не удалось
+        except Exception:
             await context.bot.send_message(chat_id=message_to_interact_with.chat_id, text=msg_text)
         return
 
@@ -920,7 +958,7 @@ async def make_tournament_roll(update: Update, context: ContextTypes.DEFAULT_TYP
         # Уведомляем пользователя об ошибке через answer, если это еще возможно
         try:
             await query.answer("Произошла ошибка при броске кубика. Попробуйте еще раз.", show_alert=True)
-        except: # Если answer уже был вызван или query устарел
+        except Exception:
             await context.bot.send_message(chat_id=query.message.chat_id, text=f"{user.first_name}, произошла ошибка при вашем броске. Попробуйте снова нажать кнопку.")
 
 

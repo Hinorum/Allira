@@ -45,26 +45,30 @@ def load_prompt(speaker: str) -> str:
     if speaker not in prompt_cache:
         prompt_cache[speaker] = {
             "custom": None,
+            "checked_fs": False,
             "base": BASE_PROMPTS.get(speaker, [""])
         }
 
-    custom_prompt = None
-    try:
-        for ext in [".txt", ""]:
-            file_path = os.path.join("prompts", f"{speaker}{ext}")
-            if os.path.exists(file_path):
-                with open(file_path, "r", encoding="utf-8") as f:
-                    custom_prompt = f.read().strip()
-                    if custom_prompt:
-                        prompt_cache[speaker]["custom"] = custom_prompt
-                        break
-    except Exception as e:
-        logger.debug(f"Нет кастомного промпта для {speaker}: {e}")
+    cache = prompt_cache[speaker]
 
-    if prompt_cache[speaker]["custom"]:
-        base = prompt_cache[speaker]["custom"]
+    if not cache["checked_fs"]:
+        cache["checked_fs"] = True
+        try:
+            for ext in [".txt", ""]:
+                file_path = os.path.join("prompts", f"{speaker}{ext}")
+                if os.path.exists(file_path):
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        custom_prompt = f.read().strip()
+                        if custom_prompt:
+                            cache["custom"] = custom_prompt
+                            break
+        except Exception as e:
+            logger.debug(f"Нет кастомного промпта для {speaker}: {e}")
+
+    if cache["custom"]:
+        base = cache["custom"]
     else:
-        base = random.choice(prompt_cache[speaker]["base"])
+        base = random.choice(cache["base"])
 
     suffix = STYLE_SUFFIXES.get(speaker, "")
     return base + suffix
