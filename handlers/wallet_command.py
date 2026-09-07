@@ -42,19 +42,21 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
         items = await fetch_rent_history(api_token, category, limit=100)
         if items:
             for item in items:
-                dst = item.get("dst", "")
                 all_events.append(item)
-                if _normalize_address(dst) == normalized:
-                    logger.info(f"MATCH: {item}")
+
+    if all_events:
+        for ev in all_events[:5]:
+            logger.info(f"Sample dst: [{ev.get('dst')}] src: [{ev.get('src')}] price: {ev.get('price_nano')}")
+
+    matched = [e for e in all_events if _normalize_address(e.get("dst", "")) == normalized]
 
     logger.info(f"Wallet: {wallet_address}, Normalized: {normalized}")
-    logger.info(f"Total events: {len(all_events)}")
+    logger.info(f"Total events: {len(all_events)}, Matched: {len(matched)}")
 
     now_ts = _ts_now()
     day_ts = now_ts - 86400
     week_ts = now_ts - 604800
 
-    matched = [e for e in all_events if _normalize_address(e.get("dst", "")) == normalized]
     day_income = sum(_nano_to_ton(e.get("price_nano", "0")) for e in matched if e.get("ts", 0) >= day_ts)
     week_income = sum(_nano_to_ton(e.get("price_nano", "0")) for e in matched if e.get("ts", 0) >= week_ts)
     total_income = sum(_nano_to_ton(e.get("price_nano", "0")) for e in matched)
