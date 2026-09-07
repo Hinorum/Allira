@@ -7,11 +7,11 @@ from tasks.marketapp_reports import fetch_profit
 logger = logging.getLogger(__name__)
 
 
-async def wallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
-            "Использование: /wallet <адрес_кошелька>\n"
-            "Пример: /wallet UQDCaRr4ZXxAv46TNQhwpsdhKIz8IqoBqbOvpWhBgvxplaqA"
+            "Использование: /marketapprent <адрес_кошелька>\n"
+            "Пример: /marketapprent UQDCaRr4ZXxAv46TNQhwpsdhKIz8IqoBqbOvpWhBgvxplaqA"
         )
         return
 
