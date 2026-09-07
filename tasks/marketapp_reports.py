@@ -10,6 +10,8 @@ logger = logging.getLogger(__name__)
 MARKETAPP_API_URL = "https://api.marketapp.org"
 RENT_CATEGORIES = ["gifts", "usernames", "numbers"]
 
+MSK = timezone(timedelta(hours=3))
+
 
 def _escape_html(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -23,6 +25,14 @@ def _format_ton(value: float) -> str:
 
 def _nano_to_ton(nano: str) -> float:
     return int(nano) / 1_000_000_000
+
+
+def _ts_now() -> int:
+    return int(datetime.now(MSK).timestamp())
+
+
+def _ts_days_ago(days: int) -> int:
+    return int((datetime.now(MSK) - timedelta(days=days)).timestamp())
 
 
 @with_retry(max_retries=2, base_delay=1.0)
@@ -46,28 +56,18 @@ async def fetch_rent_history(api_token: str, category: str, limit: int = 100) ->
         return None
 
 
-async def fetch_total_rent_income(api_token: str) -> dict | None:
+async def fetch_income_for_period(api_token: str, since_ts: int) -> float:
     total_ton = 0.0
-    events = []
 
     for category in RENT_CATEGORIES:
         items = await fetch_rent_history(api_token, category, limit=100)
         if items:
             for item in items:
-                price_ton = _nano_to_ton(item.get("price_nano", "0"))
-                total_ton += price_ton
-                events.append({
-                    "name": item.get("name", "?"),
-                    "category": category,
-                    "price_ton": price_ton,
-                    "ts": item.get("ts", 0),
-                })
+                ts = item.get("ts", 0)
+                if ts >= since_ts:
+                    total_ton += _nano_to_ton(item.get("price_nano", "0"))
 
-    if not events:
-        return None
-
-    events.sort(key=lambda x: x["ts"], reverse=True)
-    return {"total_ton": total_ton, "events": events[:10]}
+    return total_ton
 
 
 async def fetch_my_rented(api_token: str) -> list | None:
@@ -87,11 +87,6 @@ async def fetch_my_rented(api_token: str) -> list | None:
     except Exception as e:
         logger.error(f"Marketapp API ошибка (my-rented): {e}")
         return None
-
-
-@with_retry(max_retries=2, base_delay=1.0)
-async def fetch_profit(api_key: str, wallet_address: str, period: str) -> float | None:
-    return None
 
 
 def format_daily_report(current_profit: float, previous_profit: float | None) -> str:
@@ -188,17 +183,17 @@ async def _send_report(context: ContextTypes.DEFAULT_TYPE, period: str, report_t
 async def daily_profit_report(context: ContextTypes.DEFAULT_TYPE):
     try:
         bot_data = context.bot_data
-        api_key = bot_data.get("MARKETAPP_API_KEY")
-        wallet_address = bot_data.get("MARKETAPP_WALLET")
+        api_token = bot_data.get("MARKETAPP_API_KEY")
 
-        if not api_key or not wallet_address:
-            logger.warning("MARKETAPP_API_KEY или MARKETAPP_WALLET не заданы")
+        if not api_token:
+            logger.warning("MARKETAPP_API_KEY не задан")
             return
 
         logger.info("Получаю данные за сутки...")
-        profit = await fetch_profit(api_key, wallet_address, "day")
+        since_ts = _ts_days_ago(1)
+        profit = await fetch_income_for_period(api_token, since_ts)
 
-        if profit is None:
+        if profit == 0:
             logger.warning("Не удалось получить данные за сутки")
             return
 
@@ -216,16 +211,16 @@ async def daily_profit_report(context: ContextTypes.DEFAULT_TYPE):
 async def weekly_profit_report(context: ContextTypes.DEFAULT_TYPE):
     try:
         bot_data = context.bot_data
-        api_key = bot_data.get("MARKETAPP_API_KEY")
-        wallet_address = bot_data.get("MARKETAPP_WALLET")
+        api_token = bot_data.get("MARKETAPP_API_KEY")
 
-        if not api_key or not wallet_address:
+        if not api_token:
             return
 
         logger.info("Получаю данные за неделю...")
-        profit = await fetch_profit(api_key, wallet_address, "week")
+        since_ts = _ts_days_ago(7)
+        profit = await fetch_income_for_period(api_token, since_ts)
 
-        if profit is not None:
+        if profit > 0:
             await save_marketapp_profit("week", profit)
 
         profits = await get_profit_for_period("day", 7)
@@ -243,16 +238,16 @@ async def monthly_profit_report(context: ContextTypes.DEFAULT_TYPE):
             return
 
         bot_data = context.bot_data
-        api_key = bot_data.get("MARKETAPP_API_KEY")
-        wallet_address = bot_data.get("MARKETAPP_WALLET")
+        api_token = bot_data.get("MARKETAPP_API_KEY")
 
-        if not api_key or not wallet_address:
+        if not api_token:
             return
 
         logger.info("Получаю данные за месяц...")
-        profit = await fetch_profit(api_key, wallet_address, "month")
+        since_ts = _ts_days_ago(30)
+        profit = await fetch_income_for_period(api_token, since_ts)
 
-        if profit is not None:
+        if profit > 0:
             await save_marketapp_profit("month", profit)
 
         profits = await get_profit_for_period("day", 30)
@@ -270,7 +265,6 @@ def setup_marketapp_jobs(application):
         for job in jobs:
             job.schedule_removal()
 
-    MSK = timezone(timedelta(hours=3))
     report_time = dt_time(hour=9, minute=0, tzinfo=MSK)
 
     application.job_queue.run_daily(

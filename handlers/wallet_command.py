@@ -2,7 +2,7 @@ import logging
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from tasks.marketapp_reports import fetch_total_rent_income, fetch_my_rented
+from tasks.marketapp_reports import fetch_my_rented, fetch_income_for_period, _ts_now, _format_ton
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +17,15 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("Получаю данные по аренде...")
 
     rented = await fetch_my_rented(api_token)
-    income = await fetch_total_rent_income(api_token)
+
+    now_ts = _ts_now()
+    day_ts = now_ts - 86400
+    week_ts = now_ts - 604800
+    month_ts = now_ts - 2592000
+
+    day_income = await fetch_income_for_period(api_token, day_ts)
+    week_income = await fetch_income_for_period(api_token, week_ts)
+    month_income = await fetch_income_for_period(api_token, month_ts)
 
     lines = ["<b>Данные по аренде Marketapp:</b>\n"]
 
@@ -32,20 +40,9 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
         lines.append("Активные аренды: нет данных")
 
     lines.append("")
-
-    if income:
-        lines.append(f"<b>Общий доход:</b> {_format_ton(income['total_ton'])} TON")
-        if income["events"]:
-            lines.append("\n<b>Последние поступления:</b>")
-            for ev in income["events"][:5]:
-                lines.append(f"  {ev['name']} ({ev['category']}): {_format_ton(ev['price_ton'])} TON")
-    else:
-        lines.append("Доход: нет данных")
+    lines.append(f"<b>Доход:</b>")
+    lines.append(f"  Сутки: {_format_ton(day_income)} TON")
+    lines.append(f"  Неделя: {_format_ton(week_income)} TON")
+    lines.append(f"  Месяц: {_format_ton(month_income)} TON")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-
-
-def _format_ton(value: float) -> str:
-    if value >= 1000:
-        return f"{value:,.2f}"
-    return f"{value:.2f}"
