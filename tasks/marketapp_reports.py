@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import logging
+import httpx
 from datetime import datetime, timedelta, timezone, time as dt_time
 from telegram.ext import ContextTypes
 
@@ -8,6 +9,7 @@ from utils.database import (
     save_marketapp_profit, get_previous_profit, get_profit_for_period,
     save_rent_events, save_blockchain_rent_events, get_sync_state, set_sync_state
 )
+from utils.config import BotConfig
 from utils.http_client import get_client, with_retry
 
 logger = logging.getLogger(__name__)
@@ -15,6 +17,9 @@ logger = logging.getLogger(__name__)
 MARKETAPP_API_URL = "https://api.marketapp.org"
 TONCENTER_API_URL = "https://toncenter.com/api/v2"
 RENT_CATEGORIES = ["gifts", "usernames", "numbers"]
+RENT_COMMENT_MARKERS = ("marketapp", "rent")
+MAX_PAGE_RETRIES = 5
+MAX_HISTORY_PAGES = 500
 
 MSK = timezone(timedelta(hours=3))
 
@@ -58,38 +63,59 @@ def userfriendly_to_raw(addr: str) -> str:
 
 
 @with_retry(max_retries=2, base_delay=5.0)
-async def fetch_toncenter_txns(address: str, limit: int = 100, lt: str = None, hash_val: str = None) -> list | None:
-    try:
-        params = {"address": address, "limit": limit}
-        if lt and hash_val:
-            import urllib.parse
-            params["lt"] = lt
-            params["hash"] = hash_val
-        client = await get_client()
-        response = await client.get(
-            f"{TONCENTER_API_URL}/getTransactions",
-            params=params,
-            timeout=20.0
-        )
+async def fetch_toncenter_txns(address: str, limit: int = 100, lt: str = None, hash_val: str = None,
+                               api_key: str = None) -> list | None:
+    params = {"address": address, "limit": limit}
+    if lt and hash_val:
+        params["lt"] = lt
+        params["hash"] = hash_val
+    headers = {"User-Agent": "AlliraBot/1.0"}
+    if api_key:
+        headers["X-API-Key"] = api_key
+
+    client = await get_client()
+    for attempt in range(MAX_PAGE_RETRIES):
+        try:
+            response = await client.get(
+                f"{TONCENTER_API_URL}/getTransactions",
+                params=params,
+                headers=headers,
+                timeout=20.0
+            )
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+            logger.warning(f"TON Center сеть (попытка {attempt + 1}/{MAX_PAGE_RETRIES}): {e}")
+            await asyncio.sleep(2.0)
+            continue
+
         if response.status_code == 429:
-            retry_after = int(response.headers.get("Retry-After", "10"))
+            retry_after = int(response.headers.get("Retry-After", "5"))
             logger.warning(f"TON Center 429, ожидание {retry_after}с...")
             await asyncio.sleep(retry_after)
-            return None
-        response.raise_for_status()
-        data = response.json()
+            continue
+
+        if response.status_code != 200:
+            logger.error(f"TON Center API статус {response.status_code}: {response.text[:200]}")
+            await asyncio.sleep(2.0)
+            continue
+
+        try:
+            data = response.json()
+        except Exception:
+            logger.error("TON Center API: невалидный JSON")
+            await asyncio.sleep(2.0)
+            continue
+
         if not data.get("ok"):
             logger.error(f"TON Center API: {data}")
             return None
         return data.get("result", [])
-    except Exception as e:
-        logger.error(f"TON Center API ошибка: {e}")
-        return None
+    return None
 
 
 @with_retry(max_retries=2, base_delay=3.0)
 async def sync_rent_from_blockchain(wallet: str, max_pages: int = 50, from_scratch: bool = False) -> int:
     raw_wallet = userfriendly_to_raw(wallet)
+    api_key = BotConfig.from_env().toncenter_api_key
 
     boundary_lt = None
     boundary_hash = None
@@ -103,19 +129,31 @@ async def sync_rent_from_blockchain(wallet: str, max_pages: int = 50, from_scrat
     cur_hash = None
     new_events = []
     pages = 0
-    reached_boundary = False
+    scan_complete = False
     deep_lt = None
     deep_hash = None
     deep_utime = 0
 
-    while pages < max_pages:
+    while pages < max_pages and not scan_complete:
         if pages > 0:
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(1.0 if not api_key else 0.3)
 
-        items = await fetch_toncenter_txns(wallet, limit=100, lt=cur_lt, hash_val=cur_hash)
-        if not items:
+        items = None
+        for attempt in range(MAX_PAGE_RETRIES):
+            items = await fetch_toncenter_txns(wallet, limit=100, lt=cur_lt, hash_val=cur_hash, api_key=api_key)
+            if items is not None:
+                break
+            await asyncio.sleep(2.0)
+
+        if items is None:
+            logger.error("TON Center недоступен — история синхронизирована не полностью")
             break
 
+        if not items:
+            scan_complete = True
+            break
+
+        found_boundary = False
         page_cursor_lt = None
         page_cursor_hash = None
         page_last_utime = 0
@@ -128,7 +166,10 @@ async def sync_rent_from_blockchain(wallet: str, max_pages: int = 50, from_scrat
             page_last_utime = item.get("utime", 0)
 
             if boundary_lt is not None and tx_lt == boundary_lt and tx_hash == boundary_hash:
-                reached_boundary = True
+                deep_lt = tx_lt
+                deep_hash = tx_hash
+                deep_utime = page_last_utime
+                found_boundary = True
                 break
 
             in_msg = item.get("in_msg", {})
@@ -137,7 +178,7 @@ async def sync_rent_from_blockchain(wallet: str, max_pages: int = 50, from_scrat
                 continue
 
             message = in_msg.get("message", "")
-            if "marketapp" not in message.lower():
+            if not any(marker in message.lower() for marker in RENT_COMMENT_MARKERS):
                 continue
 
             utime = item.get("utime", 0)
@@ -153,19 +194,20 @@ async def sync_rent_from_blockchain(wallet: str, max_pages: int = 50, from_scrat
                 "value_nano": str(value),
             })
 
-        if reached_boundary:
+        if found_boundary:
+            scan_complete = True
             break
 
         if not page_cursor_lt or not page_cursor_hash:
             break
 
-        deep_lt = page_cursor_lt
-        deep_hash = page_cursor_hash
-        deep_utime = page_last_utime
         cur_lt, cur_hash = page_cursor_lt, page_cursor_hash
+        deep_lt = cur_lt
+        deep_hash = cur_hash
+        deep_utime = page_last_utime
         pages += 1
 
-    if deep_lt and deep_hash:
+    if scan_complete and deep_lt and deep_hash:
         await set_sync_state(wallet, deep_lt, deep_hash, deep_utime)
 
     if new_events:
@@ -186,29 +228,52 @@ async def sync_blockchain_rent_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 @with_retry(max_retries=2, base_delay=5.0)
-async def fetch_rent_history(api_token: str, category: str, limit: int = 100) -> list | None:
-    try:
-        client = await get_client()
-        response = await client.get(
-            f"{MARKETAPP_API_URL}/v1/rent/{category}/history/",
-            params={"limit": limit},
-            headers={
-                "Authorization": api_token,
-                "User-Agent": "AlliraBot/1.0"
-            },
-            timeout=15.0
-        )
+async def fetch_rent_history(api_token: str, category: str, limit: int = 100,
+                             cursor: str = None) -> tuple[list | None, str | None]:
+    params = {"limit": limit}
+    if cursor:
+        params["cursor"] = cursor
+    headers = {
+        "Authorization": api_token,
+        "User-Agent": "AlliraBot/1.0"
+    }
+
+    client = await get_client()
+    for attempt in range(MAX_PAGE_RETRIES):
+        try:
+            response = await client.get(
+                f"{MARKETAPP_API_URL}/v1/rent/{category}/history/",
+                params=params,
+                headers=headers,
+                timeout=15.0
+            )
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+            logger.warning(f"Marketapp сеть (попытка {attempt + 1}/{MAX_PAGE_RETRIES}): {e}")
+            await asyncio.sleep(2.0)
+            continue
+
         if response.status_code == 429:
-            retry_after = int(response.headers.get("Retry-After", "10"))
+            retry_after = int(response.headers.get("Retry-After", "5"))
             logger.warning(f"Marketapp API 429, ожидание {retry_after}с...")
             await asyncio.sleep(retry_after)
-            return None
-        response.raise_for_status()
-        data = response.json()
-        return data.get("items", [])
-    except Exception as e:
-        logger.error(f"Marketapp API ошибка ({category}/history): {e}")
-        return None
+            continue
+
+        if response.status_code != 200:
+            logger.error(f"Marketapp API статус {response.status_code} ({category}/history): {response.text[:200]}")
+            await asyncio.sleep(2.0)
+            continue
+
+        try:
+            data = response.json()
+        except Exception:
+            logger.error("Marketapp API: невалидный JSON")
+            await asyncio.sleep(2.0)
+            continue
+
+        items = data.get("items", [])
+        next_cursor = data.get("next_cursor") or data.get("next_cursor_url") or None
+        return items, next_cursor
+    return None, None
 
 
 async def fetch_income_for_period(api_token: str, since_ts: int) -> float:
@@ -217,7 +282,7 @@ async def fetch_income_for_period(api_token: str, since_ts: int) -> float:
     for i, category in enumerate(RENT_CATEGORIES):
         if i > 0:
             await asyncio.sleep(2)
-        items = await fetch_rent_history(api_token, category, limit=100)
+        items, _ = await fetch_rent_history(api_token, category, limit=100)
         if items:
             for item in items:
                 ts = item.get("ts", 0)
@@ -252,7 +317,8 @@ async def fetch_my_rented(api_token: str) -> list | None:
 
 
 async def fetch_rent_income_events(api_token: str, category: str) -> list | None:
-    return await fetch_rent_history(api_token, category, limit=100)
+    items, _ = await fetch_rent_history(api_token, category, limit=100)
+    return items
 
 
 async def collect_rent_events(api_token: str, wallet: str) -> int:
@@ -262,16 +328,26 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
     for i, category in enumerate(RENT_CATEGORIES):
         if i > 0:
             await asyncio.sleep(2)
-        items = await fetch_rent_history(api_token, category, limit=100)
-        if not items:
-            continue
-        for item in items:
-            src_raw = userfriendly_to_raw(item.get("src", ""))
-            dst_raw = userfriendly_to_raw(item.get("dst", ""))
-            if src_raw != raw_wallet and dst_raw != raw_wallet:
-                continue
-            record = {**item, "category": category}
-            collected.append(record)
+        cursor = None
+        for page in range(MAX_HISTORY_PAGES):
+            if page > 0:
+                await asyncio.sleep(1)
+            items, next_cursor = await fetch_rent_history(api_token, category, limit=100, cursor=cursor)
+            if not items:
+                break
+            for item in items:
+                src_raw = userfriendly_to_raw(item.get("src", ""))
+                dst_raw = userfriendly_to_raw(item.get("dst", ""))
+                if src_raw != raw_wallet and dst_raw != raw_wallet:
+                    continue
+                if not int(item.get("price_nano", "0") or 0) > 0:
+                    continue
+                record = {**item, "category": category}
+                collected.append(record)
+
+            if not next_cursor:
+                break
+            cursor = next_cursor
 
     if not collected:
         return 0
@@ -500,4 +576,11 @@ def setup_marketapp_jobs(application):
         name="blockchain_rent_sync"
     )
 
-    logger.info("Marketapp отчеты настроены (09:00 MSK, блокчейн-синхронизация каждые 10 мин)")
+    application.job_queue.run_repeating(
+        sync_rent_events_job,
+        interval=timedelta(minutes=30),
+        first=45,
+        name="marketapp_rent_sync"
+    )
+
+    logger.info("Marketapp отчеты настроены (09:00 MSK, блокчейн-синхронизация 10 мин, история 30 мин)")

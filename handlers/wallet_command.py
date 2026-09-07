@@ -5,6 +5,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from tasks.marketapp_reports import (
+    collect_rent_events,
     sync_rent_from_blockchain,
     _format_ton,
     _nano_to_ton,
@@ -12,13 +13,33 @@ from tasks.marketapp_reports import (
     MSK,
     MARKETAPP_API_URL,
 )
-from utils.database import get_all_rent_events
+from utils.database import clear_rent_events, get_all_rent_events
 from utils.http_client import get_client
 
 logger = logging.getLogger(__name__)
 
-MAX_SYNC_PAGES = 300
+MAX_SYNC_PAGES = 1000
 MAX_LIST_MESSAGES = 20
+
+
+def _dedupe_events(events: list) -> list:
+    seen = set()
+    unique = []
+    for ev in events:
+        key = (
+            int(ev.get("ts", 0) or 0),
+            (ev.get("src") or "").strip().lower(),
+            (ev.get("dst") or "").strip().lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(ev)
+    return unique
+
+
+def _total_nano(events: list, since_ts: int = 0) -> int:
+    return sum(int(ev["price_nano"] or 0) for ev in events if ev["ts"] >= since_ts)
 
 
 async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -29,11 +50,22 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("MARKETAPP_WALLET не настроен — фильтрация прибыли невозможна.")
         return
 
+    api_saved = 0
+    blockchain_saved = 0
+
+    await clear_rent_events()
+
+    if api_token:
+        await update.message.reply_text("Синхронизирую историю из Marketapp...")
+        try:
+            api_saved = await collect_rent_events(api_token, wallet)
+        except Exception as e:
+            logger.error(f"Marketapp API синхронизация: {e}", exc_info=True)
+
     await update.message.reply_text("Синхронизирую полную историю из блокчейна...")
+    blockchain_saved = await sync_rent_from_blockchain(wallet, max_pages=MAX_SYNC_PAGES, from_scratch=True)
 
-    saved = await sync_rent_from_blockchain(wallet, max_pages=MAX_SYNC_PAGES, from_scratch=True)
-
-    events = await get_all_rent_events()
+    events = _dedupe_events(await get_all_rent_events())
     sorted_events = sorted(events, key=lambda e: e["ts"], reverse=True)
 
     now_ts = int(datetime.now(MSK).timestamp())
@@ -41,14 +73,11 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
     week_ts = now_ts - 604800
     month_ts = now_ts - 2592000
 
-    def total_in(since_ts: int) -> float:
-        return sum(_nano_to_ton(ev["price_nano"]) for ev in events if ev["ts"] >= since_ts)
-
     total_ops = len(sorted_events)
-    day_income = total_in(day_ts)
-    week_income = total_in(week_ts)
-    month_income = total_in(month_ts)
-    total_income = total_in(0)
+    day_income = _total_nano(sorted_events, day_ts) / 1_000_000_000
+    week_income = _total_nano(sorted_events, week_ts) / 1_000_000_000
+    month_income = _total_nano(sorted_events, month_ts) / 1_000_000_000
+    total_income = _total_nano(sorted_events, 0) / 1_000_000_000
 
     if sorted_events:
         first_ts = sorted_events[-1]["ts"]
@@ -70,18 +99,23 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
         f"Операций в базе: <b>{total_ops}</b>",
     ]
 
-    if saved:
-        lines.append(f"Новых событий: <b>{saved}</b>")
+    if api_saved or blockchain_saved:
+        parts = []
+        if api_saved:
+            parts.append(f"Marketapp: +{api_saved}")
+        if blockchain_saved:
+            parts.append(f"Блокчейн: +{blockchain_saved}")
+        lines.append("Новых событий: " + ", ".join(parts))
 
     if sorted_events:
         lines.append("\n<b>Разбивка по месяцам:</b>")
         monthly = OrderedDict()
-        for ev in events:
+        for ev in sorted_events:
             key = datetime.fromtimestamp(ev["ts"], MSK).strftime("%m.%Y")
-            monthly[key] = monthly.get(key, 0.0) + _nano_to_ton(ev["price_nano"])
+            monthly[key] = monthly.get(key, 0) + int(ev["price_nano"] or 0)
 
         for key in sorted(monthly.keys()):
-            lines.append(f"{key}: <b>{_format_ton(monthly[key])} TON</b>")
+            lines.append(f"{key}: <b>{_format_ton(monthly[key] / 1_000_000_000)} TON</b>")
 
     try:
         client = await get_client()

@@ -3,6 +3,7 @@ import logging
 import time
 import asyncio
 import threading
+import base64
 from contextlib import contextmanager
 from datetime import datetime
 
@@ -450,56 +451,126 @@ async def get_previous_profit(period: str) -> dict | None:
 
 
 def _sync_save_rent_event(event: dict) -> bool:
-    tx_hash = event.get("tx_hash")
-    if not tx_hash:
+    if not event.get("tx_hash"):
         return False
     with get_db() as conn:
-        cursor = conn.execute("""
-            INSERT OR IGNORE INTO marketapp_rent_events
-                (tx_hash, category, nft_address, nft_name, collection_address, ts, src, dst, price_nano, currency, is_extend, duration)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        return _sync_upsert_rent_event(conn, event) > 0
+
+
+def _normalize_addr(addr: str) -> str:
+    addr = (addr or "").strip()
+    if addr.startswith("0:"):
+        return addr.lower()
+    if len(addr) == 48 and addr[:2] in ("EQ", "UQ"):
+        try:
+            urlsafe = addr[2:].replace("-", "+").replace("_", "/")
+            padding = (4 - len(urlsafe) % 4) % 4
+            urlsafe += "=" * padding
+            decoded = base64.b64decode(urlsafe)
+            return "0:" + decoded[2:34].hex()
+        except Exception:
+            pass
+    return addr.lower()
+
+
+def _canonical_tx_hash(tx_hash: str) -> str:
+    h = (tx_hash or "").strip()
+    if not h:
+        return ""
+    if h.startswith("0x"):
+        h = h[2:]
+    raw = None
+    if len(h) == 64:
+        try:
+            raw = bytes.fromhex(h)
+        except ValueError:
+            raw = None
+    if raw is None:
+        b = h.replace("-", "+").replace("_", "/")
+        b += "=" * ((4 - len(b) % 4) % 4)
+        try:
+            raw = base64.b64decode(b)
+        except Exception:
+            raw = None
+    if raw is not None and len(raw) == 32:
+        return raw.hex()
+    return h.lower()
+
+
+def _sync_find_rent_event(conn, ts: int, src: str, dst: str):
+    return conn.execute(
+        "SELECT id FROM marketapp_rent_events WHERE ts=? AND src=? AND dst=? LIMIT 1",
+        (ts, _normalize_addr(src), _normalize_addr(dst))
+    ).fetchone()
+
+
+def _sync_clear_rent_events():
+    with get_db() as conn:
+        conn.execute("DELETE FROM marketapp_rent_events")
+
+
+def _sync_upsert_rent_event(conn, event: dict) -> int:
+    tx_hash = event.get("tx_hash")
+    if not tx_hash:
+        return 0
+    canon_hash = _canonical_tx_hash(tx_hash)
+    ts = int(event.get("ts", 0) or 0)
+    src = _normalize_addr(event.get("src", ""))
+    dst = _normalize_addr(event.get("dst", ""))
+
+    existing = None
+    if canon_hash:
+        existing = conn.execute(
+            "SELECT id FROM marketapp_rent_events WHERE tx_hash=? LIMIT 1", (canon_hash,)
+        ).fetchone()
+    if existing is None:
+        existing = _sync_find_rent_event(conn, ts, src, dst)
+    if existing:
+        conn.execute("""
+            UPDATE marketapp_rent_events
+            SET tx_hash=?, category=?, nft_address=?, nft_name=?, collection_address=?,
+                price_nano=?, currency=?, is_extend=?, duration=?, source='marketapp'
+            WHERE id=?
         """, (
-            tx_hash,
+            canon_hash or tx_hash,
             event.get("category", ""),
             event.get("address", ""),
             event.get("name", ""),
             event.get("collection_address", ""),
-            int(event.get("ts", 0)),
-            event.get("src", ""),
-            event.get("dst", ""),
             event.get("price_nano", "0"),
             event.get("currency", "GRAM"),
             1 if event.get("is_extend") else 0,
             int(event.get("duration", 0) or 0),
+            existing["id"],
         ))
-        return cursor.rowcount > 0
+        return 1
+
+    cursor = conn.execute("""
+        INSERT INTO marketapp_rent_events
+            (tx_hash, category, nft_address, nft_name, collection_address, ts, src, dst, price_nano, currency, is_extend, duration)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        canon_hash or tx_hash,
+        event.get("category", ""),
+        event.get("address", ""),
+        event.get("name", ""),
+        event.get("collection_address", ""),
+        ts,
+        src,
+        dst,
+        event.get("price_nano", "0"),
+        event.get("currency", "GRAM"),
+        1 if event.get("is_extend") else 0,
+        int(event.get("duration", 0) or 0),
+    ))
+    return cursor.rowcount
 
 
 def _sync_save_rent_events(events: list) -> int:
     with get_db() as conn:
         saved = 0
         for event in events:
-            if not event.get("tx_hash"):
-                continue
-            cursor = conn.execute("""
-                INSERT OR IGNORE INTO marketapp_rent_events
-                    (tx_hash, category, nft_address, nft_name, collection_address, ts, src, dst, price_nano, currency, is_extend, duration)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                event.get("tx_hash"),
-                event.get("category", ""),
-                event.get("address", ""),
-                event.get("name", ""),
-                event.get("collection_address", ""),
-                int(event.get("ts", 0)),
-                event.get("src", ""),
-                event.get("dst", ""),
-                event.get("price_nano", "0"),
-                event.get("currency", "GRAM"),
-                1 if event.get("is_extend") else 0,
-                int(event.get("duration", 0) or 0),
-            ))
-            saved += cursor.rowcount
+            saved += _sync_upsert_rent_event(conn, event)
         return saved
 
 
@@ -532,15 +603,30 @@ def _sync_save_blockchain_rent_events(events: list) -> int:
     with get_db() as conn:
         saved = 0
         for ev in events:
+            tx_hash = ev.get("tx_hash")
+            if not tx_hash:
+                continue
+            canon_hash = _canonical_tx_hash(tx_hash)
+            ts = int(ev.get("ts", 0) or 0)
+            src = _normalize_addr(ev.get("src", ""))
+            dst = _normalize_addr(ev.get("dst", ""))
+            if canon_hash:
+                existing = conn.execute(
+                    "SELECT id FROM marketapp_rent_events WHERE tx_hash=? LIMIT 1", (canon_hash,)
+                ).fetchone()
+                if existing:
+                    continue
+            if _sync_find_rent_event(conn, ts, src, dst):
+                continue
             cursor = conn.execute("""
                 INSERT OR IGNORE INTO marketapp_rent_events
                     (tx_hash, ts, src, dst, price_nano, source)
                 VALUES (?, ?, ?, ?, ?, 'blockchain')
             """, (
-                ev.get("tx_hash"),
-                int(ev.get("ts", 0)),
-                ev.get("src", ""),
-                ev.get("dst", ""),
+                canon_hash or tx_hash,
+                ts,
+                src,
+                dst,
                 str(ev.get("value_nano", "0")),
             ))
             saved += cursor.rowcount
@@ -590,3 +676,7 @@ async def set_sync_state(address: str, lt: str, hash_val: str, utime: int):
 
 async def get_all_rent_events() -> list:
     return await asyncio.to_thread(_sync_get_all_rent_events)
+
+
+async def clear_rent_events():
+    return await asyncio.to_thread(_sync_clear_rent_events)

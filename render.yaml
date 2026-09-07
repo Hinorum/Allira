@@ -27,3 +27,5 @@ services:
         sync: false
       - key: MARKETAPP_WALLET
         sync: false
+      - key: TONCENTER_API_KEY
+        sync: false
