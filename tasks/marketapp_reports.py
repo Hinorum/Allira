@@ -166,6 +166,10 @@ async def sync_rent_from_blockchain(wallet: str, max_pages: int = 50, from_scrat
             page_cursor_hash = tx_hash
             page_last_utime = item.get("utime", 0)
 
+            # TON Center v2 включает в ответ транзакцию-курсор (пересечение страниц)
+            if cur_lt is not None and tx_lt == cur_lt and tx_hash == cur_hash:
+                continue
+
             if boundary_lt is not None and tx_lt == boundary_lt and tx_hash == boundary_hash:
                 deep_lt = tx_lt
                 deep_hash = tx_hash
@@ -196,6 +200,12 @@ async def sync_rent_from_blockchain(wallet: str, max_pages: int = 50, from_scrat
             })
 
         if found_boundary:
+            scan_complete = True
+            break
+
+        # TON Center v2 на «хвосте» истории возвращает курсорную транзакцию самой
+        # (lt/hash совпадают с запрошенным) — значит, старше ничего нет
+        if cur_lt is not None and page_cursor_lt == cur_lt and page_cursor_hash == cur_hash:
             scan_complete = True
             break
 
