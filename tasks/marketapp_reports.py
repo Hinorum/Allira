@@ -8,6 +8,7 @@ from utils.http_client import get_client, with_retry
 logger = logging.getLogger(__name__)
 
 MARKETAPP_API_URL = "https://api.marketapp.org"
+RENT_CATEGORIES = ["gifts", "usernames", "numbers"]
 
 
 def _escape_html(text: str) -> str:
@@ -20,32 +21,77 @@ def _format_ton(value: float) -> str:
     return f"{value:.2f}"
 
 
+def _nano_to_ton(nano: str) -> float:
+    return int(nano) / 1_000_000_000
+
+
 @with_retry(max_retries=2, base_delay=1.0)
-async def fetch_profit(api_key: str, wallet_address: str, period: str) -> float | None:
+async def fetch_rent_history(api_token: str, category: str, limit: int = 100) -> list | None:
     try:
         client = await get_client()
         response = await client.get(
-            f"{MARKETAPP_API_URL}/api/profit",
-            params={
-                "api_key": api_key,
-                "wallet": wallet_address,
-                "period": period
+            f"{MARKETAPP_API_URL}/v1/rent/{category}/history/",
+            params={"limit": limit},
+            headers={
+                "Authorization": api_token,
+                "User-Agent": "AlliraBot/1.0"
             },
-            headers={"User-Agent": "AlliraBot/1.0"},
             timeout=15.0
         )
         response.raise_for_status()
         data = response.json()
-
-        if "profit" in data:
-            return float(data["profit"])
-
-        logger.warning(f"Marketapp API: неожиданный формат ответа: {data}")
-        return None
-
+        return data.get("items", [])
     except Exception as e:
-        logger.error(f"Marketapp API ошибка ({period}): {e}")
+        logger.error(f"Marketapp API ошибка ({category}/history): {e}")
         return None
+
+
+async def fetch_total_rent_income(api_token: str) -> dict | None:
+    total_ton = 0.0
+    events = []
+
+    for category in RENT_CATEGORIES:
+        items = await fetch_rent_history(api_token, category, limit=100)
+        if items:
+            for item in items:
+                price_ton = _nano_to_ton(item.get("price_nano", "0"))
+                total_ton += price_ton
+                events.append({
+                    "name": item.get("name", "?"),
+                    "category": category,
+                    "price_ton": price_ton,
+                    "ts": item.get("ts", 0),
+                })
+
+    if not events:
+        return None
+
+    events.sort(key=lambda x: x["ts"], reverse=True)
+    return {"total_ton": total_ton, "events": events[:10]}
+
+
+async def fetch_my_rented(api_token: str) -> list | None:
+    try:
+        client = await get_client()
+        response = await client.get(
+            f"{MARKETAPP_API_URL}/v1/rent/my-rented/",
+            headers={
+                "Authorization": api_token,
+                "User-Agent": "AlliraBot/1.0"
+            },
+            timeout=15.0
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data.get("items", [])
+    except Exception as e:
+        logger.error(f"Marketapp API ошибка (my-rented): {e}")
+        return None
+
+
+@with_retry(max_retries=2, base_delay=1.0)
+async def fetch_profit(api_key: str, wallet_address: str, period: str) -> float | None:
+    return None
 
 
 def format_daily_report(current_profit: float, previous_profit: float | None) -> str:
