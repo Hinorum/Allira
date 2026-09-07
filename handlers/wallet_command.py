@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -8,13 +9,19 @@ from tasks.marketapp_reports import fetch_rent_history, _ts_now, _format_ton, _n
 logger = logging.getLogger(__name__)
 
 
-def _normalize_address(addr: str) -> str:
+def _address_to_raw(addr: str) -> str:
     addr = addr.strip()
     if addr.startswith("0:"):
-        return "UQ" + addr[2:]
-    if addr.startswith("UQ") or addr.startswith("EQ"):
-        return addr
-    return addr
+        return addr.lower()
+    if len(addr) == 48 and (addr.startswith("EQ") or addr.startswith("UQ")):
+        bounceable = addr.startswith("EQ")
+        raw_part = addr[2:]
+        data = bytes.fromhex("80" if bounceable else "00" + raw_part)
+        checksum = hashlib.sha256(hashlib.sha256(data).digest()).digest()[:2]
+        decoded = data + checksum
+        hex_part = decoded[1:33].hex()
+        return f"0:{hex_part}"
+    return addr.lower()
 
 
 async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -26,7 +33,7 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     wallet_address = context.args[0]
-    normalized = _normalize_address(wallet_address)
+    raw_wallet = _address_to_raw(wallet_address)
     api_token = context.bot_data.get("MARKETAPP_API_KEY")
 
     if not api_token:
@@ -44,13 +51,9 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
             for item in items:
                 all_events.append(item)
 
-    if all_events:
-        for ev in all_events[:5]:
-            logger.info(f"Sample dst: [{ev.get('dst')}] src: [{ev.get('src')}] price: {ev.get('price_nano')}")
+    matched = [e for e in all_events if _address_to_raw(e.get("dst", "")) == raw_wallet]
 
-    matched = [e for e in all_events if _normalize_address(e.get("dst", "")) == normalized]
-
-    logger.info(f"Wallet: {wallet_address}, Normalized: {normalized}")
+    logger.info(f"Wallet: {wallet_address}, Raw: {raw_wallet}")
     logger.info(f"Total events: {len(all_events)}, Matched: {len(matched)}")
 
     now_ts = _ts_now()
