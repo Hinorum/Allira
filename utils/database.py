@@ -111,11 +111,29 @@ def init_db():
                 raw_response TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS marketapp_rent_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tx_hash TEXT UNIQUE,
+                category TEXT NOT NULL,
+                nft_address TEXT,
+                nft_name TEXT,
+                collection_address TEXT,
+                ts INTEGER NOT NULL,
+                src TEXT,
+                dst TEXT,
+                price_nano TEXT,
+                currency TEXT,
+                is_extend INTEGER DEFAULT 0,
+                duration INTEGER DEFAULT 0,
+                recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id);
             CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
             CREATE INDEX IF NOT EXISTS idx_tournaments_chat ON tournaments(chat_id);
             CREATE INDEX IF NOT EXISTS idx_tournament_players_tid ON tournament_players(tournament_id);
             CREATE INDEX IF NOT EXISTS idx_marketapp_profit_period ON marketapp_profit(period, recorded_at);
+            CREATE INDEX IF NOT EXISTS idx_rent_events_ts ON marketapp_rent_events(ts);
         """)
     logger.info("База данных инициализирована")
 
@@ -420,3 +438,82 @@ async def get_profit_for_period(period: str, days_back: int) -> list:
 
 async def get_previous_profit(period: str) -> dict | None:
     return await asyncio.to_thread(_sync_get_previous_profit, period)
+
+
+def _sync_save_rent_event(event: dict) -> bool:
+    tx_hash = event.get("tx_hash")
+    if not tx_hash:
+        return False
+    with get_db() as conn:
+        cursor = conn.execute("""
+            INSERT OR IGNORE INTO marketapp_rent_events
+                (tx_hash, category, nft_address, nft_name, collection_address, ts, src, dst, price_nano, currency, is_extend, duration)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            tx_hash,
+            event.get("category", ""),
+            event.get("address", ""),
+            event.get("name", ""),
+            event.get("collection_address", ""),
+            int(event.get("ts", 0)),
+            event.get("src", ""),
+            event.get("dst", ""),
+            event.get("price_nano", "0"),
+            event.get("currency", "GRAM"),
+            1 if event.get("is_extend") else 0,
+            int(event.get("duration", 0) or 0),
+        ))
+        return cursor.rowcount > 0
+
+
+def _sync_save_rent_events(events: list) -> int:
+    with get_db() as conn:
+        saved = 0
+        for event in events:
+            if not event.get("tx_hash"):
+                continue
+            cursor = conn.execute("""
+                INSERT OR IGNORE INTO marketapp_rent_events
+                    (tx_hash, category, nft_address, nft_name, collection_address, ts, src, dst, price_nano, currency, is_extend, duration)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                event.get("tx_hash"),
+                event.get("category", ""),
+                event.get("address", ""),
+                event.get("name", ""),
+                event.get("collection_address", ""),
+                int(event.get("ts", 0)),
+                event.get("src", ""),
+                event.get("dst", ""),
+                event.get("price_nano", "0"),
+                event.get("currency", "GRAM"),
+                1 if event.get("is_extend") else 0,
+                int(event.get("duration", 0) or 0),
+            ))
+            saved += cursor.rowcount
+        return saved
+
+
+def _sync_get_rent_events(since_ts: int = 0, is_extend: bool = None) -> list:
+    with get_db() as conn:
+        params = []
+        query = "SELECT * FROM marketapp_rent_events WHERE ts >= ?"
+        params.append(since_ts)
+        if is_extend is not None:
+            query += " AND is_extend = ?"
+            params.append(1 if is_extend else 0)
+        query += " ORDER BY ts DESC"
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+async def save_rent_event(event: dict) -> bool:
+    return await asyncio.to_thread(_sync_save_rent_event, event)
+
+
+async def save_rent_events(events: list) -> int:
+    return await asyncio.to_thread(_sync_save_rent_events, events)
+
+
+async def get_rent_events(since_ts: int = 0, is_extend: bool = None) -> list:
+    return await asyncio.to_thread(_sync_get_rent_events, since_ts, is_extend)

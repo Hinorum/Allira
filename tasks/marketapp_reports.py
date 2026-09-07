@@ -1,9 +1,10 @@
 import asyncio
+import base64
 import logging
 from datetime import datetime, timedelta, timezone, time as dt_time
 from telegram.ext import ContextTypes
 
-from utils.database import save_marketapp_profit, get_previous_profit, get_profit_for_period
+from utils.database import save_marketapp_profit, get_previous_profit, get_profit_for_period, save_rent_events
 from utils.http_client import get_client, with_retry
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,22 @@ def _ts_now() -> int:
 
 def _ts_days_ago(days: int) -> int:
     return int((datetime.now(MSK) - timedelta(days=days)).timestamp())
+
+
+def userfriendly_to_raw(addr: str) -> str:
+    addr = (addr or "").strip()
+    if addr.startswith("0:"):
+        return addr.lower()
+    if len(addr) == 48 and addr[:2] in ("EQ", "UQ"):
+        try:
+            urlsafe = addr[2:].replace("-", "+").replace("_", "/")
+            padding = (4 - len(urlsafe) % 4) % 4
+            urlsafe += "=" * padding
+            decoded = base64.b64decode(urlsafe)
+            return "0:" + decoded[2:34].hex()
+        except Exception:
+            return addr.lower()
+    return addr.lower()
 
 
 @with_retry(max_retries=2, base_delay=5.0)
@@ -104,6 +121,47 @@ async def fetch_my_rented(api_token: str) -> list | None:
 
 async def fetch_rent_income_events(api_token: str, category: str) -> list | None:
     return await fetch_rent_history(api_token, category, limit=100)
+
+
+async def collect_rent_events(api_token: str, wallet: str) -> int:
+    raw_wallet = userfriendly_to_raw(wallet)
+    collected = []
+
+    for i, category in enumerate(RENT_CATEGORIES):
+        if i > 0:
+            await asyncio.sleep(2)
+        items = await fetch_rent_history(api_token, category, limit=100)
+        if not items:
+            continue
+        for item in items:
+            src_raw = userfriendly_to_raw(item.get("src", ""))
+            dst_raw = userfriendly_to_raw(item.get("dst", ""))
+            if src_raw != raw_wallet and dst_raw != raw_wallet:
+                continue
+            record = {**item, "category": category}
+            collected.append(record)
+
+    if not collected:
+        return 0
+
+    saved = await save_rent_events(collected)
+    if saved:
+        logger.info(f"Сохранено новых событий аренды: {saved}")
+    return saved
+
+
+async def sync_rent_events_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        bot_data = context.bot_data
+        api_token = bot_data.get("MARKETAPP_API_KEY")
+        wallet = bot_data.get("MARKETAPP_WALLET", "")
+
+        if not api_token or not wallet:
+            return
+
+        await collect_rent_events(api_token, wallet)
+    except Exception as e:
+        logger.error(f"Ошибка сбора событий аренды: {e}", exc_info=True)
 
 
 def format_daily_report(current_profit: float, previous_profit: float | None) -> str:
@@ -277,7 +335,7 @@ async def monthly_profit_report(context: ContextTypes.DEFAULT_TYPE):
 
 
 def setup_marketapp_jobs(application):
-    for job_name in ["marketapp_daily", "marketapp_weekly", "marketapp_monthly"]:
+    for job_name in ["marketapp_daily", "marketapp_weekly", "marketapp_monthly", "marketapp_rent_sync"]:
         jobs = application.job_queue.get_jobs_by_name(job_name)
         for job in jobs:
             job.schedule_removal()
@@ -303,4 +361,11 @@ def setup_marketapp_jobs(application):
         name="marketapp_monthly"
     )
 
-    logger.info("Marketapp отчеты настроены (09:00 MSK: день/понедельник/1-е число)")
+    application.job_queue.run_repeating(
+        sync_rent_events_job,
+        interval=timedelta(minutes=5),
+        first=10,
+        name="marketapp_rent_sync"
+    )
+
+    logger.info("Marketapp отчеты настроены (09:00 MSK: день/понедельник/1-е число, сбор аренды каждые 5 мин)")
