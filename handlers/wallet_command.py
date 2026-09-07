@@ -3,9 +3,10 @@ from datetime import datetime
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from tasks.marketapp_reports import MARKETAPP_API_URL, _format_ton, _nano_to_ton, MSK, collect_rent_events
-from utils.database import get_rent_events
+from tasks.marketapp_reports import sync_rent_from_blockchain, _format_ton, _nano_to_ton, MSK
+from utils.database import get_all_rent_events
 from utils.http_client import get_client
+from tasks.marketapp_reports import MARKETAPP_API_URL
 
 logger = logging.getLogger(__name__)
 
@@ -14,24 +15,20 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
     api_token = context.bot_data.get("MARKETAPP_API_KEY")
     wallet = context.bot_data.get("MARKETAPP_WALLET", "")
 
-    if not api_token:
-        await update.message.reply_text("MARKETAPP_API_KEY не настроен.")
-        return
-
     if not wallet:
         await update.message.reply_text("MARKETAPP_WALLET не настроен — фильтрация прибыли невозможна.")
         return
 
-    await update.message.reply_text("Собираю данные по аренде...")
+    await update.message.reply_text("Синхронизирую данные из блокчейна...")
 
-    saved = await collect_rent_events(api_token, wallet)
+    saved = await sync_rent_from_blockchain(wallet, max_pages=5)
+
+    events = await get_all_rent_events()
 
     now_ts = int(datetime.now(MSK).timestamp())
     day_ts = now_ts - 86400
     week_ts = now_ts - 604800
     month_ts = now_ts - 2592000
-
-    events = await get_rent_events(since_ts=0)
 
     def total_in(since_ts: int) -> float:
         return sum(_nano_to_ton(ev["price_nano"]) for ev in events if ev["ts"] >= since_ts)

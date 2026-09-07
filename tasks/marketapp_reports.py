@@ -4,12 +4,16 @@ import logging
 from datetime import datetime, timedelta, timezone, time as dt_time
 from telegram.ext import ContextTypes
 
-from utils.database import save_marketapp_profit, get_previous_profit, get_profit_for_period, save_rent_events
+from utils.database import (
+    save_marketapp_profit, get_previous_profit, get_profit_for_period,
+    save_rent_events, save_blockchain_rent_events, get_sync_state, set_sync_state
+)
 from utils.http_client import get_client, with_retry
 
 logger = logging.getLogger(__name__)
 
 MARKETAPP_API_URL = "https://api.marketapp.org"
+TONCENTER_API_URL = "https://toncenter.com/api/v2"
 RENT_CATEGORIES = ["gifts", "usernames", "numbers"]
 
 MSK = timezone(timedelta(hours=3))
@@ -49,7 +53,126 @@ def userfriendly_to_raw(addr: str) -> str:
             decoded = base64.b64decode(urlsafe)
             return "0:" + decoded[2:34].hex()
         except Exception:
-            return addr.lower()
+    return addr.lower()
+
+
+@with_retry(max_retries=2, base_delay=5.0)
+async def fetch_toncenter_txns(address: str, limit: int = 100, lt: str = None, hash_val: str = None) -> list | None:
+    try:
+        params = {"address": address, "limit": limit}
+        if lt and hash_val:
+            import urllib.parse
+            params["lt"] = lt
+            params["hash"] = hash_val
+        client = await get_client()
+        response = await client.get(
+            f"{TONCENTER_API_URL}/getTransactions",
+            params=params,
+            timeout=20.0
+        )
+        if response.status_code == 429:
+            retry_after = int(response.headers.get("Retry-After", "10"))
+            logger.warning(f"TON Center 429, ожидание {retry_after}с...")
+            await asyncio.sleep(retry_after)
+            return None
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("ok"):
+            logger.error(f"TON Center API: {data}")
+            return None
+        return data.get("result", [])
+    except Exception as e:
+        logger.error(f"TON Center API ошибка: {e}")
+        return None
+
+
+@with_retry(max_retries=2, base_delay=3.0)
+async def sync_rent_from_blockchain(wallet: str, max_pages: int = 50) -> int:
+    raw_wallet = userfriendly_to_raw(wallet)
+    sync_state = await get_sync_state(wallet)
+
+    cur_lt = None
+    cur_hash = None
+    if sync_state:
+        cur_lt = sync_state.get("last_synced_lt")
+        cur_hash = sync_state.get("last_synced_hash")
+
+    new_events = []
+    pages = 0
+    last_utime = 0
+    last_lt = ""
+    last_hash = ""
+
+    while pages < max_pages:
+        if pages > 0:
+            await asyncio.sleep(1.2)
+
+        items = await fetch_toncenter_txns(wallet, limit=100, lt=cur_lt, hash_val=cur_hash)
+        if not items:
+            break
+
+        for item in items:
+            in_msg = item.get("in_msg", {})
+            dest = in_msg.get("destination", "")
+            dest_raw = userfriendly_to_raw(dest)
+            if dest_raw != raw_wallet:
+                continue
+
+            message = in_msg.get("message", "")
+            if "marketapp" not in message.lower():
+                continue
+
+            utime = item.get("utime", 0)
+            value = int(in_msg.get("value", 0))
+            if value <= 0:
+                continue
+
+            tx_id = item.get("transaction_id", {})
+            tx_hash = tx_id.get("hash", "")
+            tx_lt = tx_id.get("lt", "")
+            source = in_msg.get("source", "")
+
+            new_events.append({
+                "tx_hash": tx_hash,
+                "ts": utime,
+                "src": source,
+                "dst": dest,
+                "value_nano": str(value),
+            })
+
+            if utime > last_utime:
+                last_utime = utime
+                last_lt = tx_lt
+                last_hash = tx_hash
+
+        if not items:
+            break
+
+        if cur_lt and cur_hash:
+            break
+
+        cur_lt = tx_lt
+        cur_hash = tx_hash
+        pages += 1
+
+    if last_lt and last_hash:
+        await set_sync_state(wallet, last_lt, last_hash, last_utime)
+
+    if new_events:
+        saved = await save_blockchain_rent_events(new_events)
+        logger.info(f"Блокчейн: сохранено {saved} событий аренды")
+        return saved
+    return 0
+
+
+async def sync_blockchain_rent_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        wallet = context.bot_data.get("MARKETAPP_WALLET", "")
+        if not wallet:
+            return
+        await sync_rent_from_blockchain(wallet, max_pages=3)
+    except Exception as e:
+        logger.error(f"Ошибка синхронизации блокчейна: {e}", exc_info=True)
     return addr.lower()
 
 
@@ -335,7 +458,7 @@ async def monthly_profit_report(context: ContextTypes.DEFAULT_TYPE):
 
 
 def setup_marketapp_jobs(application):
-    for job_name in ["marketapp_daily", "marketapp_weekly", "marketapp_monthly", "marketapp_rent_sync"]:
+    for job_name in ["marketapp_daily", "marketapp_weekly", "marketapp_monthly", "marketapp_rent_sync", "blockchain_rent_sync"]:
         jobs = application.job_queue.get_jobs_by_name(job_name)
         for job in jobs:
             job.schedule_removal()
@@ -362,10 +485,10 @@ def setup_marketapp_jobs(application):
     )
 
     application.job_queue.run_repeating(
-        sync_rent_events_job,
-        interval=timedelta(minutes=5),
-        first=10,
-        name="marketapp_rent_sync"
+        sync_blockchain_rent_job,
+        interval=timedelta(minutes=10),
+        first=30,
+        name="blockchain_rent_sync"
     )
 
-    logger.info("Marketapp отчеты настроены (09:00 MSK: день/понедельник/1-е число, сбор аренды каждые 5 мин)")
+    logger.info("Marketapp отчеты настроены (09:00 MSK, блокчейн-синхронизация каждые 10 мин)")

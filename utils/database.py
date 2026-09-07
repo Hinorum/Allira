@@ -114,7 +114,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS marketapp_rent_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 tx_hash TEXT UNIQUE,
-                category TEXT NOT NULL,
+                category TEXT,
                 nft_address TEXT,
                 nft_name TEXT,
                 collection_address TEXT,
@@ -122,10 +122,19 @@ def init_db():
                 src TEXT,
                 dst TEXT,
                 price_nano TEXT,
-                currency TEXT,
+                currency TEXT DEFAULT 'GRAM',
                 is_extend INTEGER DEFAULT 0,
                 duration INTEGER DEFAULT 0,
+                source TEXT DEFAULT 'marketapp',
                 recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS blockchain_sync_state (
+                address TEXT PRIMARY KEY,
+                last_synced_lt TEXT,
+                last_synced_hash TEXT,
+                last_synced_utime INTEGER DEFAULT 0,
+                last_sync_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id);
@@ -517,3 +526,67 @@ async def save_rent_events(events: list) -> int:
 
 async def get_rent_events(since_ts: int = 0, is_extend: bool = None) -> list:
     return await asyncio.to_thread(_sync_get_rent_events, since_ts, is_extend)
+
+
+def _sync_save_blockchain_rent_events(events: list) -> int:
+    with get_db() as conn:
+        saved = 0
+        for ev in events:
+            cursor = conn.execute("""
+                INSERT OR IGNORE INTO marketapp_rent_events
+                    (tx_hash, ts, src, dst, price_nano, source)
+                VALUES (?, ?, ?, ?, ?, 'blockchain')
+            """, (
+                ev.get("tx_hash"),
+                int(ev.get("ts", 0)),
+                ev.get("src", ""),
+                ev.get("dst", ""),
+                str(ev.get("value_nano", "0")),
+            ))
+            saved += cursor.rowcount
+        return saved
+
+
+def _sync_get_sync_state(address: str) -> dict | None:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM blockchain_sync_state WHERE address = ?", (address,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def _sync_set_sync_state(address: str, lt: str, hash_val: str, utime: int):
+    with get_db() as conn:
+        conn.execute("""
+            INSERT INTO blockchain_sync_state (address, last_synced_lt, last_synced_hash, last_synced_utime, last_sync_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(address) DO UPDATE SET
+                last_synced_lt = excluded.last_synced_lt,
+                last_synced_hash = excluded.last_synced_hash,
+                last_synced_utime = excluded.last_synced_utime,
+                last_sync_at = CURRENT_TIMESTAMP
+        """, (address, lt, hash_val, utime))
+
+
+def _sync_get_all_rent_events() -> list:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM marketapp_rent_events ORDER BY ts DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+async def save_blockchain_rent_events(events: list) -> int:
+    return await asyncio.to_thread(_sync_save_blockchain_rent_events, events)
+
+
+async def get_sync_state(address: str) -> dict | None:
+    return await asyncio.to_thread(_sync_get_sync_state, address)
+
+
+async def set_sync_state(address: str, lt: str, hash_val: str, utime: int):
+    return await asyncio.to_thread(_sync_set_sync_state, address, lt, hash_val, utime)
+
+
+async def get_all_rent_events() -> list:
+    return await asyncio.to_thread(_sync_get_all_rent_events)
