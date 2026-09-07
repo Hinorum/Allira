@@ -10,6 +10,7 @@ from tasks.marketapp_reports import (
     _format_ton,
     _nano_to_ton,
     _escape_html,
+    userfriendly_to_raw,
     MSK,
     MARKETAPP_API_URL,
 )
@@ -44,11 +45,26 @@ def _total_nano(events: list, since_ts: int = 0) -> int:
 
 async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     api_token = context.bot_data.get("MARKETAPP_API_KEY")
-    wallet = context.bot_data.get("MARKETAPP_WALLET", "")
+
+    wallet = ""
+    if context.args:
+        candidate = context.args[0].strip()
+        if userfriendly_to_raw(candidate).startswith("0:"):
+            wallet = candidate
+    if not wallet:
+        wallet = context.bot_data.get("MARKETAPP_WALLET", "")
 
     if not wallet:
-        await update.message.reply_text("MARKETAPP_WALLET не настроен — фильтрация прибыли невозможна.")
+        await update.message.reply_text(
+            "Кошелёк не передан и MARKETAPP_WALLET не настроен.\n"
+            "Использование: /marketapprent <адрес кошелька>"
+        )
         return
+
+    await update.message.reply_text(
+        f"Синхронизирую историю для кошелька:\n<code>{_escape_html(wallet)}</code>",
+        parse_mode="HTML"
+    )
 
     api_saved = 0
     blockchain_saved = 0
