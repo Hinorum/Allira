@@ -26,6 +26,6 @@ class BotConfig:
             lane_model=os.getenv("LANE_MODEL", "google/gemma-4-31b-it:free"),
             news_channel_id=os.getenv("NEWS_CHANNEL_ID", ""),
             port=int(os.getenv("PORT", "10000")),
-            marketapp_api_key=os.getenv("MARKETAPP_API_KEY", ""),
-            marketapp_wallet=os.getenv("MARKETAPP_WALLET", ""),
+            marketapp_api_key=os.getenv("MARKETAPP_API_KEY", "").strip(),
+            marketapp_wallet=os.getenv("MARKETAPP_WALLET", "").strip(),
         )
