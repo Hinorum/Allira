@@ -53,6 +53,7 @@ def userfriendly_to_raw(addr: str) -> str:
             decoded = base64.b64decode(urlsafe)
             return "0:" + decoded[2:34].hex()
         except Exception:
+            pass
     return addr.lower()
 
 
@@ -87,35 +88,52 @@ async def fetch_toncenter_txns(address: str, limit: int = 100, lt: str = None, h
 
 
 @with_retry(max_retries=2, base_delay=3.0)
-async def sync_rent_from_blockchain(wallet: str, max_pages: int = 50) -> int:
+async def sync_rent_from_blockchain(wallet: str, max_pages: int = 50, from_scratch: bool = False) -> int:
     raw_wallet = userfriendly_to_raw(wallet)
-    sync_state = await get_sync_state(wallet)
+
+    boundary_lt = None
+    boundary_hash = None
+    if not from_scratch:
+        sync_state = await get_sync_state(wallet)
+        if sync_state:
+            boundary_lt = sync_state.get("last_synced_lt")
+            boundary_hash = sync_state.get("last_synced_hash")
 
     cur_lt = None
     cur_hash = None
-    if sync_state:
-        cur_lt = sync_state.get("last_synced_lt")
-        cur_hash = sync_state.get("last_synced_hash")
-
     new_events = []
     pages = 0
-    last_utime = 0
-    last_lt = ""
-    last_hash = ""
+    reached_boundary = False
+    deep_lt = None
+    deep_hash = None
+    deep_utime = 0
 
     while pages < max_pages:
         if pages > 0:
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(1.0)
 
         items = await fetch_toncenter_txns(wallet, limit=100, lt=cur_lt, hash_val=cur_hash)
         if not items:
             break
 
+        page_cursor_lt = None
+        page_cursor_hash = None
+        page_last_utime = 0
         for item in items:
+            tx_id = item.get("transaction_id", {})
+            tx_hash = tx_id.get("hash", "")
+            tx_lt = tx_id.get("lt", "")
+            page_cursor_lt = tx_lt
+            page_cursor_hash = tx_hash
+            page_last_utime = item.get("utime", 0)
+
+            if boundary_lt is not None and tx_lt == boundary_lt and tx_hash == boundary_hash:
+                reached_boundary = True
+                break
+
             in_msg = item.get("in_msg", {})
             dest = in_msg.get("destination", "")
-            dest_raw = userfriendly_to_raw(dest)
-            if dest_raw != raw_wallet:
+            if userfriendly_to_raw(dest) != raw_wallet:
                 continue
 
             message = in_msg.get("message", "")
@@ -127,36 +145,28 @@ async def sync_rent_from_blockchain(wallet: str, max_pages: int = 50) -> int:
             if value <= 0:
                 continue
 
-            tx_id = item.get("transaction_id", {})
-            tx_hash = tx_id.get("hash", "")
-            tx_lt = tx_id.get("lt", "")
-            source = in_msg.get("source", "")
-
             new_events.append({
                 "tx_hash": tx_hash,
                 "ts": utime,
-                "src": source,
+                "src": in_msg.get("source", ""),
                 "dst": dest,
                 "value_nano": str(value),
             })
 
-            if utime > last_utime:
-                last_utime = utime
-                last_lt = tx_lt
-                last_hash = tx_hash
-
-        if not items:
+        if reached_boundary:
             break
 
-        if cur_lt and cur_hash:
+        if not page_cursor_lt or not page_cursor_hash:
             break
 
-        cur_lt = tx_lt
-        cur_hash = tx_hash
+        deep_lt = page_cursor_lt
+        deep_hash = page_cursor_hash
+        deep_utime = page_last_utime
+        cur_lt, cur_hash = page_cursor_lt, page_cursor_hash
         pages += 1
 
-    if last_lt and last_hash:
-        await set_sync_state(wallet, last_lt, last_hash, last_utime)
+    if deep_lt and deep_hash:
+        await set_sync_state(wallet, deep_lt, deep_hash, deep_utime)
 
     if new_events:
         saved = await save_blockchain_rent_events(new_events)
@@ -173,7 +183,6 @@ async def sync_blockchain_rent_job(context: ContextTypes.DEFAULT_TYPE):
         await sync_rent_from_blockchain(wallet, max_pages=3)
     except Exception as e:
         logger.error(f"Ошибка синхронизации блокчейна: {e}", exc_info=True)
-    return addr.lower()
 
 
 @with_retry(max_retries=2, base_delay=5.0)
