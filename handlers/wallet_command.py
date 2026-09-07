@@ -71,15 +71,15 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     await clear_rent_events()
 
+    await update.message.reply_text("Сканирую полную историю из блокчейна...")
+    blockchain_saved = await sync_rent_from_blockchain(wallet, max_pages=MAX_SYNC_PAGES, from_scratch=True)
+
     if api_token:
-        await update.message.reply_text("Синхронизирую историю из Marketapp...")
+        await update.message.reply_text("Дополняю метаданными из Marketapp...")
         try:
             api_saved = await collect_rent_events(api_token, wallet)
         except Exception as e:
-            logger.error(f"Marketapp API синхронизация: {e}", exc_info=True)
-
-    await update.message.reply_text("Синхронизирую полную историю из блокчейна...")
-    blockchain_saved = await sync_rent_from_blockchain(wallet, max_pages=MAX_SYNC_PAGES, from_scratch=True)
+            logger.error(f"Marketapp API дополнение: {e}", exc_info=True)
 
     events = _dedupe_events(await get_all_rent_events())
     sorted_events = sorted(events, key=lambda e: e["ts"], reverse=True)
@@ -117,11 +117,11 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     if api_saved or blockchain_saved:
         parts = []
-        if api_saved:
-            parts.append(f"Marketapp: +{api_saved}")
         if blockchain_saved:
-            parts.append(f"Блокчейн: +{blockchain_saved}")
-        lines.append("Новых событий: " + ", ".join(parts))
+            parts.append(f"блокчейн: +{blockchain_saved} платежей")
+        if api_saved:
+            parts.append(f"метаданные Marketapp: {api_saved}")
+        lines.append("Сохранено: " + ", ".join(parts))
 
     if sorted_events:
         lines.append("\n<b>Разбивка по месяцам:</b>")

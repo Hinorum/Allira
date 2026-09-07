@@ -7,7 +7,8 @@ from telegram.ext import ContextTypes
 
 from utils.database import (
     save_marketapp_profit, get_previous_profit, get_profit_for_period,
-    save_rent_events, save_blockchain_rent_events, get_sync_state, set_sync_state
+    save_blockchain_rent_events, get_sync_state, set_sync_state,
+    enrich_blockchain_events
 )
 from utils.config import BotConfig
 from utils.http_client import get_client, with_retry
@@ -342,7 +343,18 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
                     continue
                 if not int(item.get("price_nano", "0") or 0) > 0:
                     continue
-                record = {**item, "category": category}
+                record = {
+                    "tx_hash": item.get("tx_hash") or "",
+                    "category": category,
+                    "address": item.get("address", ""),
+                    "name": item.get("name", ""),
+                    "collection_address": item.get("collection_address", ""),
+                    "is_extend": item.get("is_extend") or False,
+                    "duration": int(item.get("duration", 0) or 0),
+                    "ts": int(item.get("ts", 0) or 0),
+                    "src": item.get("src", ""),
+                    "dst": item.get("dst", ""),
+                }
                 collected.append(record)
 
             if not next_cursor:
@@ -352,10 +364,10 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
     if not collected:
         return 0
 
-    saved = await save_rent_events(collected)
-    if saved:
-        logger.info(f"Сохранено новых событий аренды: {saved}")
-    return saved
+    enriched = await enrich_blockchain_events(collected)
+    if enriched:
+        logger.info(f"Дополнено метаданными из Marketapp: {enriched}")
+    return enriched
 
 
 async def sync_rent_events_job(context: ContextTypes.DEFAULT_TYPE):

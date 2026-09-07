@@ -566,6 +566,47 @@ def _sync_upsert_rent_event(conn, event: dict) -> int:
     return cursor.rowcount
 
 
+def _sync_enrich_blockchain_event(conn, event: dict) -> int:
+    tx_hash = event.get("tx_hash")
+    canon_hash = _canonical_tx_hash(tx_hash) if tx_hash else None
+    ts = int(event.get("ts", 0) or 0)
+    src = _normalize_addr(event.get("src", ""))
+    dst = _normalize_addr(event.get("dst", ""))
+
+    existing = None
+    if canon_hash:
+        existing = conn.execute(
+            "SELECT id FROM marketapp_rent_events WHERE tx_hash=? LIMIT 1", (canon_hash,)
+        ).fetchone()
+    if existing is None:
+        existing = _sync_find_rent_event(conn, ts, src, dst)
+    if existing is None:
+        return 0
+    conn.execute("""
+        UPDATE marketapp_rent_events
+        SET category=?, nft_address=?, nft_name=?, collection_address=?,
+            is_extend=?, duration=?, source='marketapp'
+        WHERE id=?
+    """, (
+        event.get("category", ""),
+        event.get("address", ""),
+        event.get("name", ""),
+        event.get("collection_address", ""),
+        1 if event.get("is_extend") else 0,
+        int(event.get("duration", 0) or 0),
+        existing["id"],
+    ))
+    return 1
+
+
+def _sync_enrich_blockchain_events(events: list) -> int:
+    with get_db() as conn:
+        saved = 0
+        for event in events:
+            saved += _sync_enrich_blockchain_event(conn, event)
+        return saved
+
+
 def _sync_save_rent_events(events: list) -> int:
     with get_db() as conn:
         saved = 0
@@ -680,3 +721,7 @@ async def get_all_rent_events() -> list:
 
 async def clear_rent_events():
     return await asyncio.to_thread(_sync_clear_rent_events)
+
+
+async def enrich_blockchain_events(events: list) -> int:
+    return await asyncio.to_thread(_sync_enrich_blockchain_events, events)
