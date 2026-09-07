@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone, time as dt_time
 from telegram.ext import ContextTypes
@@ -35,7 +36,7 @@ def _ts_days_ago(days: int) -> int:
     return int((datetime.now(MSK) - timedelta(days=days)).timestamp())
 
 
-@with_retry(max_retries=2, base_delay=1.0)
+@with_retry(max_retries=2, base_delay=5.0)
 async def fetch_rent_history(api_token: str, category: str, limit: int = 100) -> list | None:
     try:
         client = await get_client()
@@ -48,6 +49,11 @@ async def fetch_rent_history(api_token: str, category: str, limit: int = 100) ->
             },
             timeout=15.0
         )
+        if response.status_code == 429:
+            retry_after = int(response.headers.get("Retry-After", "10"))
+            logger.warning(f"Marketapp API 429, ожидание {retry_after}с...")
+            await asyncio.sleep(retry_after)
+            return None
         response.raise_for_status()
         data = response.json()
         return data.get("items", [])
@@ -59,7 +65,9 @@ async def fetch_rent_history(api_token: str, category: str, limit: int = 100) ->
 async def fetch_income_for_period(api_token: str, since_ts: int) -> float:
     total_ton = 0.0
 
-    for category in RENT_CATEGORIES:
+    for i, category in enumerate(RENT_CATEGORIES):
+        if i > 0:
+            await asyncio.sleep(2)
         items = await fetch_rent_history(api_token, category, limit=100)
         if items:
             for item in items:
@@ -81,12 +89,21 @@ async def fetch_my_rented(api_token: str) -> list | None:
             },
             timeout=15.0
         )
+        if response.status_code == 429:
+            retry_after = int(response.headers.get("Retry-After", "10"))
+            logger.warning(f"Marketapp API 429 (my-rented), ожидание {retry_after}с...")
+            await asyncio.sleep(retry_after)
+            return None
         response.raise_for_status()
         data = response.json()
         return data.get("items", [])
     except Exception as e:
         logger.error(f"Marketapp API ошибка (my-rented): {e}")
         return None
+
+
+async def fetch_rent_income_events(api_token: str, category: str) -> list | None:
+    return await fetch_rent_history(api_token, category, limit=100)
 
 
 def format_daily_report(current_profit: float, previous_profit: float | None) -> str:

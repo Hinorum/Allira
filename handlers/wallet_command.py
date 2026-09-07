@@ -1,8 +1,9 @@
+import asyncio
 import logging
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from tasks.marketapp_reports import fetch_my_rented, fetch_income_for_period, _ts_now, _format_ton
+from tasks.marketapp_reports import fetch_my_rented, fetch_rent_income_events, _ts_now, _format_ton, _nano_to_ton, RENT_CATEGORIES
 
 logger = logging.getLogger(__name__)
 
@@ -18,14 +19,21 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     rented = await fetch_my_rented(api_token)
 
+    all_events = []
+    for i, category in enumerate(RENT_CATEGORIES):
+        if i > 0:
+            await asyncio.sleep(2)
+        items = await fetch_rent_income_events(api_token, category)
+        if items:
+            all_events.extend(items)
+
     now_ts = _ts_now()
     day_ts = now_ts - 86400
     week_ts = now_ts - 604800
-    month_ts = now_ts - 2592000
 
-    day_income = await fetch_income_for_period(api_token, day_ts)
-    week_income = await fetch_income_for_period(api_token, week_ts)
-    month_income = await fetch_income_for_period(api_token, month_ts)
+    day_income = sum(_nano_to_ton(e.get("price_nano", "0")) for e in all_events if e.get("ts", 0) >= day_ts)
+    week_income = sum(_nano_to_ton(e.get("price_nano", "0")) for e in all_events if e.get("ts", 0) >= week_ts)
+    month_income = sum(_nano_to_ton(e.get("price_nano", "0")) for e in all_events)
 
     lines = ["<b>Данные по аренде Marketapp:</b>\n"]
 
