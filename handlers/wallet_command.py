@@ -43,16 +43,21 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
         if items:
             for item in items:
                 dst = item.get("dst", "")
+                all_events.append(item)
                 if _normalize_address(dst) == normalized:
-                    all_events.append(item)
+                    logger.info(f"MATCH: {item}")
+
+    logger.info(f"Wallet: {wallet_address}, Normalized: {normalized}")
+    logger.info(f"Total events: {len(all_events)}")
 
     now_ts = _ts_now()
     day_ts = now_ts - 86400
     week_ts = now_ts - 604800
 
-    day_income = sum(_nano_to_ton(e.get("price_nano", "0")) for e in all_events if e.get("ts", 0) >= day_ts)
-    week_income = sum(_nano_to_ton(e.get("price_nano", "0")) for e in all_events if e.get("ts", 0) >= week_ts)
-    total_income = sum(_nano_to_ton(e.get("price_nano", "0")) for e in all_events)
+    matched = [e for e in all_events if _normalize_address(e.get("dst", "")) == normalized]
+    day_income = sum(_nano_to_ton(e.get("price_nano", "0")) for e in matched if e.get("ts", 0) >= day_ts)
+    week_income = sum(_nano_to_ton(e.get("price_nano", "0")) for e in matched if e.get("ts", 0) >= week_ts)
+    total_income = sum(_nano_to_ton(e.get("price_nano", "0")) for e in matched)
 
     lines = [
         "<b>Данные по аренде:</b>",
@@ -63,14 +68,14 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
         f"  Всего: {_format_ton(total_income)} TON",
     ]
 
-    if all_events:
-        lines.append(f"\nОпераций: {len(all_events)}")
+    if matched:
+        lines.append(f"\nОпераций: {len(matched)}")
         lines.append("\n<b>Последние поступления:</b>")
-        for ev in all_events[:5]:
+        for ev in matched[:5]:
             name = ev.get("name", "?")
             price = _nano_to_ton(ev.get("price_nano", "0"))
             lines.append(f"  {name}: {_format_ton(price)} TON")
-        if len(all_events) > 5:
-            lines.append(f"  ... и ещё {len(all_events) - 5}")
+        if len(matched) > 5:
+            lines.append(f"  ... и ещё {len(matched) - 5}")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
