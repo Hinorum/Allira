@@ -1,5 +1,5 @@
 import asyncio
-import hashlib
+import base64
 import logging
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -14,11 +14,11 @@ def _address_to_raw(addr: str) -> str:
     if addr.startswith("0:"):
         return addr.lower()
     if len(addr) == 48 and (addr.startswith("EQ") or addr.startswith("UQ")):
-        bounceable = addr.startswith("EQ")
-        raw_part = addr[2:]
-        data = bytes.fromhex("80" if bounceable else "00" + raw_part)
-        checksum = hashlib.sha256(hashlib.sha256(data).digest()).digest()[:2]
-        decoded = data + checksum
+        urlsafe = addr[2:].replace("-", "+").replace("_", "/")
+        padding = 4 - len(urlsafe) % 4
+        if padding != 4:
+            urlsafe += "=" * padding
+        decoded = base64.b64decode(urlsafe)
         hex_part = decoded[1:33].hex()
         return f"0:{hex_part}"
     return addr.lower()
@@ -33,7 +33,13 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     wallet_address = context.args[0]
-    raw_wallet = _address_to_raw(wallet_address)
+    try:
+        raw_wallet = _address_to_raw(wallet_address)
+    except Exception as e:
+        logger.error(f"Address parse error: {e}")
+        await update.message.reply_text("Ошибка формата адреса.")
+        return
+
     api_token = context.bot_data.get("MARKETAPP_API_KEY")
 
     if not api_token:
@@ -48,8 +54,7 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
             await asyncio.sleep(2)
         items = await fetch_rent_history(api_token, category, limit=100)
         if items:
-            for item in items:
-                all_events.append(item)
+            all_events.extend(items)
 
     matched = [e for e in all_events if _address_to_raw(e.get("dst", "")) == raw_wallet]
 
