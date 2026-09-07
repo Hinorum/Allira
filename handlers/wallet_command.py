@@ -3,9 +3,18 @@ import logging
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from tasks.marketapp_reports import fetch_my_rented, fetch_rent_history, _ts_now, _format_ton, _nano_to_ton, RENT_CATEGORIES
+from tasks.marketapp_reports import fetch_rent_history, _ts_now, _format_ton, _nano_to_ton, RENT_CATEGORIES
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_address(addr: str) -> str:
+    addr = addr.strip()
+    if addr.startswith("0:"):
+        return "UQ" + addr[2:]
+    if addr.startswith("UQ") or addr.startswith("EQ"):
+        return addr
+    return addr
 
 
 async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -17,6 +26,7 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     wallet_address = context.args[0]
+    normalized = _normalize_address(wallet_address)
     api_token = context.bot_data.get("MARKETAPP_API_KEY")
 
     if not api_token:
@@ -32,7 +42,8 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
         items = await fetch_rent_history(api_token, category, limit=100)
         if items:
             for item in items:
-                if item.get("dst") == wallet_address:
+                dst = item.get("dst", "")
+                if _normalize_address(dst) == normalized:
                     all_events.append(item)
 
     now_ts = _ts_now()
