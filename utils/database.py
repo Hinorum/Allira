@@ -514,10 +514,18 @@ def _canonical_tx_hash(tx_hash: str) -> str:
 
 
 def _sync_find_rent_event(conn, ts: int, src: str, dst: str, wallet: str = ""):
+    norm_src = _normalize_addr(src)
+    norm_dst = _normalize_addr(dst)
+    try:
+        ts = int(ts)
+    except (TypeError, ValueError):
+        ts = 0
+    if ts > 10_000_000_000:  # миллисекунды -> секунды
+        ts //= 1000
     row = conn.execute(
         "SELECT id, wallet FROM marketapp_rent_events "
-        "WHERE ts=? AND src=? AND dst=? LIMIT 1",
-        (ts, _normalize_addr(src), _normalize_addr(dst))
+        "WHERE ts BETWEEN ? AND ? AND src=? AND dst=? LIMIT 1",
+        (ts - 300, ts + 300, norm_src, norm_dst)
     ).fetchone()
     if row is None:
         return None

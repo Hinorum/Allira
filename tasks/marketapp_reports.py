@@ -8,7 +8,7 @@ from telegram.ext import ContextTypes
 from utils.database import (
     save_marketapp_profit, get_previous_profit, get_profit_for_period,
     save_blockchain_rent_events, get_sync_state, set_sync_state,
-    enrich_blockchain_events
+    enrich_blockchain_events, get_all_rent_events
 )
 from utils.config import BotConfig
 from utils.http_client import get_client, with_retry
@@ -439,7 +439,7 @@ async def fetch_rent_history(api_token: str, category: str, limit: int = 100,
             continue
 
         items = data.get("items", [])
-        next_cursor = data.get("next_cursor") or data.get("next_cursor_url") or None
+        next_cursor = data.get("cursor") or data.get("next_cursor") or data.get("next_cursor_url") or None
         return items, next_cursor
     return None, None
 
@@ -493,6 +493,10 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
     raw_wallet = userfriendly_to_raw(wallet)
     collected = []
 
+    known = await get_all_rent_events(wallet)
+    min_ts = min((int(e.get("ts", 0) or 0) for e in known), default=0)
+    logger.info(f"marketapp: блокчейн-событий по кошельку={len(known)}, min_ts={min_ts}")
+
     for i, category in enumerate(RENT_CATEGORIES):
         if i > 0:
             await asyncio.sleep(2)
@@ -503,7 +507,22 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
             items, next_cursor = await fetch_rent_history(api_token, category, limit=100, cursor=cursor)
             if not items:
                 break
-            logger.info(f"marketapp: {category}/history страница {page + 1} — {len(items)} записей")
+            oldest = min((int(ev.get("ts", 0) or 0) for ev in items), default=0)
+            if min_ts and oldest and oldest < min_ts - 604800:
+                logger.info(
+                    f"marketapp: {category}/history — история ушла старее блокчейн-границы "
+                    f"(oldest={oldest} < min_ts={min_ts}), останавливаюсь на странице {page + 1}"
+                )
+                break
+            if page == 0:
+                sample = items[0] if items else {}
+                logger.info(
+                    f"marketapp: {category}/history страница 1 — {len(items)} записей, "
+                    f"next_cursor={next_cursor!r} keys={sorted(sample.keys())} "
+                    f"sample src={sample.get('src')!r} dst={sample.get('dst')!r} ts={sample.get('ts')!r} price_nano={sample.get('price_nano')!r}"
+                )
+            elif page < 5:
+                logger.info(f"marketapp: {category}/history страница {page + 1} — {len(items)} записей")
             for item in items:
                 src_raw = userfriendly_to_raw(item.get("src", ""))
                 dst_raw = userfriendly_to_raw(item.get("dst", ""))
