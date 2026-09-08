@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 MARKETAPP_API_URL = "https://api.marketapp.org"
 TONCENTER_API_URL = "https://toncenter.com/api/v2"
+TONAPI_API_URL = "https://tonapi.io/v2"
 RENT_CATEGORIES = ["gifts", "usernames", "numbers"]
 RENT_COMMENT_MARKERS = ("marketapp", "rent")
 MAX_PAGE_RETRIES = 5
@@ -102,7 +103,7 @@ async def fetch_toncenter_txns(address: str, limit: int = 100, lt: str = None, h
         try:
             data = response.json()
         except Exception:
-            logger.error("TON Center API: невалидный JSON")
+            logger.error(f"TON Center API: невалидный JSON (статус {response.status_code}, {response.text[:80]!r})")
             await asyncio.sleep(2.0)
             continue
 
@@ -114,7 +115,149 @@ async def fetch_toncenter_txns(address: str, limit: int = 100, lt: str = None, h
 
 
 @with_retry(max_retries=2, base_delay=3.0)
+async def fetch_tonapi_events(address: str, before_lt: str = None, limit: int = 100) -> list | None:
+    params = {"limit": limit}
+    if before_lt:
+        params["before_lt"] = before_lt
+    headers = {"User-Agent": "AlliraBot/1.0"}
+
+    client = await get_client()
+    for attempt in range(MAX_PAGE_RETRIES):
+        try:
+            response = await client.get(
+                f"{TONAPI_API_URL}/accounts/{address}/events",
+                params=params,
+                headers=headers,
+                timeout=20.0
+            )
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+            logger.warning(f"tonapi сеть (попытка {attempt + 1}/{MAX_PAGE_RETRIES}): {e}")
+            await asyncio.sleep(2.0)
+            continue
+
+        if response.status_code == 429:
+            retry_after = int(response.headers.get("Retry-After", "5"))
+            logger.warning(f"tonapi 429, ожидание {retry_after}с...")
+            await asyncio.sleep(retry_after)
+            continue
+
+        if response.status_code != 200:
+            logger.error(f"tonapi статус {response.status_code}: {response.text[:200]}")
+            await asyncio.sleep(2.0)
+            continue
+
+        try:
+            data = response.json()
+        except Exception:
+            logger.error(f"tonapi: невалидный JSON (статус {response.status_code}, {response.text[:80]!r})")
+            await asyncio.sleep(2.0)
+            continue
+
+        return data.get("events", [])
+    return None
+
+
+def _tonapi_extract_rent(event: dict, raw_wallet: str) -> dict | None:
+    for action in event.get("actions", []):
+        if action.get("type") != "TonTransfer":
+            continue
+        tt = action.get("TonTransfer", {})
+        comment = tt.get("comment", "") or ""
+        if not any(marker in comment.lower() for marker in RENT_COMMENT_MARKERS):
+            continue
+        recipient = tt.get("recipient", {}) or {}
+        dst = recipient.get("address", "")
+        if not dst or userfriendly_to_raw(dst) != raw_wallet:
+            continue
+        amount = int(tt.get("amount", 0) or 0)
+        if amount <= 0:
+            continue
+        sender = tt.get("sender", {}) or {}
+        return {
+            "tx_hash": event.get("event_id", ""),
+            "ts": int(event.get("timestamp", 0) or 0),
+            "src": sender.get("address", ""),
+            "dst": dst,
+            "value_nano": str(amount),
+        }
+    return None
+
+
+@with_retry(max_retries=2, base_delay=3.0)
+async def _sync_from_tonapi(wallet: str, max_pages: int = 50, from_scratch: bool = False) -> tuple[int, bool]:
+    raw_wallet = userfriendly_to_raw(wallet)
+
+    boundary = None
+    if not from_scratch:
+        sync_state = await get_sync_state(wallet)
+        if sync_state and sync_state.get("last_synced_lt"):
+            try:
+                boundary = int(sync_state["last_synced_lt"])
+            except (TypeError, ValueError):
+                boundary = None
+
+    before_lt = None
+    new_events = []
+    pages = 0
+    scan_complete = False
+    deep_lt = None
+    deep_utime = 0
+
+    while pages < max_pages and not scan_complete:
+        if pages > 0:
+            await asyncio.sleep(0.5)
+
+        events = await fetch_tonapi_events(wallet, before_lt=before_lt)
+        if not events:
+            if events is None:
+                return 0, False
+            scan_complete = True
+            break
+
+        for ev in events:
+            try:
+                lt = int(ev.get("lt", 0) or 0)
+            except (TypeError, ValueError):
+                lt = 0
+            if boundary is not None and lt <= boundary:
+                deep_lt = boundary
+                deep_utime = int(ev.get("timestamp", 0) or 0)
+                scan_complete = True
+                break
+            rent = _tonapi_extract_rent(ev, raw_wallet)
+            if rent:
+                new_events.append(rent)
+            deep_lt = lt
+            deep_utime = int(ev.get("timestamp", 0) or 0)
+
+        if scan_complete:
+            break
+        if deep_lt is None:
+            break
+        before_lt = str(deep_lt)
+        pages += 1
+
+    if new_events:
+        saved = await save_blockchain_rent_events(new_events, wallet)
+        logger.info(f"Блокчейн (tonapi): сохранено {saved} событий аренды")
+    else:
+        saved = 0
+
+    if scan_complete and deep_lt is not None:
+        await set_sync_state(wallet, str(deep_lt), "", deep_utime)
+
+    return saved, True
+
+
 async def sync_rent_from_blockchain(wallet: str, max_pages: int = 50, from_scratch: bool = False) -> int:
+    saved, ok = await _sync_from_tonapi(wallet, max_pages, from_scratch)
+    if ok:
+        return saved
+    logger.warning("tonapi недоступен — переключаюсь на TON Center")
+    return await _sync_from_toncenter(wallet, max_pages, from_scratch)
+
+
+async def _sync_from_toncenter(wallet: str, max_pages: int = 50, from_scratch: bool = False) -> int:
     raw_wallet = userfriendly_to_raw(wallet)
     api_key = BotConfig.from_env().toncenter_api_key
 
