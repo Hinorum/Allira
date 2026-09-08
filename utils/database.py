@@ -612,6 +612,9 @@ def _sync_enrich_blockchain_event(conn, event: dict, wallet: str = "") -> int:
     ts = int(event.get("ts", 0) or 0)
     src = _normalize_addr(event.get("src", ""))
     dst = _normalize_addr(event.get("dst", ""))
+    if ts > 10_000_000_000:  # миллисекунды -> секунды
+        ts //= 1000
+    price = int(float(event.get("price_nano") or 0))
 
     existing = None
     if canon_hash:
@@ -620,18 +623,42 @@ def _sync_enrich_blockchain_event(conn, event: dict, wallet: str = "") -> int:
         ).fetchone()
     if existing is None:
         existing = _sync_find_rent_event(conn, ts, src, dst, wallet)
+
+    # Робастный матч: ts-окно + цена с допуском + кошелёк в src|dst
+    if existing is None and ts:
+        params = [_normalize_addr(wallet), ts - 7200, ts + 7200]
+        rows = conn.execute(
+            "SELECT id, src, dst, price_nano FROM marketapp_rent_events "
+            "WHERE (src=? OR dst=?) AND ts BETWEEN ? AND ?",
+            params,
+        ).fetchall()
+        if price > 0:
+            candidates = []
+            for r in rows:
+                row_price = int(float(r["price_nano"] or 0))
+                if row_price > 0:
+                    diff = abs(row_price - price)
+                    if diff / max(row_price, price, 1) < 0.05:
+                        candidates.append(r)
+            if len(candidates) == 1:
+                existing = candidates[0]
+            elif len(candidates) > 1:
+                best = min(candidates, key=lambda r: abs(int(float(r["price_nano"] or 0)) - price))
+                existing = best
+
     if existing is None:
         return 0
     conn.execute("""
         UPDATE marketapp_rent_events
         SET category=?, nft_address=?, nft_name=?, collection_address=?,
-            is_extend=?, duration=?, wallet=?, source='marketapp'
+            price_nano=?, is_extend=?, duration=?, wallet=?, source='marketapp'
         WHERE id=?
     """, (
         event.get("category", ""),
         event.get("address", ""),
         event.get("name", ""),
         event.get("collection_address", ""),
+        event.get("price_nano", "0"),
         1 if event.get("is_extend") else 0,
         int(event.get("duration", 0) or 0),
         _normalize_addr(wallet),

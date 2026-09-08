@@ -548,6 +548,7 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
                     "ts": int(item.get("ts", 0) or 0),
                     "src": item.get("src", ""),
                     "dst": item.get("dst", ""),
+                    "price_nano": item.get("price_nano", "0"),
                 }
                 collected.append(record)
 
