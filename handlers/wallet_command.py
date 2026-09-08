@@ -51,6 +51,12 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
         candidate = context.args[0].strip()
         if userfriendly_to_raw(candidate).startswith("0:"):
             wallet = candidate
+        else:
+            await update.message.reply_text(
+                "Неверный адрес кошелька.\n"
+                "Использование: /marketapprent <адрес кошелька>"
+            )
+            return
     if not wallet:
         wallet = context.bot_data.get("MARKETAPP_WALLET", "")
 
@@ -61,6 +67,10 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
+    wallet_raw = userfriendly_to_raw(wallet)
+    owner_wallet = context.bot_data.get("MARKETAPP_WALLET", "")
+    is_owner = bool(owner_wallet and userfriendly_to_raw(owner_wallet) == wallet_raw)
+
     await update.message.reply_text(
         f"Синхронизирую историю для кошелька:\n<code>{_escape_html(wallet)}</code>",
         parse_mode="HTML"
@@ -69,19 +79,19 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
     api_saved = 0
     blockchain_saved = 0
 
-    await clear_rent_events()
+    await clear_rent_events(wallet)
 
     await update.message.reply_text("Сканирую полную историю из блокчейна...")
     blockchain_saved = await sync_rent_from_blockchain(wallet, max_pages=MAX_SYNC_PAGES, from_scratch=True)
 
-    if api_token:
+    if api_token and is_owner:
         await update.message.reply_text("Дополняю метаданными из Marketapp...")
         try:
             api_saved = await collect_rent_events(api_token, wallet)
         except Exception as e:
             logger.error(f"Marketapp API дополнение: {e}", exc_info=True)
 
-    events = _dedupe_events(await get_all_rent_events())
+    events = _dedupe_events(await get_all_rent_events(wallet))
     sorted_events = sorted(events, key=lambda e: e["ts"], reverse=True)
 
     now_ts = int(datetime.now(MSK).timestamp())
@@ -134,20 +144,21 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
             lines.append(f"{key}: <b>{_format_ton(monthly[key] / 1_000_000_000)} TON</b>")
 
     try:
-        client = await get_client()
-        response = await client.get(
-            f"{MARKETAPP_API_URL}/v1/rent/my-rented/",
-            headers={"Authorization": api_token, "User-Agent": "AlliraBot/1.0"},
-            timeout=15.0
-        )
-        if response.status_code == 200:
-            rented = response.json().get("items", [])
-            if rented:
-                lines.append(f"\nАктивных аренд: {len(rented)}")
-                for item in rented[:5]:
-                    name = _escape_html(item.get("nft_name", "?"))
-                    price = _nano_to_ton(item.get("price_per_day", "0"))
-                    lines.append(f"  - {name}: {_format_ton(price)} TON/день")
+        if api_token and is_owner:
+            client = await get_client()
+            response = await client.get(
+                f"{MARKETAPP_API_URL}/v1/rent/my-rented/",
+                headers={"Authorization": api_token, "User-Agent": "AlliraBot/1.0"},
+                timeout=15.0
+            )
+            if response.status_code == 200:
+                rented = response.json().get("items", [])
+                if rented:
+                    lines.append(f"\nАктивных аренд: {len(rented)}")
+                    for item in rented[:5]:
+                        name = _escape_html(item.get("nft_name", "?"))
+                        price = _nano_to_ton(item.get("price_per_day", "0"))
+                        lines.append(f"  - {name}: {_format_ton(price)} TON/день")
     except Exception:
         pass
 

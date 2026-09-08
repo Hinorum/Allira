@@ -222,7 +222,7 @@ async def sync_rent_from_blockchain(wallet: str, max_pages: int = 50, from_scrat
         await set_sync_state(wallet, deep_lt, deep_hash, deep_utime)
 
     if new_events:
-        saved = await save_blockchain_rent_events(new_events)
+        saved = await save_blockchain_rent_events(new_events, wallet)
         logger.info(f"Блокчейн: сохранено {saved} событий аренды")
         return saved
     return 0
@@ -374,7 +374,7 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
     if not collected:
         return 0
 
-    enriched = await enrich_blockchain_events(collected)
+    enriched = await enrich_blockchain_events(collected, wallet)
     if enriched:
         logger.info(f"Дополнено метаданными из Marketapp: {enriched}")
     return enriched
