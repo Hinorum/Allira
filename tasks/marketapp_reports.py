@@ -140,7 +140,7 @@ async def fetch_tonapi_events(address: str, before_lt: str = None, limit: int = 
 
         if response.status_code == 429:
             retry_after = int(response.headers.get("Retry-After", "5"))
-            logger.warning(f"tonapi 429, ожидание {retry_after}с...")
+            logger.warning(f"tonapi 429 (попытка {attempt + 1}/{MAX_PAGE_RETRIES}), ожидание {retry_after}с...")
             await asyncio.sleep(retry_after)
             continue
 
@@ -156,7 +156,9 @@ async def fetch_tonapi_events(address: str, before_lt: str = None, limit: int = 
             await asyncio.sleep(2.0)
             continue
 
-        return data.get("events", [])
+        events = data.get("events") or []
+        logger.info(f"tonapi: страница перед lt={before_lt or 'begin'} — служебных событий {len(events)}")
+        return events
     return None
 
 
@@ -190,6 +192,7 @@ def _tonapi_extract_rent(event: dict, raw_wallet: str) -> dict | None:
 async def _sync_from_tonapi(wallet: str, max_pages: int = 50, from_scratch: bool = False) -> tuple[int, bool]:
     raw_wallet = userfriendly_to_raw(wallet)
     api_key = BotConfig.from_env().tonapi_api_key
+    logger.info(f"[tonapi sync] wallet={wallet} raw={raw_wallet} api_key={bool(api_key)} from_scratch={from_scratch} max_pages={max_pages}")
 
     boundary = None
     if not from_scratch:
@@ -248,6 +251,7 @@ async def _sync_from_tonapi(wallet: str, max_pages: int = 50, from_scratch: bool
         logger.info(f"Блокчейн (tonapi): сохранено {saved} событий аренды")
     else:
         saved = 0
+        logger.warning(f"[tonapi sync] найденных событий аренды: 0 (страниц перебрано: {pages}, scan_complete={scan_complete})")
 
     if scan_complete and deep_lt is not None:
         await set_sync_state(wallet, str(deep_lt), "", deep_utime)
@@ -256,11 +260,15 @@ async def _sync_from_tonapi(wallet: str, max_pages: int = 50, from_scratch: bool
 
 
 async def sync_rent_from_blockchain(wallet: str, max_pages: int = 50, from_scratch: bool = False) -> int:
+    logger.info(f"[sync] старт wallet={wallet} max_pages={max_pages} from_scratch={from_scratch}")
     saved, ok = await _sync_from_tonapi(wallet, max_pages, from_scratch)
     if ok:
+        logger.info(f"[sync] tonapi путь завершён: saved={saved}")
         return saved
     logger.warning("tonapi недоступен — переключаюсь на TON Center")
-    return await _sync_from_toncenter(wallet, max_pages, from_scratch)
+    saved = await _sync_from_toncenter(wallet, max_pages, from_scratch)
+    logger.info(f"[sync] toncenter путь завершён: saved={saved}")
+    return saved
 
 
 async def _sync_from_toncenter(wallet: str, max_pages: int = 50, from_scratch: bool = False) -> int:

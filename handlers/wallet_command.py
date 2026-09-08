@@ -44,6 +44,7 @@ def _total_nano(events: list, since_ts: int = 0) -> int:
 
 
 async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"/marketapprent вызван, args={context.args}")
     api_token = context.bot_data.get("MARKETAPP_API_KEY")
 
     wallet = ""
@@ -81,6 +82,7 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     await update.message.reply_text("Сканирую полную историю из блокчейна...")
     blockchain_saved = await sync_rent_from_blockchain(wallet, max_pages=MAX_SYNC_PAGES, from_scratch=True)
+    logger.info(f"/marketapprent: блокчейн-синк завершён, сохранено={blockchain_saved}")
 
     if api_token and is_owner:
         await update.message.reply_text("Дополняю метаданными из Marketapp...")
@@ -130,6 +132,8 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
         if api_saved:
             parts.append(f"метаданные Marketapp: {api_saved}")
         lines.append("Сохранено: " + ", ".join(parts))
+    else:
+        lines.append("Сохранено: ничего (оба источника не вернули данные)")
 
     if sorted_events:
         lines.append("\n<b>Разбивка по месяцам:</b>")
