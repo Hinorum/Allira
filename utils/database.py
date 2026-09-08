@@ -156,6 +156,10 @@ def init_db():
         conn.execute(
             "UPDATE marketapp_rent_events SET wallet = dst WHERE wallet = '' AND dst <> ''"
         )
+        conn.execute(
+            "UPDATE marketapp_rent_events SET wallet = dst "
+            "WHERE wallet <> '' AND wallet <> dst AND dst <> '' AND dst LIKE '0:%'"
+        )
 
     logger.info("База данных инициализирована")
 
@@ -510,10 +514,20 @@ def _canonical_tx_hash(tx_hash: str) -> str:
 
 
 def _sync_find_rent_event(conn, ts: int, src: str, dst: str, wallet: str = ""):
-    return conn.execute(
-        "SELECT id FROM marketapp_rent_events WHERE ts=? AND src=? AND dst=? AND wallet=? LIMIT 1",
-        (ts, _normalize_addr(src), _normalize_addr(dst), _normalize_addr(wallet))
+    row = conn.execute(
+        "SELECT id, wallet FROM marketapp_rent_events "
+        "WHERE ts=? AND src=? AND dst=? LIMIT 1",
+        (ts, _normalize_addr(src), _normalize_addr(dst))
     ).fetchone()
+    if row is None:
+        return None
+    norm_wallet = _normalize_addr(wallet)
+    if row["wallet"] != norm_wallet:
+        conn.execute(
+            "UPDATE marketapp_rent_events SET wallet=? WHERE id=?",
+            (norm_wallet, row["id"]),
+        )
+    return row
 
 
 def _sync_clear_rent_events(wallet: str = ""):
@@ -677,9 +691,14 @@ def _sync_save_blockchain_rent_events(events: list, wallet: str = "") -> int:
             wallet = _normalize_addr(wallet)
             if canon_hash:
                 existing = conn.execute(
-                    "SELECT id FROM marketapp_rent_events WHERE tx_hash=? LIMIT 1", (canon_hash,)
+                    "SELECT id, wallet FROM marketapp_rent_events WHERE tx_hash=? LIMIT 1", (canon_hash,)
                 ).fetchone()
                 if existing:
+                    if existing["wallet"] != wallet:
+                        conn.execute(
+                            "UPDATE marketapp_rent_events SET wallet=? WHERE id=?",
+                            (wallet, existing["id"]),
+                        )
                     continue
             if _sync_find_rent_event(conn, ts, src, dst, wallet):
                 continue
