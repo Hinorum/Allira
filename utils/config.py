@@ -14,6 +14,7 @@ class BotConfig:
     marketapp_api_key: str = ""
     marketapp_wallet: str = ""
     toncenter_api_key: str = ""
+    tonapi_api_key: str = ""
     bot_username: str = ""
     bot_id: int = 0
 
@@ -30,4 +31,5 @@ class BotConfig:
             marketapp_api_key=os.getenv("MARKETAPP_API_KEY", "").strip(),
             marketapp_wallet=os.getenv("MARKETAPP_WALLET", "").strip(),
             toncenter_api_key=os.getenv("TONCENTER_API_KEY", "").strip(),
+            tonapi_api_key=os.getenv("TONAPI_API_KEY", "").strip(),
         )

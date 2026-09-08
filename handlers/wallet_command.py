@@ -14,7 +14,7 @@ from tasks.marketapp_reports import (
     MSK,
     MARKETAPP_API_URL,
 )
-from utils.database import clear_rent_events, get_all_rent_events
+from utils.database import get_all_rent_events
 from utils.http_client import get_client
 
 logger = logging.getLogger(__name__)
@@ -78,8 +78,6 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     api_saved = 0
     blockchain_saved = 0
-
-    await clear_rent_events(wallet)
 
     await update.message.reply_text("Сканирую полную историю из блокчейна...")
     blockchain_saved = await sync_rent_from_blockchain(wallet, max_pages=MAX_SYNC_PAGES, from_scratch=True)

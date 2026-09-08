@@ -115,11 +115,14 @@ async def fetch_toncenter_txns(address: str, limit: int = 100, lt: str = None, h
 
 
 @with_retry(max_retries=2, base_delay=3.0)
-async def fetch_tonapi_events(address: str, before_lt: str = None, limit: int = 100) -> list | None:
+async def fetch_tonapi_events(address: str, before_lt: str = None, limit: int = 100,
+                              api_key: str = None) -> list | None:
     params = {"limit": limit}
     if before_lt:
         params["before_lt"] = before_lt
     headers = {"User-Agent": "AlliraBot/1.0"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     client = await get_client()
     for attempt in range(MAX_PAGE_RETRIES):
@@ -186,6 +189,7 @@ def _tonapi_extract_rent(event: dict, raw_wallet: str) -> dict | None:
 @with_retry(max_retries=2, base_delay=3.0)
 async def _sync_from_tonapi(wallet: str, max_pages: int = 50, from_scratch: bool = False) -> tuple[int, bool]:
     raw_wallet = userfriendly_to_raw(wallet)
+    api_key = BotConfig.from_env().tonapi_api_key
 
     boundary = None
     if not from_scratch:
@@ -205,11 +209,13 @@ async def _sync_from_tonapi(wallet: str, max_pages: int = 50, from_scratch: bool
 
     while pages < max_pages and not scan_complete:
         if pages > 0:
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1.1 if not api_key else 0.25)
 
-        events = await fetch_tonapi_events(wallet, before_lt=before_lt)
+        events = await fetch_tonapi_events(wallet, before_lt=before_lt, api_key=api_key)
         if not events:
             if events is None:
+                if new_events:
+                    await save_blockchain_rent_events(new_events, wallet)
                 return 0, False
             scan_complete = True
             break

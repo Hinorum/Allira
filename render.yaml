@@ -29,3 +29,5 @@ services:
         sync: false
       - key: TONCENTER_API_KEY
         sync: false
+      - key: TONAPI_API_KEY
+        sync: false
