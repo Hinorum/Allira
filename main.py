@@ -24,7 +24,7 @@ from utils.config import BotConfig
 from utils.http_client import close_client
 from prompts.loader import preload_all_prompts
 from handlers.start_command import start_command, help_command, show_help_callback
-from handlers.wallet_command import marketapprent_command
+from handlers.wallet_command import marketapprent_command, marketappgifts_command
 from handlers.message_handler import handle_message, handle_private_message
 from handlers.stats_command import stats_command, history_command, leaderboard_command
 from handlers.dice_tournament import (
@@ -203,6 +203,7 @@ def main():
     application.add_handler(CommandHandler("leaderboard", leaderboard_command))
     application.add_handler(CommandHandler("clear", clear_context_command))
     application.add_handler(CommandHandler("marketapprent", marketapprent_command))
+    application.add_handler(CommandHandler("marketappgifts", marketappgifts_command))
 
     application.add_handler(CallbackQueryHandler(
         show_help_callback, pattern="^show_help$"

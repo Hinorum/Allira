@@ -20,7 +20,6 @@ from utils.http_client import get_client
 logger = logging.getLogger(__name__)
 
 MAX_SYNC_PAGES = 1000
-MAX_LIST_MESSAGES = 20
 
 
 def _dedupe_events(events: list) -> list:
@@ -172,33 +171,92 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def send_rent_history(update: Update, events: list):
-    header = "<b>Все сдачи в аренду от начала пользования кошелька:</b>"
-    lines = [header]
-    chunks = []
-    current_len = 0
-
+    lines = [f"Сдачи в аренду — всего {len(events)} событий:\n"]
     for ev in events:
         amount = _format_ton(_nano_to_ton(ev["price_nano"]))
         line = (
             f"{datetime.fromtimestamp(ev['ts'], MSK).strftime('%d.%m.%Y %H:%M')} — "
             f"+{amount} TON"
         )
-        if current_len and current_len + len(line) + 1 > 3800:
-            chunks.append("\n".join(lines))
+        name = (ev.get("nft_name") or "").strip()
+        nft_addr = (ev.get("nft_address") or "").strip()
+        if name:
+            line += f" — {name}"
+        lines.append(line)
+        if nft_addr:
+            lines.append(f"  https://getgems.io/nft/{nft_addr}")
+
+    payload = "\n".join(lines).encode("utf-8")
+    await update.message.reply_document(
+        document=("rent_history.txt", payload),
+        caption=f"Все сдачи в аренду: <b>{len(events)}</b> событий, "
+                f"+{_format_ton(_nano_to_ton(sum(int(ev['price_nano'] or 0) for ev in events)))} TON",
+        parse_mode="HTML",
+    )
+
+
+async def marketappgifts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"/marketappgifts вызван, args={context.args}")
+    wallet = ""
+    if context.args:
+        candidate = context.args[0].strip()
+        if userfriendly_to_raw(candidate).startswith("0:"):
+            wallet = candidate
+        else:
+            await update.message.reply_text(
+                "Неверный адрес кошелька.\n"
+                "Использование: /marketappgifts <адрес кошелька>"
+            )
+            return
+    if not wallet:
+        wallet = context.bot_data.get("MARKETAPP_WALLET", "")
+
+    if not wallet:
+        await update.message.reply_text(
+            "Кошелёк не передан и MARKETAPP_WALLET не настроен.\n"
+            "Использование: /marketappgifts <адрес кошелька>"
+        )
+        return
+
+    events = _dedupe_events(await get_all_rent_events(wallet))
+    if not events:
+        await update.message.reply_text("По этому кошельку пока нет данных.")
+        return
+
+    per_gift = OrderedDict()
+    for ev in events:
+        addr = (ev.get("nft_address") or "").strip()
+        if not addr:
+            continue
+        name = (ev.get("nft_name") or "").strip()
+        key = addr
+        entry = per_gift.setdefault(key, {"name": name, "nano": 0, "count": 0})
+        entry["nano"] += int(ev["price_nano"] or 0)
+        entry["count"] += 1
+
+    if not per_gift:
+        await update.message.reply_text(
+            "Нет событий с привязкой к подаркам. "
+            "Сначала запустите /marketapprent для этого кошелька."
+        )
+        return
+
+    header = f"<b>Доход по подаркам</b> ({wallet[:10]}...): {len(per_gift)} NFT\n"
+    lines = [header]
+    current_len = len(header)
+
+    for addr, gift in sorted(per_gift.items(), key=lambda kv: kv[1]["nano"], reverse=True):
+        ton = _format_ton(_nano_to_ton(str(gift["nano"])))
+        name = _escape_html(gift["name"]) if gift["name"] else "без названия"
+        line = (
+            f"<a href=\"https://getgems.io/nft/{addr}\">"
+            f"{name}</a> — <b>{ton} TON</b> ({gift['count']} сд.)"
+        )
+        if current_len and current_len + len(name) + 60 > 3800:
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
             lines = [header]
-            current_len = 0
+            current_len = len(header)
         lines.append(line)
         current_len += len(line) + 1
 
-    if len(lines) > 1 or not chunks:
-        chunks.append("\n".join(lines))
-
-    for chunk in chunks[:MAX_LIST_MESSAGES]:
-        await update.message.reply_text(chunk, parse_mode="HTML")
-
-    if len(chunks) > MAX_LIST_MESSAGES:
-        await update.message.reply_text(
-            f"Показаны первые {len(chunks[:MAX_LIST_MESSAGES])} сообщений. "
-            f"Всего событий в базе: <b>{len(events)}</b>.",
-            parse_mode="HTML"
-        )
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
