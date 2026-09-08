@@ -1,7 +1,8 @@
+import io
 import logging
 from collections import OrderedDict
 from datetime import datetime
-from telegram import Update
+from telegram import InputFile, Update
 from telegram.ext import ContextTypes
 
 from tasks.marketapp_reports import (
@@ -188,7 +189,7 @@ async def send_rent_history(update: Update, events: list):
 
     payload = "\n".join(lines).encode("utf-8")
     await update.message.reply_document(
-        document=("rent_history.txt", payload),
+        document=InputFile(io.BytesIO(payload), filename="rent_history.txt"),
         caption=f"Все сдачи в аренду: <b>{len(events)}</b> событий, "
                 f"+{_format_ton(_nano_to_ton(sum(int(ev['price_nano'] or 0) for ev in events)))} TON",
         parse_mode="HTML",
@@ -218,7 +219,25 @@ async def marketappgifts_command(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
+    api_token = context.bot_data.get("MARKETAPP_API_KEY")
+    wallet_raw = userfriendly_to_raw(wallet)
+    owner_wallet = context.bot_data.get("MARKETAPP_WALLET", "")
+    is_owner = bool(owner_wallet and userfriendly_to_raw(owner_wallet) == wallet_raw)
+
     events = _dedupe_events(await get_all_rent_events(wallet))
+    if not events or not any((e.get("nft_address") or "").strip() for e in events):
+        await update.message.reply_text("Синхронизирую историю и дополняю метаданными подарков...")
+        try:
+            await sync_rent_from_blockchain(wallet, max_pages=MAX_SYNC_PAGES, from_scratch=True)
+        except Exception as e:
+            logger.error(f"/marketappgifts: блокчейн-синк: {e}", exc_info=True)
+        if api_token and is_owner:
+            try:
+                await collect_rent_events(api_token, wallet)
+            except Exception as e:
+                logger.error(f"/marketappgifts: Marketapp дополнение: {e}", exc_info=True)
+        events = _dedupe_events(await get_all_rent_events(wallet))
+
     if not events:
         await update.message.reply_text("По этому кошельку пока нет данных.")
         return
@@ -229,8 +248,7 @@ async def marketappgifts_command(update: Update, context: ContextTypes.DEFAULT_T
         if not addr:
             continue
         name = (ev.get("nft_name") or "").strip()
-        key = addr
-        entry = per_gift.setdefault(key, {"name": name, "nano": 0, "count": 0})
+        entry = per_gift.setdefault(addr, {"name": name, "nano": 0, "count": 0})
         entry["nano"] += int(ev["price_nano"] or 0)
         entry["count"] += 1
 

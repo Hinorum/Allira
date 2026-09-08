@@ -475,7 +475,7 @@ def _normalize_addr(addr: str) -> str:
         return addr.lower()
     if len(addr) == 48 and addr[:2] in ("EQ", "UQ"):
         try:
-            urlsafe = addr[2:].replace("-", "+").replace("_", "/")
+            urlsafe = addr.replace("-", "+").replace("_", "/")
             padding = (4 - len(urlsafe) % 4) % 4
             urlsafe += "=" * padding
             decoded = base64.b64decode(urlsafe)
