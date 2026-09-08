@@ -1,3 +1,4 @@
+import asyncio
 import io
 import logging
 from collections import OrderedDict
@@ -15,7 +16,7 @@ from tasks.marketapp_reports import (
     MSK,
     MARKETAPP_API_URL,
 )
-from utils.database import get_all_rent_events
+from utils.database import get_all_rent_events, get_db
 from utils.http_client import get_client
 
 logger = logging.getLogger(__name__)
@@ -196,6 +197,65 @@ async def send_rent_history(update: Update, events: list):
     )
 
 
+async def _enrich_by_price(api_token: str, wallet: str) -> int:
+    from tasks.marketapp_reports import fetch_my_rented
+
+    rented = await fetch_my_rented(api_token)
+    if not rented:
+        logger.info("_enrich_by_price: нет данных от my-rented")
+        return 0
+
+    nfts = []
+    for item in rented:
+        price = int(item.get("price_per_day", "0") or 0)
+        if price > 0:
+            nfts.append({
+                "address": item.get("nft_address", ""),
+                "name": item.get("nft_name", ""),
+                "price": price,
+            })
+
+    logger.info(f"_enrich_by_price: {len(nfts)} NFT с ценами")
+    if not nfts:
+        return 0
+
+    events = await get_all_rent_events(wallet)
+    unmatched = [e for e in events if not (e.get("nft_address") or "").strip()]
+    logger.info(f"_enrich_by_price: {len(unmatched)} событий без привязки к NFT")
+
+    if not unmatched:
+        return 0
+
+    def _do_enrich():
+        enriched = 0
+        with get_db() as conn:
+            for ev in unmatched:
+                value = int(ev.get("price_nano", "0") or 0)
+                if value <= 0:
+                    continue
+
+                best_nft = None
+                best_diff = float("inf")
+                for nft in nfts:
+                    for days in range(1, 31):
+                        expected = nft["price"] * days
+                        diff = abs(value - expected)
+                        if diff < best_diff:
+                            best_diff = diff
+                            best_nft = nft
+
+                if best_nft and best_diff / max(value, 1) < 0.05:
+                    conn.execute(
+                        "UPDATE marketapp_rent_events "
+                        "SET nft_address=?, nft_name=?, source='price_match' WHERE id=?",
+                        (best_nft["address"], best_nft["name"], ev["id"]),
+                    )
+                    enriched += 1
+        return enriched
+
+    return await asyncio.to_thread(_do_enrich)
+
+
 async def marketappgifts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"/marketappgifts вызван, args={context.args}")
     wallet = ""
@@ -231,22 +291,20 @@ async def marketappgifts_command(update: Update, context: ContextTypes.DEFAULT_T
     events = _dedupe_events(await get_all_rent_events(wallet))
     logger.info(f"/marketappgifts: событий в БД={len(events)}, "
                 f"с-подарком={sum(1 for e in events if (e.get('nft_address') or '').strip())}")
-    if not events or not any((e.get("nft_address") or "").strip() for e in events):
-        await update.message.reply_text("Синхронизирую историю и дополняю метаданными подарков...")
-        try:
-            await sync_rent_from_blockchain(wallet, max_pages=MAX_SYNC_PAGES, from_scratch=True)
-        except Exception as e:
-            logger.error(f"/marketappgifts: блокчейн-синк: {e}", exc_info=True)
-        if api_token and is_owner:
-            try:
-                await collect_rent_events(api_token, wallet)
-            except Exception as e:
-                logger.error(f"/marketappgifts: Marketapp дополнение: {e}", exc_info=True)
-        events = _dedupe_events(await get_all_rent_events(wallet))
-
     if not events:
         await update.message.reply_text("По этому кошельку пока нет данных.")
         return
+
+    has_nft_info = any((e.get("nft_address") or "").strip() for e in events)
+    if not has_nft_info and api_token and is_owner:
+        await update.message.reply_text("Подбираю NFT по ценам аренды...")
+        try:
+            enriched = await _enrich_by_price(api_token, wallet)
+            if enriched > 0:
+                events = _dedupe_events(await get_all_rent_events(wallet))
+                logger.info(f"/marketappgifts: price enrichment обогатил {enriched} событий")
+        except Exception as e:
+            logger.error(f"/marketappgifts: price enrichment: {e}", exc_info=True)
 
     per_gift = OrderedDict()
     for ev in events:
@@ -258,14 +316,22 @@ async def marketappgifts_command(update: Update, context: ContextTypes.DEFAULT_T
         entry["nano"] += int(ev["price_nano"] or 0)
         entry["count"] += 1
 
+    total_nano = sum(int(e.get("price_nano", 0) or 0) for e in events)
+    total_ton = _format_ton(_nano_to_ton(str(total_nano)))
+
     if not per_gift:
         await update.message.reply_text(
-            "Нет событий с привязкой к подаркам. "
-            "Сначала запустите /marketapprent для этого кошелька."
+            f"Общий доход: <b>{total_ton} TON</b> ({len(events)} событий)\n\n"
+            "Не удалось привязать платежи к конкретным NFT.\n"
+            "Возможно, NFT уже не в аренде или цены не совпали.",
+            parse_mode="HTML",
         )
         return
 
-    header = f"<b>Доход по подаркам</b> ({wallet[:10]}...): {len(per_gift)} NFT\n"
+    header = (
+        f"<b>Доход по подаркам</b> ({wallet[:10]}...): "
+        f"{len(per_gift)} NFT / {total_ton} TON\n"
+    )
     lines = [header]
     current_len = len(header)
 
