@@ -20,8 +20,8 @@ TONCENTER_API_URL = "https://toncenter.com/api/v2"
 TONAPI_API_URL = "https://tonapi.io/v2"
 RENT_CATEGORIES = ["gifts", "usernames", "numbers"]
 RENT_COMMENT_MARKERS = ("marketapp", "rent")
-MAX_PAGE_RETRIES = 5
-MAX_HISTORY_PAGES = 500
+MAX_PAGE_RETRIES = 3
+MAX_HISTORY_PAGES = 200
 
 MSK = timezone(timedelta(hours=3))
 
@@ -178,6 +178,8 @@ def _tonapi_extract_rent(event: dict, raw_wallet: str) -> dict | None:
         if amount <= 0:
             continue
         sender = tt.get("sender", {}) or {}
+        if comment:
+            logger.info(f"[rent comment] {comment!r}")
         return {
             "tx_hash": event.get("event_id", ""),
             "ts": int(event.get("timestamp", 0) or 0),
@@ -407,6 +409,7 @@ async def fetch_rent_history(api_token: str, category: str, limit: int = 100,
     }
 
     client = await get_client()
+    backoff = 3.0
     for attempt in range(MAX_PAGE_RETRIES):
         try:
             response = await client.get(
@@ -417,25 +420,28 @@ async def fetch_rent_history(api_token: str, category: str, limit: int = 100,
             )
         except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
             logger.warning(f"Marketapp сеть (попытка {attempt + 1}/{MAX_PAGE_RETRIES}): {e}")
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
             continue
 
         if response.status_code == 429:
             retry_after = int(response.headers.get("Retry-After", "5"))
-            logger.warning(f"Marketapp API 429, ожидание {retry_after}с...")
-            await asyncio.sleep(retry_after)
+            wait = max(retry_after, backoff)
+            logger.warning(f"Marketapp API 429 (попытка {attempt + 1}/{MAX_PAGE_RETRIES}), ожидание {wait}с...")
+            await asyncio.sleep(wait)
+            backoff = min(backoff * 2, 30.0)
             continue
 
         if response.status_code != 200:
             logger.error(f"Marketapp API статус {response.status_code} ({category}/history): {response.text[:200]}")
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(backoff)
             continue
 
         try:
             data = response.json()
         except Exception:
             logger.error("Marketapp API: невалидный JSON")
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(backoff)
             continue
 
         items = data.get("items", [])
@@ -499,11 +505,12 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
 
     for i, category in enumerate(RENT_CATEGORIES):
         if i > 0:
-            await asyncio.sleep(2)
+            await asyncio.sleep(5)
         cursor = None
+        page_delay = 3.0
         for page in range(MAX_HISTORY_PAGES):
             if page > 0:
-                await asyncio.sleep(1)
+                await asyncio.sleep(page_delay)
             items, next_cursor = await fetch_rent_history(api_token, category, limit=100, cursor=cursor)
             if not items:
                 break
