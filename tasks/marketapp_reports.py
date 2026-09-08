@@ -209,7 +209,7 @@ async def _sync_from_tonapi(wallet: str, max_pages: int = 50, from_scratch: bool
 
     while pages < max_pages and not scan_complete:
         if pages > 0:
-            await asyncio.sleep(1.1 if not api_key else 0.25)
+            await asyncio.sleep(4.2 if not api_key else 0.25)
 
         events = await fetch_tonapi_events(wallet, before_lt=before_lt, api_key=api_key)
         if not events:
