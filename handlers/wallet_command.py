@@ -223,8 +223,14 @@ async def marketappgifts_command(update: Update, context: ContextTypes.DEFAULT_T
     wallet_raw = userfriendly_to_raw(wallet)
     owner_wallet = context.bot_data.get("MARKETAPP_WALLET", "")
     is_owner = bool(owner_wallet and userfriendly_to_raw(owner_wallet) == wallet_raw)
+    logger.info(
+        f"/marketappgifts: api_token={'есть' if api_token else 'НЕТ'} "
+        f"owner_wallet={owner_wallet!r} is_owner={is_owner}"
+    )
 
     events = _dedupe_events(await get_all_rent_events(wallet))
+    logger.info(f"/marketappgifts: событий в БД={len(events)}, "
+                f"с-подарком={sum(1 for e in events if (e.get('nft_address') or '').strip())}")
     if not events or not any((e.get("nft_address") or "").strip() for e in events):
         await update.message.reply_text("Синхронизирую историю и дополняю метаданными подарков...")
         try:

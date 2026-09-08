@@ -503,6 +503,7 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
             items, next_cursor = await fetch_rent_history(api_token, category, limit=100, cursor=cursor)
             if not items:
                 break
+            logger.info(f"marketapp: {category}/history страница {page + 1} — {len(items)} записей")
             for item in items:
                 src_raw = userfriendly_to_raw(item.get("src", ""))
                 dst_raw = userfriendly_to_raw(item.get("dst", ""))
@@ -528,10 +529,12 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
                 break
             cursor = next_cursor
 
+    logger.info(f"marketapp: собрано записей по кошельку: {len(collected)}")
     if not collected:
         return 0
 
     enriched = await enrich_blockchain_events(collected, wallet)
+    logger.info(f"marketapp: enrich совпадений с блокчейн-событиями: {enriched} из {len(collected)}")
     if enriched:
         logger.info(f"Дополнено метаданными из Marketapp: {enriched}")
     return enriched
