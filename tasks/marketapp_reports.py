@@ -456,12 +456,24 @@ async def fetch_income_for_period(api_token: str, since_ts: int) -> float:
     for i, category in enumerate(RENT_CATEGORIES):
         if i > 0:
             await asyncio.sleep(2)
-        items, _ = await fetch_rent_history(api_token, category, limit=100)
-        if items:
+        cursor = None
+        for page in range(MAX_HISTORY_PAGES):
+            if page > 0:
+                await asyncio.sleep(3.0)
+            items, next_cursor = await fetch_rent_history(api_token, category, limit=100, cursor=cursor)
+            if not items:
+                break
+            stop = False
             for item in items:
                 ts = item.get("ts", 0)
                 if ts >= since_ts:
                     total_ton += _nano_to_ton(item.get("price_nano", "0"))
+                else:
+                    stop = True
+                    break
+            if stop or not next_cursor:
+                break
+            cursor = next_cursor
 
     return total_ton
 
@@ -603,9 +615,10 @@ def format_weekly_report(profits: list) -> str:
         return "<b>📊 ОТЧЁТ ЗА НЕДЕЛЮ</b>\n\nНет данных за неделю."
 
     total = sum(p["profit_ton"] for p in profits)
-    avg = total / len(profits) if profits else 0
-    min_p = min(p["profit_ton"] for p in profits)
-    max_p = max(p["profit_ton"] for p in profits)
+    avg = total / 7 if total else 0
+    values = [p["profit_ton"] for p in profits]
+    min_p = min(values) if values else 0
+    max_p = max(values) if values else 0
 
     now = datetime.now()
     week_start = (now - timedelta(days=now.weekday())).strftime("%d.%m")
@@ -616,7 +629,7 @@ def format_weekly_report(profits: list) -> str:
         f"Прибыль: <b>{_format_ton(total)} TON</b>",
         f"Средняя в день: {_format_ton(avg)} TON",
         f"Мин/Макс: {_format_ton(min_p)} / {_format_ton(max_p)} TON",
-        f"Отчётов: {len(profits)}",
+        f"Дней с данными: {len(profits)} из 7",
     ]
 
     if len(profits) >= 2:
@@ -636,9 +649,10 @@ def format_monthly_report(profits: list) -> str:
         return "<b>📊 ОТЧЁТ ЗА МЕСЯЦ</b>\n\nНет данных за месяц."
 
     total = sum(p["profit_ton"] for p in profits)
-    avg = total / len(profits) if profits else 0
-    min_p = min(p["profit_ton"] for p in profits)
-    max_p = max(p["profit_ton"] for p in profits)
+    avg = total / 30 if total else 0
+    values = [p["profit_ton"] for p in profits]
+    min_p = min(values) if values else 0
+    max_p = max(values) if values else 0
 
     now = datetime.now()
     month_name = now.strftime("%B %Y")
@@ -648,7 +662,7 @@ def format_monthly_report(profits: list) -> str:
         f"Прибыль: <b>{_format_ton(total)} TON</b>",
         f"Средняя в день: {_format_ton(avg)} TON",
         f"Мин/Макс: {_format_ton(min_p)} / {_format_ton(max_p)} TON",
-        f"Отчётов: {len(profits)}",
+        f"Дней с данными: {len(profits)} из 30",
     ]
 
     lines.append(f"\n<i>{now.strftime('%d.%m.%Y %H:%M')}</i>")
@@ -686,7 +700,8 @@ async def daily_profit_report(context: ContextTypes.DEFAULT_TYPE):
         profit = await fetch_income_for_period(api_token, since_ts)
 
         if profit == 0:
-            logger.warning("Не удалось получить данные за сутки")
+            logger.info("Прибыли за сутки нет, сохраняю 0 для статистики")
+            await save_marketapp_profit("day", 0.0)
             return
 
         previous = await get_previous_profit("day")
