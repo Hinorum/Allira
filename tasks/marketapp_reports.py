@@ -450,8 +450,9 @@ async def fetch_rent_history(api_token: str, category: str, limit: int = 100,
     return None, None
 
 
-async def fetch_income_for_period(api_token: str, since_ts: int) -> float:
+async def fetch_income_for_period(api_token: str, since_ts: int, wallet: str = "") -> float:
     total_ton = 0.0
+    raw_wallet = userfriendly_to_raw(wallet)
 
     for i, category in enumerate(RENT_CATEGORIES):
         if i > 0:
@@ -466,11 +467,12 @@ async def fetch_income_for_period(api_token: str, since_ts: int) -> float:
             stop = False
             for item in items:
                 ts = item.get("ts", 0)
-                if ts >= since_ts:
-                    total_ton += _nano_to_ton(item.get("price_nano", "0"))
-                else:
+                if ts < since_ts:
                     stop = True
                     break
+                if raw_wallet and userfriendly_to_raw(item.get("src", "")) != raw_wallet and userfriendly_to_raw(item.get("dst", "")) != raw_wallet:
+                    continue
+                total_ton += _nano_to_ton(item.get("price_nano", "0"))
             if stop or not next_cursor:
                 break
             cursor = next_cursor
@@ -690,6 +692,7 @@ async def daily_profit_report(context: ContextTypes.DEFAULT_TYPE):
     try:
         bot_data = context.bot_data
         api_token = bot_data.get("MARKETAPP_API_KEY")
+        wallet = bot_data.get("MARKETAPP_WALLET", "")
 
         if not api_token:
             logger.warning("MARKETAPP_API_KEY не задан")
@@ -697,7 +700,7 @@ async def daily_profit_report(context: ContextTypes.DEFAULT_TYPE):
 
         logger.info("Получаю данные за сутки...")
         since_ts = _ts_days_ago(1)
-        profit = await fetch_income_for_period(api_token, since_ts)
+        profit = await fetch_income_for_period(api_token, since_ts, wallet)
 
         if profit == 0:
             logger.info("Прибыли за сутки нет, сохраняю 0 для статистики")
@@ -719,13 +722,14 @@ async def weekly_profit_report(context: ContextTypes.DEFAULT_TYPE):
     try:
         bot_data = context.bot_data
         api_token = bot_data.get("MARKETAPP_API_KEY")
+        wallet = bot_data.get("MARKETAPP_WALLET", "")
 
         if not api_token:
             return
 
         logger.info("Получаю данные за неделю...")
         since_ts = _ts_days_ago(7)
-        profit = await fetch_income_for_period(api_token, since_ts)
+        profit = await fetch_income_for_period(api_token, since_ts, wallet)
 
         if profit > 0:
             await save_marketapp_profit("week", profit)
@@ -746,13 +750,14 @@ async def monthly_profit_report(context: ContextTypes.DEFAULT_TYPE):
 
         bot_data = context.bot_data
         api_token = bot_data.get("MARKETAPP_API_KEY")
+        wallet = bot_data.get("MARKETAPP_WALLET", "")
 
         if not api_token:
             return
 
         logger.info("Получаю данные за месяц...")
         since_ts = _ts_days_ago(30)
-        profit = await fetch_income_for_period(api_token, since_ts)
+        profit = await fetch_income_for_period(api_token, since_ts, wallet)
 
         if profit > 0:
             await save_marketapp_profit("month", profit)
