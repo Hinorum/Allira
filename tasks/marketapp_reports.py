@@ -179,7 +179,7 @@ def _tonapi_extract_rent(event: dict, raw_wallet: str) -> dict | None:
             continue
         sender = tt.get("sender", {}) or {}
         if comment:
-            logger.info(f"[rent comment] {comment!r}")
+            logger.debug(f"[rent comment] {comment!r}")
         return {
             "tx_hash": event.get("event_id", ""),
             "ts": int(event.get("timestamp", 0) or 0),

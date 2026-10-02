@@ -66,10 +66,16 @@ def health():
         "status": "ok",
         "uptime": f"{hours}h {minutes}m",
         "uptime_seconds": uptime,
-        "total_messages": get_stat("total_messages"),
-        "messages_today": get_messages_today(),
-        "total_users": get_total_users(),
     }
+    try:
+        data["total_messages"] = get_stat("total_messages")
+        data["messages_today"] = get_messages_today()
+        data["total_users"] = get_total_users()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"/health: сбор статистики не удался: {e}")
+        data.setdefault("total_messages", 0)
+        data.setdefault("messages_today", 0)
+        data.setdefault("total_users", 0)
     return json.dumps(data), 200, {"Content-Type": "application/json"}
 
 
@@ -105,8 +111,8 @@ async def post_init(application: Application):
     })
 
     try:
-        await application.bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Старый вебхук и pending updates удалены")
+        await application.bot.delete_webhook(drop_pending_updates=False)
+        logger.info("Вебхук снят (pending updates сохранены)")
     except Exception as e:
         logger.warning(f"Ошибка удаления вебхука: {e}")
 
