@@ -15,6 +15,7 @@ class BotConfig:
     marketapp_wallet: str = ""
     toncenter_api_key: str = ""
     tonapi_api_key: str = ""
+    admin_chat_id: str = ""
     bot_username: str = ""
     bot_id: int = 0
 
@@ -27,6 +28,7 @@ class BotConfig:
             fallback_model=os.getenv("FALLBACK_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free"),
             lane_model=os.getenv("LANE_MODEL", "google/gemma-4-31b-it:free"),
             news_channel_id=os.getenv("NEWS_CHANNEL_ID", ""),
+            admin_chat_id=os.getenv("ADMIN_CHAT_ID", "").strip(),
             port=int(os.getenv("PORT", "10000")),
             marketapp_api_key=os.getenv("MARKETAPP_API_KEY", "").strip(),
             marketapp_wallet=os.getenv("MARKETAPP_WALLET", "").strip(),

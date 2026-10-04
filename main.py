@@ -112,6 +112,18 @@ async def post_init(application: Application):
         logger.info(f"Бот @{bot_info.username} запущен")
     except Exception as e:
         logger.error(f"Ошибка получения информации о боте: {e}")
+        bot_info = None
+
+    if config.admin_chat_id and bot_info is not None:
+        try:
+            await application.bot.send_message(
+                config.admin_chat_id,
+                f"Бот @{bot_info.username} запущен (uptime сброслен)"
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось отправить стартовое уведомление: {e}")
+    else:
+        logger.warning("ADMIN_CHAT_ID не задан — алерты об ошибках не придут в Telegram")
 
     application.bot_data.update({
         "DEFAULT_MODEL": config.default_model,
@@ -194,6 +206,37 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error(f"Inline error: {e}")
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Ловит необработанные исключения: пишет в лог и сообщает админу.
+
+    Раньше исключение уходило только в лог, и пользователь видел тишину —
+    поэтому поломки приходилось диагностировать вслепую.
+    """
+    error = context.error
+    logger.error("Необработанная ошибка при обработке апдейта", exc_info=error)
+
+    chat = getattr(update, "effective_chat", None)
+    user = getattr(update, "effective_user", None)
+    where = "неизвестный чат"
+    if chat is not None:
+        where = f"чат {getattr(chat, 'id', '?')}"
+    who = f"от {user.id}" if user else ""
+    try:
+        if config.admin_chat_id:
+            await context.bot.send_message(
+                config.admin_chat_id,
+                f"Ошибка бота ({where}, {who}):\n{type(error).__name__}: {error}"[:1000]
+            )
+    except Exception as e:
+        logger.error(f"Не удалось отправить алерт админу: {e}")
+
+    if chat is not None:
+        try:
+            await chat.send_message("Что-то сломалось на моей стороне, попробуй ещё раз.")
+        except Exception:
+            pass
+
+
 async def clear_context_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("=> Контекст сброшен. Начинай с чистого листа.")
@@ -244,6 +287,8 @@ def main():
     ))
 
     application.add_handler(InlineQueryHandler(handle_inline_query))
+
+    application.add_error_handler(error_handler)
 
     if config.news_channel_id:
         application.add_handler(MessageHandler(
