@@ -98,6 +98,10 @@ def init_db():
                 PRIMARY KEY (user_id, chat_id)
             );
 
+            CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
+
+            CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen);
+
             CREATE TABLE IF NOT EXISTS bot_stats (
                 key TEXT PRIMARY KEY,
                 value INTEGER DEFAULT 0,
@@ -188,6 +192,16 @@ def _sync_log_message(user_id: int, chat_id: int, chat_type: str, speaker: str):
             VALUES (?, ?, ?, ?)
         """, (user_id, chat_id, chat_type, speaker))
         _sync_increment_stat("total_messages")
+        # Таблица messages росла без прунинга. /stats и get_active_users
+        # считают по ней, поэтому на бесплатном инстансе со временем запросы
+        # деградировали. Чистим раз в ~1000 записей, не чаще раза в 5 минут.
+        last = getattr(_local, "last_prune", 0.0)
+        now = time.time()
+        if now - last > 300:
+            _local.last_prune = now
+            conn.execute(
+                "DELETE FROM messages WHERE timestamp < datetime('now', '-30 days')"
+            )
 
 
 def _sync_check_rate_limit(user_id: int, chat_id: int, cooldown: float = 3.0, max_per_minute: int = 5) -> bool:

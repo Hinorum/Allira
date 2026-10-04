@@ -264,19 +264,11 @@ async def do_autoposting(context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-async def wakeup_task(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        port = int(os.getenv("PORT", "10000"))
-        client = await get_client()
-        response = await client.get(f"http://localhost:{port}/health", timeout=5)
-        if response.status_code == 200:
-            logger.debug("Health-check OK")
-    except Exception as e:
-        logger.error(f"Health-check failed: {e}")
+
 
 
 def setup_autoposting(application):
-    for job_name in ["autoposting", "wakeup"]:
+    for job_name in ["autoposting"]:
         jobs = application.job_queue.get_jobs_by_name(job_name)
         for job in jobs:
             job.schedule_removal()
@@ -289,11 +281,7 @@ def setup_autoposting(application):
         name="autoposting"
     )
 
-    application.job_queue.run_repeating(
-        wakeup_task,
-        interval=120,
-        first=10,
-        name="wakeup"
-    )
-
+    # Раньше здесь была задача wakeup_task с запросом к localhost/health каждые
+    # 120с. На Render она бесполезна: засыпание определяется по ВНЕШНЕМ входящему
+    # трафику, а loopback-запрос внутри контейнера его не сбрасывает.
     logger.info(f"Автопостинг настроен (интервал: {interval//3600}ч)")

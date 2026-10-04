@@ -255,7 +255,10 @@ async def _sync_from_tonapi(wallet: str, max_pages: int = 50, from_scratch: bool
         saved = 0
         logger.warning(f"[tonapi sync] найденных событий аренды: 0 (страниц перебрано: {pages}, scan_complete={scan_complete})")
 
-    if scan_complete and deep_lt is not None:
+    # Чекпоинт ставим по фактически пройденной границе, а не только при полном
+    # скане. Раньше прогон с max_pages=3, не дошедший до конца, границу не писал —
+    # и следующий прогон снова начинал с той же точки, крутя одни и те же страницы.
+    if deep_lt is not None and deep_utime:
         await set_sync_state(wallet, str(deep_lt), "", deep_utime)
 
     return saved, True
