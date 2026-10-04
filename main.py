@@ -15,7 +15,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     InlineQueryHandler,
 )
-from flask import Flask
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from cachetools import TTLCache
 
@@ -58,14 +58,68 @@ logger = logging.getLogger(__name__)
 config = BotConfig.from_env()
 BOT_START_TIME = time.time()
 
-flask_app = Flask(__name__)
-
 _inline_rate_limit = TTLCache(maxsize=200, ttl=60)
 
 
-@flask_app.route('/')
-def home():
-    return "Allira Bot is running!", 200
+def _build_health_payload() -> dict:
+    uptime = int(time.time() - BOT_START_TIME)
+    hours = uptime // 3600
+    minutes = (uptime % 3600) // 60
+    data = {
+        "status": "ok",
+        "uptime": f"{hours}h {minutes}m",
+        "uptime_seconds": uptime,
+    }
+    try:
+        data.update(asyncio.run(_collect_health_stats()))
+    except Exception as e:
+        # /health обязан всегда отдавать 200: на Render провал этой ручки
+        # считается падением сервиса и вызывает рестарт.
+        logging.getLogger(__name__).warning(f"/health: сбор статистики не удался: {e}")
+        data.setdefault("total_messages", 0)
+        data.setdefault("messages_today", 0)
+        data.setdefault("total_users", 0)
+    return data
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    """Ручка живости на stdlib.
+
+    Раньше здесь был Flask и его dev-сервер (gunicorn стоял в requirements,
+    но не использовался). Flask нужен был ровно для двух маршрутов, поэтому
+    заменён на встроенный сервер — без лишней зависимости.
+    """
+
+    server_version = "Allira/1.0"
+
+    def _respond(self, code: int, body: str, content_type: str = "text/plain; charset=utf-8"):
+        payload = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if path == "/health":
+            try:
+                body = json.dumps(_build_health_payload())
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"/health: {e}")
+                body = json.dumps({"status": "ok"})
+            self._respond(200, body, "application/json")
+        elif path == "/":
+            self._respond(200, "Allira Bot is running!")
+        else:
+            self._respond(404, "not found")
+
+    def log_message(self, fmt, *args):
+        # Иначе каждый пинг UptimeRobot сыплет в лог отдельной строкой.
+        logging.getLogger(__name__).debug("health: " + fmt, *args)
 
 
 async def _collect_health_stats() -> dict:
@@ -81,30 +135,10 @@ async def _collect_health_stats() -> dict:
     }
 
 
-@flask_app.route('/health')
-def health():
-    uptime = int(time.time() - BOT_START_TIME)
-    hours = uptime // 3600
-    minutes = (uptime % 3600) // 60
-    data = {
-        "status": "ok",
-        "uptime": f"{hours}h {minutes}m",
-        "uptime_seconds": uptime,
-    }
-    try:
-        stats = asyncio.run(_collect_health_stats())
-        data.update(stats)
-    except Exception as e:
-        logging.getLogger(__name__).warning(f"/health: сбор статистики не удался: {e}")
-        data.setdefault("total_messages", 0)
-        data.setdefault("messages_today", 0)
-        data.setdefault("total_users", 0)
-    return json.dumps(data), 200, {"Content-Type": "application/json"}
-
-
-def run_flask():
-    logging.getLogger('werkzeug').setLevel(logging.ERROR)
-    flask_app.run(host='0.0.0.0', port=config.port, debug=False, use_reloader=False)
+def run_health_server():
+    server = ThreadingHTTPServer(("0.0.0.0", config.port), HealthHandler)
+    server.daemon_threads = True
+    server.serve_forever()
 
 
 async def post_init(application: Application):
@@ -273,8 +307,8 @@ def main():
         logger.critical("BOT_TOKEN не найден!")
         return
 
-    Thread(target=run_flask, daemon=True).start()
-    logger.info("Health-check сервер запущен")
+    Thread(target=run_health_server, daemon=True).start()
+    logger.info(f"Health-check сервер запущен на порту {config.port}")
 
     application = Application.builder() \
         .token(config.bot_token) \
