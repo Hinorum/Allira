@@ -105,10 +105,20 @@ async def _call_openrouter(payload: dict, headers: dict, timeout: float = 25.0):
     client = await get_client()
     return await client.post(OPENROUTER_URL, json=payload, headers=headers, timeout=timeout)
 
-async def get_llm_response(user_prompt: str, system_prompt: str, model: str, api_key: str) -> str:
+async def get_llm_response(
+    user_prompt: str,
+    system_prompt: str,
+    model: str,
+    api_key: str,
+    history: list[dict] | None = None,
+) -> str:
+    # В кэш попадает только чистый первый запрос: история диалога делает каждый
+    # следующий запрос уникальным, и кэш перестал бы вообще срабатывать.
     cache_key = f"{model}:{uuid.uuid5(uuid.NAMESPACE_DNS, user_prompt + '\x00' + system_prompt)}"
 
-    if cache_key in response_cache:
+    # Кэш только для запросов без истории: с историей каждый запрос уникален.
+    cacheable = not history
+    if cacheable and cache_key in response_cache:
         logger.debug("Использован кэшированный ответ")
         return response_cache[cache_key]
 
@@ -119,12 +129,19 @@ async def get_llm_response(user_prompt: str, system_prompt: str, model: str, api
         "X-Title": "AlliraCryptoBot"
     }
 
+    # История диалога идёт перед новым сообщением. Порядок ролей важен для
+    # всех провайдеров, поэтому system всегда первый, а не по времени.
+    messages = [{"role": "system", "content": system_prompt}]
+    for turn in (history or []):
+        role = turn.get("role")
+        content = str(turn.get("content") or "").strip()
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content[:2000]})
+    messages.append({"role": "user", "content": user_prompt[:4000]})
+
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt[:4000]}
-        ],
+        "messages": messages,
         "temperature": 0.8,
         "max_tokens": 1500,
         "top_p": 0.9,
@@ -195,7 +212,8 @@ async def get_llm_response(user_prompt: str, system_prompt: str, model: str, api
             if resp.status_code in (400, 404, 402):
                 result = await _try_models(model)
                 if result:
-                    response_cache[cache_key] = result[:2000]
+                    if cacheable:
+                        response_cache[cache_key] = result[:2000]
                     return result
                 return "Все модели временно недоступны. Попробуй позже!"
             return "Сервис временно недоступен. Попробуй позже!"
@@ -203,13 +221,15 @@ async def get_llm_response(user_prompt: str, system_prompt: str, model: str, api
         result = _parse_ok(resp)
         if result:
             _record_success(model)
-            response_cache[cache_key] = result[:2000]
+            if cacheable:
+                response_cache[cache_key] = result[:2000]
             return result
 
         logger.warning(f"Некорректный ответ, пробуем fallback модели")
         result = await _try_models(model)
         if result:
-            response_cache[cache_key] = result[:2000]
+            if cacheable:
+                response_cache[cache_key] = result[:2000]
             return result
         return "Модель вернула пустой ответ. Попробуй переформулировать!"
 

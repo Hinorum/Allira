@@ -29,7 +29,11 @@ from utils.http_client import close_client
 from prompts.loader import preload_all_prompts
 from handlers.start_command import start_command, help_command, show_help_callback
 from handlers.wallet_command import marketapprent_command, marketappgifts_command
-from handlers.message_handler import handle_message, handle_private_message
+from handlers.message_handler import (
+    handle_message,
+    handle_private_message,
+    _get_history,
+)
 from handlers.stats_command import stats_command, history_command, leaderboard_command
 from handlers.dice_tournament import (
     restore_tournaments,
@@ -254,8 +258,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def clear_context_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    turns = len(_get_history(context)) // 2
     context.user_data.clear()
-    await update.message.reply_text("=> Контекст сброшен. Начинай с чистого листа.")
+    if turns:
+        await update.message.reply_text(
+            f"=> Контекст сброшен, забыто {turns} реплик. Начинай с чистого листа."
+        )
+    else:
+        await update.message.reply_text("=> Контекст и так пустой. С чего начнём?")
 
 
 def main():

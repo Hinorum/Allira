@@ -19,6 +19,48 @@ DM_MAX_PER_MINUTE = 5
 GROUP_COOLDOWN = 5.0
 GROUP_MAX_PER_MINUTE = 3
 
+# Глубина памяти диалога. Хранится в user_data (в памяти процесса), а не в БД:
+# переживать рестарт незачем, зато /clear теперь честно работает.
+HISTORY_KEY = "llm_history"
+MAX_HISTORY_TURNS = 8
+MAX_HISTORY_CHARS = 400
+
+
+def _get_history(context: ContextTypes.DEFAULT_TYPE) -> list[dict]:
+    history = context.user_data.get(HISTORY_KEY)
+    if not isinstance(history, list):
+        history = []
+        context.user_data[HISTORY_KEY] = history
+    return history
+
+
+def _append_history(context: ContextTypes.DEFAULT_TYPE, role: str, text: str, speaker: str):
+    if not text or not text.strip():
+        return
+    history = _get_history(context)
+    history.append({
+        "role": role,
+        "content": text.strip()[:MAX_HISTORY_CHARS],
+        "speaker": speaker,
+    })
+    if len(history) > MAX_HISTORY_TURNS * 2:
+        del history[:-MAX_HISTORY_TURNS * 2]
+
+
+def _history_for_prompt(context: ContextTypes.DEFAULT_TYPE, speaker: str) -> list[dict]:
+    """Отдаём историю только если она того же персонажа.
+
+    Аллира и Лэйн — разные личности, и подсовывать одной реплики другой в
+    контекст значит скармливать модели противоречивые установки.
+    """
+    history = _get_history(context)
+    turns: list[dict] = []
+    for turn in history:
+        if turn.get("speaker") != speaker:
+            continue
+        turns.append({"role": turn.get("role", "user"), "content": turn.get("content", "")})
+    return turns
+
 
 async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, is_private: bool = False):
     if not update.message or not update.message.text:
@@ -74,8 +116,12 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
             user_prompt=text,
             system_prompt=load_prompt(speaker),
             model=model,
-            api_key=bot_data["OPENROUTER_API_KEY"]
+            api_key=bot_data["OPENROUTER_API_KEY"],
+            history=_history_for_prompt(context, speaker)
         )
+
+        _append_history(context, "user", text, speaker)
+        _append_history(context, "assistant", response, speaker)
 
         if len(response) > 4000:
             if is_private:
