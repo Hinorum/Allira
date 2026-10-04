@@ -21,66 +21,72 @@ _model_failures: dict[str, int] = {}
 CIRCUIT_BREAKER_THRESHOLD = 3
 CIRCUIT_BREAKER_RESET = 300
 
-REASONING_PATTERNS = [
-    r'Хорошо[,.].*?пользователь',
-    r'Сначала разберу',
-    r'Проверяю.*?реакци',
-    r'Варианты ответа',
-    r'Нужно сохранить.*?голос',
-    r'Итоговый ответ.*?:',
-    r'Проверяю.*?кодекс',
-    r'Останавливаюсь на',
-    r'Финальный вариант',
-    r'Попробую собрать',
-    r'Можно усилить',
-    r'Также важно',
-    r'Добавляю эмодзи',
-    r'Убедиться[,.] что нет',
-]
+# Структурированный разбор рассуждений вместо эвристики по регуляркам.
+# Модели-размышляющие (reasoning) возвращают служебные размышления в поле
+# reasoning/reasoning_content — их мы вырезаем на уровне ответа, а не угадываем
+# по тексту пользователя.
+_STRUCTURED_REASONING_KEYS = ("reasoning", "reasoning_content")
+
+# Эвристика по префиксам остаётся только как страховка для моделей, которые
+# пишут рассуждения прямо в content. Порог — только явные служебные обороты.
+_PREFIX_HINTS = (
+    "Сначала разберу",
+    "Давайте разберём",
+    "Нужно сохранить",
+    "Проверяю кодекс",
+    "Останавливаюсь на",
+    "Финальный вариант:",
+    "Итоговый ответ:",
+)
+
+
+def extract_reasoning(data: dict) -> str | None:
+    """Достаёт рассуждение из reasoning-моделей по структуре ответа."""
+    for key in _STRUCTURED_REASONING_KEYS:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    choices = data.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        message = choices[0].get("message") or {}
+        for key in _STRUCTURED_REASONING_KEYS:
+            value = message.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    return None
+
 
 def strip_reasoning(text: str) -> str:
+    """Убирает рассуждения, попавшие в content. Работает по абзацам, не по строкам."""
     if not text:
         return text
 
-    lines = text.split('\n')
-    result_lines = []
-    skip_mode = False
+    # Разбираем по абзацам: рассуждение почти всегда отдельным блоком,
+    # а ответ — финальным. Резать по строкам опасно, это портило текст по середине.
+    paragraphs = [p for p in re.split(r'\n\s*\n', text) if p.strip()]
+    if not paragraphs:
+        return text
 
-    for line in lines:
-        stripped = line.strip()
-        is_reasoning = False
-
-        for pattern in REASONING_PATTERNS:
-            if re.search(pattern, stripped, re.IGNORECASE):
-                is_reasoning = True
-                skip_mode = True
-                break
-
-        if skip_mode and not is_reasoning:
-            if stripped and len(stripped) > 20 and any(c.isalpha() for c in stripped):
-                if not any(re.search(p, stripped, re.IGNORECASE) for p in REASONING_PATTERNS):
-                    skip_mode = False
-                    result_lines.append(line)
-            continue
-
+    kept: list[str] = []
+    for idx, para in enumerate(paragraphs):
+        first_line = para.strip().split('\n', 1)[0].lower()
+        is_reasoning = any(first_line.startswith(hint.lower()) for hint in _PREFIX_HINTS)
         if not is_reasoning:
-            result_lines.append(line)
+            kept.append(para)
+        elif idx == len(paragraphs) - 1 and not kept:
+            # Весь текст выглядит как рассуждение — лучше отдать его, чем молчать
+            return text
 
-    result = '\n'.join(result_lines).strip()
+    result = '\n\n'.join(kept).strip()
     result = re.sub(r'```[\s\S]*?```', '', result)
     result = re.sub(r'\n{3,}', '\n\n', result).strip()
 
+    # Если фильтр съел почти всё — не оставляем пользователя с пустотой.
     if len(result) < 10 and len(text) > 50:
-        paragraphs = text.split('\n\n')
-        for p in reversed(paragraphs):
-            p = p.strip()
-            if p and len(p) > 10:
-                skip_words = ['проверяю', 'вариант', 'нужно', 'важно', 'добавляю', 'убедиться', 'останавливаюсь', 'финальный', 'попробую', 'можно']
-                if not any(w in p.lower() for w in skip_words):
-                    return p
         return text
 
     return result
+
 
 response_cache = TTLCache(maxsize=100, ttl=300)
 
@@ -100,7 +106,7 @@ async def _call_openrouter(payload: dict, headers: dict, timeout: float = 25.0):
     return await client.post(OPENROUTER_URL, json=payload, headers=headers, timeout=timeout)
 
 async def get_llm_response(user_prompt: str, system_prompt: str, model: str, api_key: str) -> str:
-    cache_key = f"{model}:{uuid.uuid5(uuid.NAMESPACE_DNS, user_prompt[:100] + system_prompt[:100])}"
+    cache_key = f"{model}:{uuid.uuid5(uuid.NAMESPACE_DNS, user_prompt + '\x00' + system_prompt)}"
 
     if cache_key in response_cache:
         logger.debug("Использован кэшированный ответ")
@@ -117,7 +123,7 @@ async def get_llm_response(user_prompt: str, system_prompt: str, model: str, api
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
+            {"role": "user", "content": user_prompt[:4000]}
         ],
         "temperature": 0.8,
         "max_tokens": 1500,
@@ -139,6 +145,14 @@ async def get_llm_response(user_prompt: str, system_prompt: str, model: str, api
         data = resp.json()
         content = _extract_content(data)
         if content:
+            # У reasoning-моделей content иногда пуст, а полезный текст лежит
+            # рядом в поле рассуждения — тогда ответ собираем из него.
+            reasoning = extract_reasoning(data)
+            if not content and reasoning:
+                content = reasoning
+            if not content:
+                logger.warning(f"Нет content в ответе модели: {str(data)[:300]}")
+                return None
             return strip_reasoning(content)
         logger.warning(f"Нет content в ответе модели: {str(data)[:300]}")
         return None
