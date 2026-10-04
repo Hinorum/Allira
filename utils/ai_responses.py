@@ -27,6 +27,14 @@ CIRCUIT_BREAKER_RESET = 300
 # по тексту пользователя.
 _STRUCTURED_REASONING_KEYS = ("reasoning", "reasoning_content")
 
+# Нуль-байт как разделитель: промпты склеиваются однозначно, без риска коллизии
+# вида "ab" + "c" == "a" + "bc".
+_CACHE_SEP = "\x00"
+
+
+def _cache_source(user_prompt: str, system_prompt: str) -> str:
+    return user_prompt + _CACHE_SEP + system_prompt
+
 # Эвристика по префиксам остаётся только как страховка для моделей, которые
 # пишут рассуждения прямо в content. Порог — только явные служебные обороты.
 _PREFIX_HINTS = (
@@ -112,9 +120,9 @@ async def get_llm_response(
     api_key: str,
     history: list[dict] | None = None,
 ) -> str:
-    # В кэш попадает только чистый первый запрос: история диалога делает каждый
-    # следующий запрос уникальным, и кэш перестал бы вообще срабатывать.
-    cache_key = f"{model}:{uuid.uuid5(uuid.NAMESPACE_DNS, user_prompt + '\x00' + system_prompt)}"
+    # Разделитель вынесен в переменную: обратный слэш внутри f-string запрещён
+    # на Python 3.11, а на Render зафиксирован именно 3.11.11.
+    cache_key = f"{model}:{uuid.uuid5(uuid.NAMESPACE_DNS, _cache_source(user_prompt, system_prompt))}"
 
     # Кэш только для запросов без истории: с историей каждый запрос уникален.
     cacheable = not history
