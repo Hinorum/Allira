@@ -3,6 +3,7 @@ import time
 import logging
 import json
 import uuid
+import asyncio
 from dotenv import load_dotenv
 from telegram import Update, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import (
@@ -57,6 +58,19 @@ def home():
     return "Allira Bot is running!", 200
 
 
+async def _collect_health_stats() -> dict:
+    total_messages, messages_today, total_users = await asyncio.gather(
+        get_stat("total_messages"),
+        get_messages_today(),
+        get_total_users(),
+    )
+    return {
+        "total_messages": total_messages,
+        "messages_today": messages_today,
+        "total_users": total_users,
+    }
+
+
 @flask_app.route('/health')
 def health():
     uptime = int(time.time() - BOT_START_TIME)
@@ -68,9 +82,8 @@ def health():
         "uptime_seconds": uptime,
     }
     try:
-        data["total_messages"] = get_stat("total_messages")
-        data["messages_today"] = get_messages_today()
-        data["total_users"] = get_total_users()
+        stats = asyncio.run(_collect_health_stats())
+        data.update(stats)
     except Exception as e:
         logging.getLogger(__name__).warning(f"/health: сбор статистики не удался: {e}")
         data.setdefault("total_messages", 0)

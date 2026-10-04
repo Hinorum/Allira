@@ -12,10 +12,10 @@ logger = logging.getLogger(__name__)
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    total_users = get_total_users()
-    total_tournaments = get_total_tournaments()
-    messages_today = get_messages_today()
-    total_messages = get_stat("total_messages")
+    total_users = await get_total_users()
+    total_tournaments = await get_total_tournaments()
+    messages_today = await get_messages_today()
+    total_messages = await get_stat("total_messages")
 
     top_users = await get_active_users(days=30, limit=5)
     top_speakers = await get_top_speakers(limit=3)

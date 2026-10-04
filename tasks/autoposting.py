@@ -251,7 +251,7 @@ async def do_autoposting(context: ContextTypes.DEFAULT_TYPE):
             )
             logger.info("Текстовый пост отправлен (картинка не сгенерировалась)")
 
-        increment_stat("total_posts")
+        await increment_stat("total_posts")
 
     except Exception as e:
         logger.error(f"Ошибка автопостинга: {e}", exc_info=True)

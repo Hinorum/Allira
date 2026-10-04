@@ -29,7 +29,7 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
     bot_username = bot_data.get("bot_username", "")
     user = message.from_user
 
-    if user and is_user_banned(user.id):
+    if user and await is_user_banned(user.id):
         return
 
     if is_private:

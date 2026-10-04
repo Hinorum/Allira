@@ -187,7 +187,7 @@ def _sync_log_message(user_id: int, chat_id: int, chat_type: str, speaker: str):
             INSERT INTO messages (user_id, chat_id, chat_type, speaker)
             VALUES (?, ?, ?, ?)
         """, (user_id, chat_id, chat_type, speaker))
-        increment_stat("total_messages")
+        _sync_increment_stat("total_messages")
 
 
 def _sync_check_rate_limit(user_id: int, chat_id: int, cooldown: float = 3.0, max_per_minute: int = 5) -> bool:
@@ -351,8 +351,8 @@ def _sync_increment_stat(key: str, amount: int = 1):
         """, (key, amount, amount))
 
 
-def increment_stat(key: str, amount: int = 1):
-    _sync_increment_stat(key, amount)
+async def increment_stat(key: str, amount: int = 1):
+    return await asyncio.to_thread(_sync_increment_stat, key, amount)
 
 
 def _sync_get_stat(key: str) -> int:
@@ -361,8 +361,8 @@ def _sync_get_stat(key: str) -> int:
         return row["value"] if row else 0
 
 
-def get_stat(key: str) -> int:
-    return _sync_get_stat(key)
+async def get_stat(key: str) -> int:
+    return await asyncio.to_thread(_sync_get_stat, key)
 
 
 def _sync_get_total_users() -> int:
@@ -371,8 +371,8 @@ def _sync_get_total_users() -> int:
         return row["cnt"] if row else 0
 
 
-def get_total_users() -> int:
-    return _sync_get_total_users()
+async def get_total_users() -> int:
+    return await asyncio.to_thread(_sync_get_total_users)
 
 
 def _sync_get_total_tournaments() -> int:
@@ -381,8 +381,8 @@ def _sync_get_total_tournaments() -> int:
         return row["cnt"] if row else 0
 
 
-def get_total_tournaments() -> int:
-    return _sync_get_total_tournaments()
+async def get_total_tournaments() -> int:
+    return await asyncio.to_thread(_sync_get_total_tournaments)
 
 
 def _sync_get_messages_today() -> int:
@@ -393,8 +393,8 @@ def _sync_get_messages_today() -> int:
         return row["cnt"] if row else 0
 
 
-def get_messages_today() -> int:
-    return _sync_get_messages_today()
+async def get_messages_today() -> int:
+    return await asyncio.to_thread(_sync_get_messages_today)
 
 
 def _sync_is_user_banned(user_id: int) -> bool:
@@ -403,8 +403,8 @@ def _sync_is_user_banned(user_id: int) -> bool:
         return bool(row["is_banned"]) if row else False
 
 
-def is_user_banned(user_id: int) -> bool:
-    return _sync_is_user_banned(user_id)
+async def is_user_banned(user_id: int) -> bool:
+    return await asyncio.to_thread(_sync_is_user_banned, user_id)
 
 
 def _sync_save_marketapp_profit(period: str, profit_ton: float, raw_response: str = None):

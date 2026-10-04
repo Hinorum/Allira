@@ -437,7 +437,7 @@ async def end_tournament(context: ContextTypes.DEFAULT_TYPE, chat_id: int, winne
                                total_rounds, total_players, winner_id, winner_name)
         if tid:
             await save_tournament_players(tid, state["players"])
-            increment_stat("total_tournaments")
+            await increment_stat("total_tournaments")
     except Exception as e:
         logger.error(f"Ошибка сохранения турнира: {e}")
 
