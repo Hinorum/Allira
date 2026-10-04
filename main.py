@@ -20,7 +20,10 @@ from threading import Thread
 from cachetools import TTLCache
 
 from utils.common import setup_logging
-from utils.database import init_db, increment_stat, get_stat, get_total_users, get_messages_today, close_all
+from utils.database import (
+    init_db, increment_stat, get_stat, get_total_users, get_messages_today,
+    close_all, prune_live_states,
+)
 from utils.config import BotConfig
 from utils.http_client import close_client
 from prompts.loader import preload_all_prompts
@@ -29,6 +32,9 @@ from handlers.wallet_command import marketapprent_command, marketappgifts_comman
 from handlers.message_handler import handle_message, handle_private_message
 from handlers.stats_command import stats_command, history_command, leaderboard_command
 from handlers.dice_tournament import (
+    restore_tournaments,
+    start_persist_task,
+    stop_persist_task,
     start_dice_tournament_registration,
     register_for_tournament,
     end_registration_and_start_round,
@@ -103,6 +109,15 @@ async def post_init(application: Application):
     init_db()
     preload_all_prompts()
 
+    await restore_tournaments()
+    start_persist_task()
+    try:
+        removed = await prune_live_states(max_age_hours=24)
+        if removed:
+            logger.info(f"Убрано зависших записей турниров: {removed}")
+    except Exception as e:
+        logger.warning(f"Прунинг турниров не удался: {e}")
+
     try:
         bot_info = await application.bot.get_me()
         config.bot_username = bot_info.username
@@ -152,6 +167,7 @@ async def post_init(application: Application):
 
 async def post_shutdown(application: Application):
     logger.info("Завершение работы бота...")
+    await stop_persist_task()
     await close_client()
     close_all()
     logger.info("Бот остановлен")

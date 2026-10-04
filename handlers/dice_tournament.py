@@ -5,7 +5,10 @@ import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.constants import DiceEmoji
-from utils.database import save_tournament, save_tournament_players, increment_stat
+from utils.database import (
+    save_tournament, save_tournament_players, increment_stat,
+    load_live_states, save_live_state, delete_live_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +19,77 @@ ELIMINATION_PERCENTAGE = 4
 
 _tournament_states: dict[int, dict] = {}
 _round_announcing: set[int] = set()
+
+# Состояние турнира раньше жило только в оперативке, и любой рестарт на Render
+# его обнулял: у игроков оставались мёртвые кнопки. Теперь оно в БД, а
+# синхронизация идёт через фоновую задачу, чтобы не переписывать все хендлеры.
+_dirty_chats: set[int] = set()
+_persist_task: "asyncio.Task | None" = None
+PERSIST_INTERVAL = 2.0
+
+
+async def restore_tournaments():
+    """Поднимает активные турниры из БД после рестарта."""
+    try:
+        saved = await load_live_states()
+        restored = 0
+        for chat_id, data in saved.items():
+            state = _default_state(chat_id)
+            state.update(data)
+            # id ключей в JSON приходят строками — возвращаем int
+            if isinstance(state.get("players"), dict):
+                state["players"] = {int(k): v for k, v in state["players"].items()}
+            if isinstance(state.get("active_players_in_round"), list):
+                state["active_players_in_round"] = set(state["active_players_in_round"])
+            _tournament_states[chat_id] = state
+            if state.get("active"):
+                restored += 1
+        logger.info(f"Восстановлено турниров из БД: {restored} (всего записей: {len(saved)})")
+    except Exception as e:
+        logger.error(f"Не удалось восстановить турниры: {e}", exc_info=True)
+
+
+def _mark_dirty(chat_id: int):
+    _dirty_chats.add(chat_id)
+
+
+async def persist_loop():
+    """Периодически сбрасывает изменённые турниры в БД."""
+    while True:
+        try:
+            await asyncio.sleep(PERSIST_INTERVAL)
+            if not _dirty_chats:
+                continue
+            pending = list(_dirty_chats)
+            _dirty_chats.clear()
+            for chat_id in pending:
+                state = _tournament_states.get(chat_id)
+                if state and state.get("active"):
+                    await save_live_state(chat_id, state)
+                else:
+                    await delete_live_state(chat_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Ошибка сохранения состояния турниров: {e}")
+
+
+def start_persist_task():
+    global _persist_task
+    if _persist_task is None or _persist_task.done():
+        _persist_task = asyncio.create_task(persist_loop())
+        logger.info(f"Синхронизация турниров с БД включена (интервал {PERSIST_INTERVAL}с)")
+
+
+async def stop_persist_task():
+    global _persist_task
+    if _persist_task and not _persist_task.done():
+        _persist_task.cancel()
+        try:
+            await _persist_task
+        except asyncio.CancelledError:
+            pass
+    _persist_task = None
 
 
 def _default_state(chat_id: int = None) -> dict:
@@ -40,11 +114,19 @@ def _default_state(chat_id: int = None) -> dict:
 def _get_state(chat_id: int) -> dict:
     if chat_id not in _tournament_states:
         _tournament_states[chat_id] = _default_state(chat_id)
+    _mark_dirty(chat_id)
     return _tournament_states[chat_id]
 
 
 def _reset_state(chat_id: int):
     _tournament_states[chat_id] = _default_state(chat_id)
+    # Сброс — это конец турнира, запись из БД надо убрать сразу, а не ждать цикла
+    _dirty_chats.discard(chat_id)
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(delete_live_state(chat_id))
+    except RuntimeError:
+        pass
 
 
 def _make_pairs(player_ids: list[int]) -> tuple[list[tuple[int, int]], int | None]:

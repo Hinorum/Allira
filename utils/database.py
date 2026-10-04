@@ -4,6 +4,7 @@ import time
 import asyncio
 import threading
 import base64
+import json
 from contextlib import contextmanager
 from datetime import datetime
 
@@ -135,6 +136,12 @@ def init_db():
                 recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS tournament_live_state (
+                chat_id INTEGER PRIMARY KEY,
+                state TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS blockchain_sync_state (
                 address TEXT PRIMARY KEY,
                 last_synced_lt TEXT,
@@ -142,6 +149,8 @@ def init_db():
                 last_synced_utime INTEGER DEFAULT 0,
                 last_sync_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE INDEX IF NOT EXISTS idx_tournament_live_updated ON tournament_live_state(updated_at);
 
             CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id);
             CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
@@ -336,6 +345,60 @@ def _sync_get_active_users(days: int = 7, limit: int = 10) -> list:
             LIMIT ?
         """, (f"-{days} days", limit)).fetchall()
         return [dict(r) for r in rows]
+
+
+def _sync_load_live_states() -> dict[int, dict]:
+    with get_db() as conn:
+        rows = conn.execute("SELECT chat_id, state FROM tournament_live_state").fetchall()
+    out = {}
+    for row in rows:
+        try:
+            out[int(row["chat_id"])] = json.loads(row["state"])
+        except (ValueError, TypeError):
+            logger.warning(f"Битое состояние турнира для чата {row['chat_id']}, пропускаю")
+    return out
+
+
+def _sync_save_live_state(chat_id: int, state: dict):
+    payload = json.dumps(state, ensure_ascii=False, default=list)
+    with get_db() as conn:
+        conn.execute("""
+            INSERT INTO tournament_live_state (chat_id, state, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                state = excluded.state,
+                updated_at = CURRENT_TIMESTAMP
+        """, (chat_id, payload))
+
+
+def _sync_delete_live_state(chat_id: int):
+    with get_db() as conn:
+        conn.execute("DELETE FROM tournament_live_state WHERE chat_id=?", (chat_id,))
+
+
+def _sync_prune_live_states(max_age_hours: int = 24) -> int:
+    with get_db() as conn:
+        cur = conn.execute(
+            "DELETE FROM tournament_live_state WHERE updated_at < datetime('now', ?)",
+            (f"-{max_age_hours} hours",)
+        )
+        return cur.rowcount
+
+
+async def load_live_states() -> dict[int, dict]:
+    return await asyncio.to_thread(_sync_load_live_states)
+
+
+async def save_live_state(chat_id: int, state: dict):
+    return await asyncio.to_thread(_sync_save_live_state, chat_id, state)
+
+
+async def delete_live_state(chat_id: int):
+    return await asyncio.to_thread(_sync_delete_live_state, chat_id)
+
+
+async def prune_live_states(max_age_hours: int = 24) -> int:
+    return await asyncio.to_thread(_sync_prune_live_states, max_age_hours)
 
 
 async def get_tournament_history(limit: int = 10) -> list:
