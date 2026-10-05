@@ -1,6 +1,5 @@
 import logging
 import random
-import asyncio
 import re
 import urllib.parse
 import time
@@ -100,15 +99,6 @@ async def _fetch_coingecko(url: str, params: dict):
 async def get_crypto_data():
     global last_request_time
 
-    cache_key = "coingecko_data"
-    if cache_key in _coingecko_cache:
-        return _coingecko_cache[cache_key]
-
-    current_time = time.time()
-    if current_time - last_request_time < 3.0:
-        await asyncio.sleep(3.0)
-    last_request_time = time.time()
-
     endpoints = [
         {
             "url": f"{COINGECKO_URL}/coins/markets",
@@ -133,6 +123,18 @@ async def get_crypto_data():
 
     endpoint = random.choice(endpoints)
 
+    # Кэш-ключ — сам эндпоинт. Раньше все три ответа лежали под одним ключом:
+    # пост с «топом монет» мог получить закэшированные «тренды» и наоборот.
+    if endpoint["url"] in _coingecko_cache:
+        return _coingecko_cache[endpoint["url"]]
+
+    # Между запросами выдерживаем паузу, НО не спим: задача автопостинга
+    # и так висит в очереди, а ожидание только откладывало отправку поста.
+    if time.time() - last_request_time < 3.0:
+        logger.info("CoinGecko: вызов слишком частый, беру запасной текст")
+        return get_fallback_crypto_data()
+    last_request_time = time.time()
+
     try:
         response = await _fetch_coingecko(endpoint["url"], endpoint["params"])
 
@@ -150,7 +152,7 @@ async def get_crypto_data():
         else:
             result = format_global_data(data)
 
-        _coingecko_cache[cache_key] = result
+        _coingecko_cache[endpoint["url"]] = result
         return result
 
     except Exception as e:
