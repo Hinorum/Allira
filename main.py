@@ -359,16 +359,20 @@ async def clear_context_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("=> Контекст и так пустой. С чего начнём?")
 
 
-def main():
-    if not config.bot_token:
-        logger.critical("BOT_TOKEN не найден!")
-        return
+def build_application() -> Application:
+    """Собирает приложение: билдер, все хендлеры, error handler.
 
-    Thread(target=run_health_server, daemon=True).start()
-    logger.info(f"Health-check сервер запущен на порту {config.port}")
-
+    Вынесено из main(), чтобы сборку можно было проверить тестом: ошибки в
+    сигнатурах PTB (например, лишний аргумент run_polling) иначе всплывают
+    только на проде при старте и роняют бота в бесконечный рестарт.
+    """
+    # Без этого PTB обрабатывает апдейты строго последовательно: один долгий
+    # LLM-запрос или синк кошелька останавливал бы бота для всех юзеров.
+    # Ограниченный семафор — чтобы всплеск не выжег free-лимиты OpenRouter.
+    # В PTB 21.1.1 этот флаг есть только у билдера, у run_polling его нет.
     application = Application.builder() \
         .token(config.bot_token) \
+        .concurrent_updates(4) \
         .post_init(post_init) \
         .post_shutdown(post_shutdown) \
         .build()
@@ -426,13 +430,21 @@ def main():
         handle_private_message
     ))
 
+    return application
+
+
+def main():
+    if not config.bot_token:
+        logger.critical("BOT_TOKEN не найден!")
+        return
+
+    Thread(target=run_health_server, daemon=True).start()
+    logger.info(f"Health-check сервер запущен на порту {config.port}")
+
+    application = build_application()
     logger.info("Запуск в режиме polling")
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        # Без этого PTB обрабатывает апдейты строго последовательно: один долгий
-        # LLM-запрос или синк кошелька останавливал бы бота для всех юзеров.
-        # Ограниченный семафор — чтобы всплеск не выжег free-лимиты OpenRouter.
-        concurrent_updates=4,
     )
 
 
