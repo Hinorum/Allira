@@ -496,11 +496,6 @@ async def fetch_my_rented(api_token: str) -> list | None:
         return None
 
 
-async def fetch_rent_income_events(api_token: str, category: str) -> list | None:
-    items, _ = await fetch_rent_history(api_token, category, limit=100)
-    return items
-
-
 async def collect_rent_events(api_token: str, wallet: str) -> int:
     raw_wallet = userfriendly_to_raw(wallet)
     collected = []
@@ -663,7 +658,7 @@ def format_monthly_report(profits: list) -> str:
     return "\n".join(lines)
 
 
-async def _send_report(context: ContextTypes.DEFAULT_TYPE, period: str, report_text: str, save_db: bool = False, db_period: str = None, profit: float = None):
+async def _send_report(context: ContextTypes.DEFAULT_TYPE, report_text: str, save_db: bool = False, db_period: str = None, profit: float = None):
     bot_data = context.bot_data
     channel_id = bot_data.get("NEWS_CHANNEL_ID")
 
@@ -703,7 +698,7 @@ async def daily_profit_report(context: ContextTypes.DEFAULT_TYPE):
         previous_profit = previous["profit_ton"] if previous else None
 
         report = format_daily_report(profit, previous_profit)
-        await _send_report(context, "day", report, save_db=True, db_period="day", profit=profit)
+        await _send_report(context, report, save_db=True, db_period="day", profit=profit)
         logger.info(f"Ежедневный отчет отправлен: {profit} TON")
 
     except Exception as e:
@@ -728,7 +723,7 @@ async def weekly_profit_report(context: ContextTypes.DEFAULT_TYPE):
 
         profits = await get_profit_for_period("day", 7)
         report = format_weekly_report(profits)
-        await _send_report(context, "week", report)
+        await _send_report(context, report)
         logger.info("Еженедельный отчет отправлен")
 
     except Exception as e:
@@ -756,7 +751,7 @@ async def monthly_profit_report(context: ContextTypes.DEFAULT_TYPE):
 
         profits = await get_profit_for_period("day", 30)
         report = format_monthly_report(profits)
-        await _send_report(context, "month", report)
+        await _send_report(context, report)
         logger.info("Ежемесячный отчет отправлен")
 
     except Exception as e:

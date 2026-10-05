@@ -561,18 +561,6 @@ def _sync_save_marketapp_profit(period: str, profit_ton: float, raw_response: st
         """, (period, profit_ton, raw_response))
 
 
-def _sync_get_latest_profit(period: str) -> dict | None:
-    with get_db() as conn:
-        row = conn.execute("""
-            SELECT profit_ton, recorded_at
-            FROM marketapp_profit
-            WHERE period = ?
-            ORDER BY recorded_at DESC
-            LIMIT 1
-        """, (period,)).fetchone()
-        return dict(row) if row else None
-
-
 def _sync_get_profit_for_period(period: str, days_back: int) -> list:
     with get_db() as conn:
         rows = conn.execute("""
@@ -600,23 +588,12 @@ async def save_marketapp_profit(period: str, profit_ton: float, raw_response: st
     await asyncio.to_thread(_sync_save_marketapp_profit, period, profit_ton, raw_response)
 
 
-async def get_latest_profit(period: str) -> dict | None:
-    return await asyncio.to_thread(_sync_get_latest_profit, period)
-
-
 async def get_profit_for_period(period: str, days_back: int) -> list:
     return await asyncio.to_thread(_sync_get_profit_for_period, period, days_back)
 
 
 async def get_previous_profit(period: str) -> dict | None:
     return await asyncio.to_thread(_sync_get_previous_profit, period)
-
-
-def _sync_save_rent_event(event: dict, wallet: str = "") -> bool:
-    if not event.get("tx_hash"):
-        return False
-    with get_db() as conn:
-        return _sync_upsert_rent_event(conn, event, wallet) > 0
 
 
 # Единый нормализатор TON-адресов (см. utils.common.normalize_ton_address).
@@ -670,74 +647,6 @@ def _sync_find_rent_event(conn, ts: int, src: str, dst: str, wallet: str = ""):
             (norm_wallet, row["id"]),
         )
     return row
-
-
-def _sync_clear_rent_events(wallet: str = ""):
-    with get_db() as conn:
-        if wallet:
-            conn.execute("DELETE FROM marketapp_rent_events WHERE wallet=?", (_normalize_addr(wallet),))
-        else:
-            conn.execute("DELETE FROM marketapp_rent_events")
-
-
-def _sync_upsert_rent_event(conn, event: dict, wallet: str = "") -> int:
-    tx_hash = event.get("tx_hash")
-    if not tx_hash:
-        return 0
-    canon_hash = _canonical_tx_hash(tx_hash)
-    ts = int(event.get("ts", 0) or 0)
-    src = _normalize_addr(event.get("src", ""))
-    dst = _normalize_addr(event.get("dst", ""))
-    wallet = _normalize_addr(wallet)
-
-    existing = None
-    if canon_hash:
-        existing = conn.execute(
-            "SELECT id FROM marketapp_rent_events WHERE tx_hash=? LIMIT 1", (canon_hash,)
-        ).fetchone()
-    if existing is None:
-        existing = _sync_find_rent_event(conn, ts, src, dst, wallet)
-    if existing:
-        conn.execute("""
-            UPDATE marketapp_rent_events
-            SET tx_hash=?, category=?, nft_address=?, nft_name=?, collection_address=?,
-                price_nano=?, currency=?, is_extend=?, duration=?, wallet=?, source='marketapp'
-            WHERE id=?
-        """, (
-            canon_hash or tx_hash,
-            event.get("category", ""),
-            event.get("address", ""),
-            event.get("name", ""),
-            event.get("collection_address", ""),
-            event.get("price_nano", "0"),
-            event.get("currency", "GRAM"),
-            1 if event.get("is_extend") else 0,
-            int(event.get("duration", 0) or 0),
-            wallet,
-            existing["id"],
-        ))
-        return 1
-
-    cursor = conn.execute("""
-        INSERT INTO marketapp_rent_events
-            (tx_hash, category, nft_address, nft_name, collection_address, ts, src, dst, price_nano, currency, is_extend, duration, wallet)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        canon_hash or tx_hash,
-        event.get("category", ""),
-        event.get("address", ""),
-        event.get("name", ""),
-        event.get("collection_address", ""),
-        ts,
-        src,
-        dst,
-        event.get("price_nano", "0"),
-        event.get("currency", "GRAM"),
-        1 if event.get("is_extend") else 0,
-        int(event.get("duration", 0) or 0),
-        wallet,
-    ))
-    return cursor.rowcount
 
 
 def _sync_enrich_blockchain_event(conn, event: dict, wallet: str = "") -> int:
@@ -809,43 +718,6 @@ def _sync_enrich_blockchain_events(events: list, wallet: str = "") -> int:
         return saved
 
 
-def _sync_save_rent_events(events: list, wallet: str = "") -> int:
-    with get_db() as conn:
-        saved = 0
-        for event in events:
-            saved += _sync_upsert_rent_event(conn, event, wallet)
-        return saved
-
-
-def _sync_get_rent_events(since_ts: int = 0, is_extend: bool = None, wallet: str = "") -> list:
-    with get_db() as conn:
-        params = []
-        query = "SELECT * FROM marketapp_rent_events WHERE 1=1"
-        if wallet:
-            query += " AND wallet = ?"
-            params.append(_normalize_addr(wallet))
-        query += " AND ts >= ?"
-        params.append(since_ts)
-        if is_extend is not None:
-            query += " AND is_extend = ?"
-            params.append(1 if is_extend else 0)
-        query += " ORDER BY ts DESC"
-        rows = conn.execute(query, params).fetchall()
-        return [dict(r) for r in rows]
-
-
-async def save_rent_event(event: dict, wallet: str = "") -> bool:
-    return await asyncio.to_thread(_sync_save_rent_event, event, wallet)
-
-
-async def save_rent_events(events: list, wallet: str = "") -> int:
-    return await asyncio.to_thread(_sync_save_rent_events, events, wallet)
-
-
-async def get_rent_events(since_ts: int = 0, is_extend: bool = None, wallet: str = "") -> list:
-    return await asyncio.to_thread(_sync_get_rent_events, since_ts, is_extend, wallet)
-
-
 def _sync_save_blockchain_rent_events(events: list, wallet: str = "") -> int:
     with get_db() as conn:
         saved = 0
@@ -909,15 +781,19 @@ def _sync_set_sync_state(address: str, lt: str, hash_val: str, utime: int):
 
 
 def _sync_get_all_rent_events(wallet: str = "") -> list:
+    # Без LIMIT выборка держала в памяти ВСЮ таблицу аренды — на free-инстансе
+    # с десятками тысяч платежей это прямой путь к OOM. Держим свежие 50k
+    # (записи отсортированы по времени), итоги считаются по ним же.
     with get_db() as conn:
         if wallet:
             rows = conn.execute(
-                "SELECT * FROM marketapp_rent_events WHERE wallet=? ORDER BY ts DESC",
+                "SELECT * FROM marketapp_rent_events WHERE wallet=? "
+                "ORDER BY ts DESC LIMIT 50000",
                 (_normalize_addr(wallet),)
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM marketapp_rent_events ORDER BY ts DESC"
+                "SELECT * FROM marketapp_rent_events ORDER BY ts DESC LIMIT 50000"
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -936,10 +812,6 @@ async def set_sync_state(address: str, lt: str, hash_val: str, utime: int):
 
 async def get_all_rent_events(wallet: str = "") -> list:
     return await asyncio.to_thread(_sync_get_all_rent_events, wallet)
-
-
-async def clear_rent_events(wallet: str = ""):
-    return await asyncio.to_thread(_sync_clear_rent_events, wallet)
 
 
 async def enrich_blockchain_events(events: list, wallet: str = "") -> int:

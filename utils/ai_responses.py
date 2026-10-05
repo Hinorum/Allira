@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 import time
@@ -181,10 +182,18 @@ def _record_success(model: str):
     _model_failures.pop(model, None)
     _model_last_failure.pop(model, None)
 
+# Сколько запросов к OpenRouter может лететь одновременно. Без ограничителя
+# всплеск сообщений давал столько же параллельных вызовов — это упиралось
+# в лимиты бесплатного тарифа и в RAM free-инстанса.
+LLM_CONCURRENCY = 4
+_llm_semaphore = asyncio.Semaphore(LLM_CONCURRENCY)
+
+
 @with_retry(max_retries=2, base_delay=1.0)
 async def _call_openrouter(payload: dict, headers: dict, timeout: float = 25.0):
     client = await get_client()
-    return await client.post(OPENROUTER_URL, json=payload, headers=headers, timeout=timeout)
+    async with _llm_semaphore:
+        return await client.post(OPENROUTER_URL, json=payload, headers=headers, timeout=timeout)
 
 async def get_llm_response(
     user_prompt: str,
