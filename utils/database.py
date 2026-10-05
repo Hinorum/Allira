@@ -43,6 +43,16 @@ def close_all():
         _local.conn = None
 
 
+def _migration_done(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM schema_migrations WHERE name = ?", (name,)
+    ).fetchone() is not None
+
+
+def _mark_migration(conn: sqlite3.Connection, name: str):
+    conn.execute("INSERT OR IGNORE INTO schema_migrations (name) VALUES (?)", (name,))
+
+
 def init_db():
     with get_db() as conn:
         conn.executescript("""
@@ -150,10 +160,14 @@ def init_db():
                 last_sync_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                name TEXT PRIMARY KEY,
+                applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE INDEX IF NOT EXISTS idx_tournament_live_updated ON tournament_live_state(updated_at);
 
             CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id);
-            CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
             CREATE INDEX IF NOT EXISTS idx_tournaments_chat ON tournaments(chat_id);
             CREATE INDEX IF NOT EXISTS idx_tournament_players_tid ON tournament_players(tournament_id);
             CREATE INDEX IF NOT EXISTS idx_marketapp_profit_period ON marketapp_profit(period, recorded_at);
@@ -166,13 +180,17 @@ def init_db():
             conn.execute("ALTER TABLE marketapp_rent_events ADD COLUMN wallet TEXT DEFAULT ''")
             logger.info("Миграция: добавлена колонка wallet в marketapp_rent_events")
 
-        conn.execute(
-            "UPDATE marketapp_rent_events SET wallet = dst WHERE wallet = '' AND dst <> ''"
-        )
-        conn.execute(
-            "UPDATE marketapp_rent_events SET wallet = dst "
-            "WHERE wallet <> '' AND wallet <> dst AND dst <> '' AND dst LIKE '0:%'"
-        )
+        # Раньше эти два UPDATE по всей таблице аренды гонялись на КАЖДОМ старте
+        # и замедляли деплой по мере роста данных. Одноразовый бэкфилл.
+        if not _migration_done(conn, "backfill_rent_wallet"):
+            conn.execute(
+                "UPDATE marketapp_rent_events SET wallet = dst WHERE wallet = '' AND dst <> ''"
+            )
+            conn.execute(
+                "UPDATE marketapp_rent_events SET wallet = dst "
+                "WHERE wallet <> '' AND wallet <> dst AND dst <> '' AND dst LIKE '0:%'"
+            )
+            _mark_migration(conn, "backfill_rent_wallet")
 
     logger.info("База данных инициализирована")
 
