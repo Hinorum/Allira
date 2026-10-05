@@ -66,6 +66,36 @@ def extract_reasoning(data: dict) -> str | None:
     return None
 
 
+def _is_fence_language_tag(line: str) -> bool:
+    """Строка вида 'python', 'js' после ``` — это маркер языка, не текст."""
+    return bool(re.fullmatch(r"[a-zA-Z0-9_+#.-]{1,20}", line.strip()))
+
+
+def _drop_reasoning_fence(match: re.Match) -> str:
+    """Убирает из ответа блоки кода, внутри которых лежит рассуждение.
+
+    Код НЕ трогаем: техническому боту ответ с кодом — главный результат.
+    Раньше здесь стоял слепой `re.sub(r'```...```', '', result)`, который
+    вырезал любые примеры кода из ответа модели.
+    """
+    block = match.group(0)
+    body = block[3:-3]
+    if body.startswith("\n"):
+        body = body[1:]
+
+    lines = [line for line in body.split("\n") if line.strip()]
+    if not lines:
+        return block
+
+    first = lines[0].strip()
+    if _is_fence_language_tag(first) and len(lines) > 1:
+        first = lines[1].strip()
+
+    if any(first.lower().startswith(hint.lower()) for hint in _PREFIX_HINTS):
+        return ""
+    return block
+
+
 def strip_reasoning(text: str) -> str:
     """Убирает рассуждения, попавшие в content. Работает по абзацам, не по строкам."""
     if not text:
@@ -88,11 +118,12 @@ def strip_reasoning(text: str) -> str:
             return text
 
     result = '\n\n'.join(kept).strip()
-    result = re.sub(r'```[\s\S]*?```', '', result)
+    result = re.sub(r'```[\s\S]*?```', _drop_reasoning_fence, result)
     result = re.sub(r'\n{3,}', '\n\n', result).strip()
 
     # Если фильтр съел почти всё — не оставляем пользователя с пустотой.
-    if len(result) < 10 and len(text) > 50:
+    # Пустой результат опасен вдвойне: reply_text("") падает в Telegram.
+    if not result or (len(result) < 10 and len(text) > 50):
         return text
 
     return result
@@ -189,18 +220,15 @@ async def get_llm_response(
     def _parse_ok(resp) -> str | None:
         data = resp.json()
         content = _extract_content(data)
-        if content:
-            # У reasoning-моделей content иногда пуст, а полезный текст лежит
-            # рядом в поле рассуждения — тогда ответ собираем из него.
-            reasoning = extract_reasoning(data)
-            if not content and reasoning:
-                content = reasoning
-            if not content:
-                logger.warning(f"Нет content в ответе модели: {str(data)[:300]}")
-                return None
-            return strip_reasoning(content)
-        logger.warning(f"Нет content в ответе модели: {str(data)[:300]}")
-        return None
+        if not content:
+            # У reasoning-моделей content пуст, а полезный текст лежит рядом
+            # в поле рассуждения. Раньше эта ветка была мёртвой (`if not content`
+            # стояло внутри `if content:`), и такие ответы отбрасывались.
+            content = extract_reasoning(data)
+        if not content:
+            logger.warning(f"Нет content в ответе модели: {str(data)[:300]}")
+            return None
+        return strip_reasoning(content)
 
     async def _try_models(primary: str) -> str | None:
         models_to_try = [primary] + [m for m in FALLBACK_MODELS if m != primary]
