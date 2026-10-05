@@ -228,7 +228,18 @@ async def do_autoposting(context: ContextTypes.DEFAULT_TYPE):
             bot_data["OPENROUTER_API_KEY"]
         )
 
-        final_caption = f"{post_content}\n\n#CryptoNews #AlliraBot"
+        # caption уходит с parse_mode="HTML": текст модели нужно экранировать,
+        # иначе один уголковый скобочный "<" в ответе роняет отправку поста.
+        # Усечь надо ДО экранирования — иначе можно разрезать сущность &amp;.
+        text = (post_content or "").strip()
+        if len(text) > 900:
+            text = text[:897] + "..."
+        final_caption = f"{_escape_html(text)}\n\n#CryptoNews #AlliraBot"
+        if len(final_caption) > 1024:
+            # Экранирование раздуло текст — ужимаем текстовую часть с запасом
+            # на худший случай (один символ превращается в сущность до 5 символов).
+            safe_text = text[:190] + "..."
+            final_caption = f"{_escape_html(safe_text)}\n\n#CryptoNews #AlliraBot"
 
         image_bytes = await generate_image(post_content)
 
@@ -239,7 +250,7 @@ async def do_autoposting(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_photo(
                 chat_id=channel_id,
                 photo=photo_file,
-                caption=final_caption[:1024],
+                caption=final_caption,
                 parse_mode="HTML"
             )
             logger.info("Пост с AI- картинкой отправлен")

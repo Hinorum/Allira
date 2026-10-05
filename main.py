@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from cachetools import TTLCache
 
-from utils.common import setup_logging
+from utils.common import setup_logging, escape_html
 from utils.database import (
     init_db, increment_stat, get_stat, get_total_users, get_messages_today,
     close_all, prune_live_states,
@@ -221,20 +221,25 @@ async def post_shutdown(application: Application):
 
 
 async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.inline_query.query.strip()
+    inline = update.inline_query
+    query = inline.query.strip()
+
+    # Любой ранний выход обязан закрывать запрос, иначе у пользователя
+    # остаётся вечный спиннер "загрузка..." до таймаута клиента.
     if not query:
+        await inline.answer([], cache_time=0, is_personal=True)
         return
 
-    user_id = update.inline_query.from_user.id
+    user_id = inline.from_user.id
     now = time.time()
     last_call = _inline_rate_limit.get(user_id, 0)
     if now - last_call < 3.0:
+        await inline.answer([], cache_time=0, is_personal=True)
         return
     _inline_rate_limit[user_id] = now
 
-    from utils.ai_responses import decide_speaker
+    from utils.ai_responses import decide_speaker, get_llm_response, is_service_error
     from prompts.loader import load_prompt
-    from utils.ai_responses import get_llm_response
 
     speaker = decide_speaker(query)
     model = context.bot_data["LANE_MODEL"] if speaker == "lane" else context.bot_data["DEFAULT_MODEL"]
@@ -246,27 +251,36 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
             model=model,
             api_key=context.bot_data["OPENROUTER_API_KEY"]
         )
-
-        if response.startswith("Технические") or response.startswith("Слишком") or response.startswith("Сервис") or response.startswith("Все модели") or response.startswith("Модель вернула"):
-            return
-
-        if len(response) > 1000:
-            response = response[:997] + "..."
-
-        results = [
-            InlineQueryResultArticle(
-                id=str(uuid.uuid4()),
-                title=f"⚡ {speaker.title()}",
-                description=response[:100],
-                input_message_content=InputTextMessageContent(
-                    message_text=f"*{speaker.title()}:* {response}",
-                    parse_mode="Markdown"
-                )
-            )
-        ]
-        await update.inline_query.answer(results, cache_time=300, is_personal=True)
     except Exception as e:
         logger.error(f"Inline error: {e}")
+        await inline.answer([], cache_time=0, is_personal=True)
+        return
+
+    # Заглушки ("Все модели недоступны", "Сервис недоступен"...) в чат не идут.
+    if is_service_error(response):
+        await inline.answer([], cache_time=0, is_personal=True)
+        return
+
+    if len(response) > 1000:
+        response = response[:997] + "..."
+
+    results = [
+        InlineQueryResultArticle(
+            id=str(uuid.uuid4()),
+            title=f"⚡ {speaker.title()}",
+            description=response[:100],
+            input_message_content=InputTextMessageContent(
+                # HTML вместо Markdown: текст модели в Markdown-разметке
+                # падал с BadRequest на первом же невинном символе.
+                message_text=f"<b>{speaker.title()}:</b> {escape_html(response)}",
+                parse_mode="HTML"
+            )
+        )
+    ]
+    try:
+        await inline.answer(results, cache_time=300, is_personal=True)
+    except Exception as e:
+        logger.error(f"Inline answer error: {e}")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):

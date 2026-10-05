@@ -9,6 +9,7 @@ from utils.database import (
     save_tournament, save_tournament_players, increment_stat,
     load_live_states, save_live_state, delete_live_state,
 )
+from utils.common import escape_html
 
 logger = logging.getLogger(__name__)
 
@@ -138,32 +139,41 @@ def _make_pairs(player_ids: list[int]) -> tuple[list[tuple[int, int]], int | Non
     return pairs, bye_player
 
 
+def _name(player: dict) -> str:
+    """Имя игрока, безопасное для parse_mode='HTML'.
+
+    Ник берётся из first_name юзера — там может оказаться '<' или '&', и одна
+    такая строка роняла отправку всей турнирной таблицы с BadRequest.
+    """
+    return escape_html(str((player or {}).get("username") or "Игрок"))
+
+
 def get_tournament_status_message(chat_id: int) -> str:
     state = _get_state(chat_id)
 
     if not state["active"]:
         return "=> Турнир не активен. Запусти через /start_tournament"
 
-    message_lines = [f"🎲 **АРЕНА КУБИКОВ — Раунд {state['current_round']}** 🎲\n"]
+    message_lines = [f"🎲 <b>АРЕНА КУБИКОВ — Раунд {state['current_round']}</b> 🎲\n"]
 
     if state["registration_open"]:
-        message_lines.append("**Регистрация открыта!** Жми 'Войти на арену' чтобы войти в игру.")
+        message_lines.append("<b>Регистрация открыта!</b> Жми 'Войти на арену' чтобы войти в игру.")
         if state["players"]:
-            message_lines.append("\n**На арене:**")
+            message_lines.append("\n<b>На арене:</b>")
             for user_id, data in state["players"].items():
-                message_lines.append(f"    -> {data['username']} (Очки: {data.get('total_score', 0)})")
+                message_lines.append(f"    -> {_name(data)} (Очки: {data.get('total_score', 0)})")
         else:
-            message_lines.append("\n_Пока пусто. Будь первым._")
+            message_lines.append("\n<i>Пока пусто. Будь первым.</i>")
 
         if len(state["players"]) >= 2:
-            message_lines.append("\n\n_Админ: жми 'Завершить набор' когда все готовы._")
+            message_lines.append("\n\n<i>Админ: жми 'Завершить набор' когда все готовы.</i>")
         else:
-            message_lines.append("\n\n_Нужно минимум 2 игрока._")
+            message_lines.append("\n\n<i>Нужно минимум 2 игрока.</i>")
     else:
         mode_text = "1 на 1" if state["tournament_mode"] == "pair_match" else "Все против всех"
         if state.get("is_final_round"):
             mode_text += " (ФИНАЛ)"
-        message_lines.append(f"**Режим:** {mode_text}")
+        message_lines.append(f"<b>Режим:</b> {mode_text}")
 
         active_players_list = []
         eliminated_players_list = []
@@ -181,26 +191,26 @@ def get_tournament_status_message(chat_id: int) -> str:
                     roll_info = ", проходит без игры (бай)"
 
             if data.get("is_eliminated"):
-                eliminated_players_list.append(f"    ❌ {data['username']} (р. {data.get('eliminated_round', '?')})")
+                eliminated_players_list.append(f"    ❌ {_name(data)} (р. {data.get('eliminated_round', '?')})")
             else:
-                active_players_list.append(f"    {data['username']} — {data.get('total_score', 0)} очк.{roll_info}")
+                active_players_list.append(f"    {_name(data)} — {data.get('total_score', 0)} очк.{roll_info}")
 
         if active_players_list:
-            message_lines.append("\n**На арене:**")
+            message_lines.append("\n<b>На арене:</b>")
             message_lines.extend(active_players_list)
 
         if eliminated_players_list:
-            message_lines.append("\n**Выбывшие:**")
+            message_lines.append("\n<b>Выбывшие:</b>")
             message_lines.extend(eliminated_players_list)
 
         if state["current_round"] > 0 and not state["registration_open"]:
             if state["tournament_mode"] == "pair_match" and state["round_matches"]:
-                message_lines.append("\n**Матчи:**")
+                message_lines.append("\n<b>Матчи:</b>")
                 for p1_id, p2_id in state["round_matches"]:
                     p1_data = state["players"].get(p1_id, {})
                     p2_data = state["players"].get(p2_id, {})
-                    p1_name = p1_data.get("username", "Игрок1")
-                    p2_name = p2_data.get("username", "Игрок2")
+                    p1_name = _name(p1_data)
+                    p2_name = _name(p2_data)
                     p1_roll = state["player_rolls_in_round"].get(p1_id, "?")
                     p2_roll = state["player_rolls_in_round"].get(p2_id, "?")
                     match_status = f"    {p1_name} ({p1_roll}) vs {p2_name} ({p2_roll})"
@@ -216,24 +226,24 @@ def get_tournament_status_message(chat_id: int) -> str:
                     message_lines.append(match_status)
 
             if state.get("player_with_bye"):
-                player_bye_name = state["players"].get(state["player_with_bye"], {}).get("username", "Игрок")
+                player_bye_name = _name(state["players"].get(state["player_with_bye"], {}))
                 message_lines.append(f"\n{player_bye_name} проходит без игры (бай).")
 
             if state["active_players_in_round"]:
                 waiting_for_roll_users = [
-                    state["players"][pid]["username"]
+                    _name(state["players"][pid])
                     for pid in state["active_players_in_round"]
                     if pid in state["players"]
                 ]
                 if waiting_for_roll_users:
-                    message_lines.append(f"\n_Ждём броска от: {', '.join(waiting_for_roll_users)}_")
+                    message_lines.append(f"\n<i>Ждём броска от: {', '.join(waiting_for_roll_users)}</i>")
             elif not state["active_players_in_round"]:
                 remaining = sum(1 for p in state["players"].values() if not p.get("is_eliminated"))
                 if remaining > 1:
-                    message_lines.append("\n\n_Админ, жми 'Следующий раунд'._")
+                    message_lines.append("\n\n<i>Админ, жми 'Следующий раунд'.</i>")
                 elif remaining == 1:
-                    winner_name = [p['username'] for p in state["players"].values() if not p.get("is_eliminated")][0]
-                    message_lines.append(f"\n\n**Почти готово. Финалист: {winner_name}**")
+                    winner_name = _name([p for p in state["players"].values() if not p.get("is_eliminated")][0])
+                    message_lines.append(f"\n\n<b>Почти готово. Финалист: {winner_name}</b>")
 
     return "\n".join(message_lines)
 
@@ -283,7 +293,7 @@ async def update_tournament_message(context: ContextTypes.DEFAULT_TYPE, chat_id:
             chat_id=chat_id,
             message_id=message_id,
             text=current_text,
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=reply_markup
         )
     except Exception as e:
@@ -295,7 +305,7 @@ async def update_tournament_message(context: ContextTypes.DEFAULT_TYPE, chat_id:
                     sent = await context.bot.send_message(
                         chat_id=chat_id,
                         text=get_tournament_status_message(chat_id),
-                        parse_mode="Markdown"
+                        parse_mode="HTML"
                     )
                     state["tournament_message_id"] = sent.message_id
                 except Exception as send_e:
@@ -310,7 +320,7 @@ async def announce_round_results(context: ContextTypes.DEFAULT_TYPE, chat_id: in
     try:
         state = _get_state(chat_id)
         round_num = state["current_round"]
-        message_lines = [f"**=> Итоги раунда {round_num}:**\n"]
+        message_lines = [f"<b>=> Итоги раунда {round_num}:</b>\n"]
         eliminated_this_round = set()
 
         if state["tournament_mode"] == "pair_match":
@@ -329,7 +339,7 @@ async def announce_round_results(context: ContextTypes.DEFAULT_TYPE, chat_id: in
                 p2_roll = state["player_rolls_in_round"].get(p2_id)
 
                 if p1_roll is None or p2_roll is None:
-                    message_lines.append(f"⚠️ {p1_data.get('username')} vs {p2_data.get('username')} — не все броски засчитаны.")
+                    message_lines.append(f"⚠️ {_name(p1_data)} vs {_name(p2_data)} — не все броски засчитаны.")
                     continue
 
                 if p1_roll == p2_roll:
@@ -341,15 +351,15 @@ async def announce_round_results(context: ContextTypes.DEFAULT_TYPE, chat_id: in
                         state["players"][loser_id]["is_eliminated"] = True
                         state["players"][loser_id]["eliminated_round"] = round_num
                         eliminated_this_round.add(loser_id)
-                        winner_name = state["players"][winner_id]["username"]
+                        winner_name = _name(state["players"][winner_id])
                         message_lines.append(
-                            f"    {p1_data['username']} ({p1_roll}) vs {p2_data['username']} ({p2_roll}) -> "
-                            f"Ничья ×{state['rematch_count']}! Жребий: **{winner_name}** проходит"
+                            f"    {_name(p1_data)} ({p1_roll}) vs {_name(p2_data)} ({p2_roll}) -> "
+                            f"Ничья ×{state['rematch_count']}! Жребий: <b>{winner_name}</b> проходит"
                         )
                     else:
                         rematch_matches.append((p1_id, p2_id))
                         message_lines.append(
-                            f"    {p1_data['username']} ({p1_roll}) vs {p2_data['username']} ({p2_roll}) -> "
+                            f"    {_name(p1_data)} ({p1_roll}) vs {_name(p2_data)} ({p2_roll}) -> "
                             f"Ничья (переигровка #{state['rematch_count']})"
                         )
                 elif p1_roll > p2_roll:
@@ -358,8 +368,8 @@ async def announce_round_results(context: ContextTypes.DEFAULT_TYPE, chat_id: in
                     state["players"][p2_id]["eliminated_round"] = round_num
                     eliminated_this_round.add(p2_id)
                     message_lines.append(
-                        f"    {p1_data['username']} ({p1_roll}) vs {p2_data['username']} ({p2_roll}) -> "
-                        f"**{p1_data['username']}** побеждает"
+                        f"    {_name(p1_data)} ({p1_roll}) vs {_name(p2_data)} ({p2_roll}) -> "
+                        f"<b>{_name(p1_data)}</b> побеждает"
                     )
                 else:
                     state["players"][p2_id]["total_score"] += 1
@@ -367,8 +377,8 @@ async def announce_round_results(context: ContextTypes.DEFAULT_TYPE, chat_id: in
                     state["players"][p1_id]["eliminated_round"] = round_num
                     eliminated_this_round.add(p1_id)
                     message_lines.append(
-                        f"    {p1_data['username']} ({p1_roll}) vs {p2_data['username']} ({p2_roll}) -> "
-                        f"**{p2_data['username']}** побеждает"
+                        f"    {_name(p1_data)} ({p1_roll}) vs {_name(p2_data)} ({p2_roll}) -> "
+                        f"<b>{_name(p2_data)}</b> побеждает"
                     )
 
             state["round_matches"] = rematch_matches
@@ -386,10 +396,10 @@ async def announce_round_results(context: ContextTypes.DEFAULT_TYPE, chat_id: in
             else:
                 active_players.sort(key=lambda x: state["player_rolls_in_round"].get(x["user_id"], 0))
 
-                message_lines.append("\n**Броски:**")
+                message_lines.append("\n<b>Броски:</b>")
                 for p_data in active_players:
                     roll = state["player_rolls_in_round"].get(p_data["user_id"], "?")
-                    message_lines.append(f"    {p_data['username']}: {roll}")
+                    message_lines.append(f"    {_name(p_data)}: {roll}")
 
                 remaining_after = len(active_players)
 
@@ -401,19 +411,19 @@ async def announce_round_results(context: ContextTypes.DEFAULT_TYPE, chat_id: in
                         state["players"][p2["user_id"]]["is_eliminated"] = True
                         state["players"][p2["user_id"]]["eliminated_round"] = round_num
                         eliminated_this_round.add(p2["user_id"])
-                        message_lines.append(f"\n**Финал:** {p1['username']} ({r1}) > {p2['username']} ({r2})")
+                        message_lines.append(f"\n<b>Финал:</b> {_name(p1)} ({r1}) &gt; {_name(p2)} ({r2})")
                     elif r2 > r1:
                         state["players"][p1["user_id"]]["is_eliminated"] = True
                         state["players"][p1["user_id"]]["eliminated_round"] = round_num
                         eliminated_this_round.add(p1["user_id"])
-                        message_lines.append(f"\n**Финал:** {p2['username']} ({r2}) > {p1['username']} ({r1})")
+                        message_lines.append(f"\n<b>Финал:</b> {_name(p2)} ({r2}) &gt; {_name(p1)} ({r1})")
                     else:
                         winner = random.choice([p1, p2])
                         loser = p2 if winner["user_id"] == p1["user_id"] else p1
                         state["players"][loser["user_id"]]["is_eliminated"] = True
                         state["players"][loser["user_id"]]["eliminated_round"] = round_num
                         eliminated_this_round.add(loser["user_id"])
-                        message_lines.append(f"\n**Финал:** Ничья! Жребий: **{winner['username']}** побеждает")
+                        message_lines.append(f"\n<b>Финал:</b> Ничья! Жребий: <b>{_name(winner)}</b> побеждает")
                 elif remaining_after > 2:
                     num_to_eliminate = max(1, remaining_after // ELIMINATION_PERCENTAGE)
                     if remaining_after - num_to_eliminate < 1:
@@ -425,11 +435,11 @@ async def announce_round_results(context: ContextTypes.DEFAULT_TYPE, chat_id: in
                             state["players"][uid]["is_eliminated"] = True
                             state["players"][uid]["eliminated_round"] = round_num
                             eliminated_this_round.add(uid)
-                            message_lines.append(f"\n_Выбывает: {p_data['username']}_")
+                            message_lines.append(f"\n<i>Выбывает: {_name(p_data)}</i>")
                 else:
-                    message_lines.append("\n_Мало игроков — все проходят._")
+                    message_lines.append("\n<i>Мало игроков — все проходят.</i>")
 
-        await context.bot.send_message(chat_id=chat_id, text="\n".join(message_lines), parse_mode="Markdown")
+        await context.bot.send_message(chat_id=chat_id, text="\n".join(message_lines), parse_mode="HTML")
 
         state["player_rolls_in_round"].clear()
         state["active_players_in_round"].clear()
@@ -445,7 +455,8 @@ async def announce_round_results(context: ContextTypes.DEFAULT_TYPE, chat_id: in
             state["is_final_round"] = True
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="🏁 **ФИНАЛ!** Осталось двое. Кто бросит больше — тот чемпион!"
+                text="🏁 <b>ФИНАЛ!</b> Осталось двое. Кто бросит больше — тот чемпион!",
+                parse_mode="HTML"
             )
 
     finally:
@@ -456,7 +467,7 @@ async def end_tournament(context: ContextTypes.DEFAULT_TYPE, chat_id: int, winne
     state = _get_state(chat_id)
     message_id = state.get("tournament_message_id")
 
-    message = "**=> ИГРА ОКОНЧЕНА**\n\n"
+    message = "<b>=> ИГРА ОКОНЧЕНА</b>\n\n"
 
     final_winner = None
     if winner_data and not winner_data.get("is_eliminated"):
@@ -476,27 +487,27 @@ async def end_tournament(context: ContextTypes.DEFAULT_TYPE, chat_id: int, winne
                 final_winner = sorted_players[0]
 
     if final_winner:
-        message += f"**Чемпион:** {final_winner['username']} — {final_winner.get('total_score', 0)} очков. 👑"
+        message += f"<b>Чемпион:</b> {_name(final_winner)} — {final_winner.get('total_score', 0)} очков. 👑"
     elif not state["players"]:
         message += "Никто не пришёл. Пустая арена — грустно."
     else:
         message += "Победитель не определён."
         sorted_players = sorted(state["players"].values(), key=lambda p: p.get("total_score", 0), reverse=True)
-        message += "\n\n**Таблица:**\n"
+        message += "\n\n<b>Таблица:</b>\n"
         for p_data in sorted_players:
             status = "выбыл" if p_data.get("is_eliminated") else "активен"
-            message += f"- {p_data['username']}: {p_data.get('total_score', 0)} ({status})\n"
+            message += f"- {_name(p_data)}: {p_data.get('total_score', 0)} ({status})\n"
 
     if message_id:
         try:
             await context.bot.edit_message_text(
                 chat_id=chat_id, message_id=message_id,
-                text=message, parse_mode="Markdown", reply_markup=None
+                text=message, parse_mode="HTML", reply_markup=None
             )
         except Exception:
-            await context.bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
+            await context.bot.send_message(chat_id=chat_id, text=message, parse_mode="HTML")
     else:
-        await context.bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
+        await context.bot.send_message(chat_id=chat_id, text=message, parse_mode="HTML")
 
     if message_id and chat_id:
         try:
@@ -568,13 +579,13 @@ async def start_dice_tournament_registration(update: Update, context: ContextTyp
     try:
         if update.callback_query:
             try:
-                await message_to_reply.edit_text(text=status_text, reply_markup=reply_markup, parse_mode="Markdown")
+                await message_to_reply.edit_text(text=status_text, reply_markup=reply_markup, parse_mode="HTML")
                 state["tournament_message_id"] = message_to_reply.message_id
             except Exception:
-                sent = await context.bot.send_message(chat_id=chat_id, text=status_text, reply_markup=reply_markup, parse_mode="Markdown")
+                sent = await context.bot.send_message(chat_id=chat_id, text=status_text, reply_markup=reply_markup, parse_mode="HTML")
                 state["tournament_message_id"] = sent.message_id
         else:
-            sent = await message_to_reply.reply_text(text=status_text, reply_markup=reply_markup, parse_mode="Markdown")
+            sent = await message_to_reply.reply_text(text=status_text, reply_markup=reply_markup, parse_mode="HTML")
             state["tournament_message_id"] = sent.message_id
 
         if state.get("tournament_message_id") and chat_id:
@@ -656,9 +667,9 @@ async def end_registration_and_start_round(update: Update, context: ContextTypes
             [InlineKeyboardButton("Все против всех", callback_data="set_tournament_mode:all_vs_all")]
         ])
         try:
-            await query.message.edit_text(text="=> Набор окончен. Выбирай режим:", reply_markup=keyboard, parse_mode="Markdown")
+            await query.message.edit_text(text="=> Набор окончен. Выбирай режим:", reply_markup=keyboard)
         except Exception:
-            await context.bot.send_message(chat_id=chat_id, text="=> Набор окончен. Выбирай режим:", reply_markup=keyboard, parse_mode="Markdown")
+            await context.bot.send_message(chat_id=chat_id, text="=> Набор окончен. Выбирай режим:", reply_markup=keyboard)
         return
 
     if not state["registration_open"] and state["current_round"] > 0:
@@ -688,9 +699,13 @@ async def end_registration_and_start_round(update: Update, context: ContextTypes
                 next_matches.extend(pairs)
                 if bye_id is not None:
                     state["player_with_bye"] = bye_id
-                    bye_name = state["players"].get(bye_id, {}).get("username", "Игрок")
+                    bye_name = _name(state["players"].get(bye_id, {}))
                     state["active_players_in_round"].discard(bye_id)
-                    await context.bot.send_message(chat_id=chat_id, text=f"_{bye_name} получает бай._")
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"<i>{bye_name} получает бай.</i>",
+                        parse_mode="HTML"
+                    )
 
             state["round_matches"] = next_matches
 
@@ -754,8 +769,12 @@ async def set_tournament_mode(update: Update, context: ContextTypes.DEFAULT_TYPE
         if bye_id is not None:
             state["player_with_bye"] = bye_id
             state["active_players_in_round"].discard(bye_id)
-            bye_name = state["players"].get(bye_id, {}).get("username", "Игрок")
-            await context.bot.send_message(chat_id=chat_id, text=f"_{bye_name} получает бай и проходит автоматически._")
+            bye_name = _name(state["players"].get(bye_id, {}))
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"<i>{bye_name} получает бай и проходит автоматически.</i>",
+                parse_mode="HTML"
+            )
 
     await update_tournament_message(context, chat_id)
 
@@ -805,9 +824,9 @@ async def make_tournament_roll(update: Update, context: ContextTypes.DEFAULT_TYP
 
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"_{user.first_name} бросил: **{dice_value}**!_",
+            text=f"<i>{escape_html(user.first_name or 'Игрок')} бросил: <b>{dice_value}</b>!</i>",
             reply_to_message_id=dice_message.message_id,
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
 
         await update_tournament_message(context, chat_id)

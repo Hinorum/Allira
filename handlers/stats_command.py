@@ -2,6 +2,7 @@ import logging
 from telegram import Update
 from telegram.ext import ContextTypes
 
+from utils.common import escape_html
 from utils.database import (
     get_tournament_history, get_tournament_leaderboard,
     get_total_users, get_total_tournaments, get_messages_today,
@@ -20,8 +21,10 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     top_users = await get_active_users(days=30, limit=5)
     top_speakers = await get_top_speakers(limit=3)
 
+    # Раньше здесь был Markdown вида "**текст**" без parse_mode — звёздочки
+    # доезжали до юзера как есть. Официализируем HTML и экранируем ники.
     lines = [
-        "**=> СТАТИСТИКА БОТА**\n",
+        "<b>=> СТАТИСТИКА БОТА</b>\n",
         f"Юзеров всего: {total_users}",
         f"Сообщений сегодня: {messages_today}",
         f"Всего сообщений: {total_messages}",
@@ -29,18 +32,18 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     if top_users:
-        lines.append("**Топ по активности (30д):**")
+        lines.append("<b>Топ по активности (30д):</b>")
         for i, u in enumerate(top_users, 1):
             name = u.get("username") or u.get("first_name") or "???"
-            lines.append(f"    {i}. {name} — {u['message_count']}")
+            lines.append(f"    {i}. {escape_html(str(name))} — {u['message_count']}")
 
     if top_speakers:
-        lines.append("\n**Кто чаще отвечает:**")
+        lines.append("\n<b>Кто чаще отвечает:</b>")
         for s in top_speakers:
             emoji = "⚡" if s["speaker"] == "allira" else "🌊"
-            lines.append(f"    {emoji} {s['speaker']}: {s['count']}")
+            lines.append(f"    {emoji} {escape_html(str(s['speaker']))}: {s['count']}")
 
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -50,20 +53,20 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("=> Турниров пока не было. Запусти первый: /start_tournament")
         return
 
-    lines = ["**=> ИСТОРИЯ ТУРНИРОВ**\n"]
+    lines = ["<b>=> ИСТОРИЯ ТУРНИРОВ</b>\n"]
 
     for i, t in enumerate(history, 1):
         mode = "1на1" if t.get("mode") == "pair_match" else "всеvsвсе"
-        winner = t.get("winner_name") or "нет"
+        winner = escape_html(str(t.get("winner_name") or "нет"))
         ended = t.get("ended_at", "")[:10]
         players = t.get("total_players", t.get("player_count", "?"))
         rounds = t.get("total_rounds", "?")
 
-        lines.append(f"**#{t['id']}** — {ended}")
+        lines.append(f"<b>#{t['id']}</b> — {ended}")
         lines.append(f"    Режим: {mode} | Игроков: {players} | Раундов: {rounds}")
-        lines.append(f"    Победитель: **{winner}**\n")
+        lines.append(f"    Победитель: <b>{winner}</b>\n")
 
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -73,12 +76,12 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("=> Пока нет чемпионов. Сыграй турнир!")
         return
 
-    lines = ["**=> ТАБЛИЦА ЛИДЕРОВ**\n"]
+    lines = ["<b>=> ТАБЛИЦА ЛИДЕРОВ</b>\n"]
 
     medals = ["🥇", "🥈", "🥉"]
     for i, l in enumerate(leaders, 1):
         prefix = medals[i-1] if i <= 3 else f"    {i}."
-        name = l.get("username") or "???"
+        name = escape_html(str(l.get("username") or "???"))
         lines.append(f"{prefix} {name} — {l['wins']} побед")
 
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")

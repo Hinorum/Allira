@@ -131,6 +131,29 @@ def strip_reasoning(text: str) -> str:
 
 response_cache = TTLCache(maxsize=100, ttl=300)
 
+# Служебные ответы-заглушки. Раньше их ловили сниффингом префиксов прямо
+# в main.py ("response.startswith('Технические')...") — любая переформулировка
+# ломала проверку. Теперь это единый источник правды, который меняет только
+# get_llm_response.
+ERR_RATE_LIMITED = "Слишком много запросов! Дай мне минутку передохнуть..."
+ERR_NO_MODELS = "Все модели временно недоступны. Попробуй позже!"
+ERR_SERVICE_DOWN = "Сервис временно недоступен. Попробуй позже!"
+ERR_EMPTY_ANSWER = "Модель вернула пустой ответ. Попробуй переформулировать!"
+ERR_TECHNICAL = "Технические неполадки! Попробуй еще раз."
+
+SERVICE_ERRORS = (
+    ERR_RATE_LIMITED,
+    ERR_NO_MODELS,
+    ERR_SERVICE_DOWN,
+    ERR_EMPTY_ANSWER,
+    ERR_TECHNICAL,
+)
+
+
+def is_service_error(text: str) -> bool:
+    """True, если модель вернула заглушку вместо реального ответа."""
+    return text in SERVICE_ERRORS
+
 def _is_circuit_open(model: str) -> bool:
     """True, если модель заблокирована после серии ошибок.
 
@@ -261,7 +284,7 @@ async def get_llm_response(
 
         if resp.status_code == 429:
             logger.warning("Превышен лимит API")
-            return "Слишком много запросов! Дай мне минутку передохнуть..."
+            return ERR_RATE_LIMITED
 
         if resp.status_code != 200:
             logger.error(f"OpenRouter API error {resp.status_code}: {resp.text[:500]}")
@@ -271,8 +294,8 @@ async def get_llm_response(
                     if cacheable:
                         response_cache[cache_key] = result[:2000]
                     return result
-                return "Все модели временно недоступны. Попробуй позже!"
-            return "Сервис временно недоступен. Попробуй позже!"
+                return ERR_NO_MODELS
+            return ERR_SERVICE_DOWN
 
         result = _parse_ok(resp)
         if result:
@@ -287,11 +310,11 @@ async def get_llm_response(
             if cacheable:
                 response_cache[cache_key] = result[:2000]
             return result
-        return "Модель вернула пустой ответ. Попробуй переформулировать!"
+        return ERR_EMPTY_ANSWER
 
     except Exception as e:
         logger.error(f"Ошибка LLM: {e}")
-        return "Технические неполадки! Попробуй еще раз."
+        return ERR_TECHNICAL
 
 def decide_speaker(text: str) -> str:
     text_lower = text.lower()

@@ -71,6 +71,8 @@ HELP_TEXT = (
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Турнир на кубиках", callback_data="start_tournament_from_menu")],
         [InlineKeyboardButton("Помощь", callback_data="show_help")]
@@ -80,6 +82,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     await update.message.reply_text(HELP_TEXT)
 
 
@@ -87,4 +91,12 @@ async def show_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     if query:
         await query.answer()
-        await query.edit_message_text(HELP_TEXT)
+        try:
+            await query.edit_message_text(HELP_TEXT)
+        except Exception as e:
+            # Повторное нажатие на "Помощь" при неизменном тексте даёт
+            # "message is not modified". Раньше исключение уходило в
+            # error_handler -> ложный алерт админу и "Что-то сломалось"
+            # пользователю на уже открытом тексте.
+            if "message is not modified" not in str(e).lower():
+                raise
