@@ -11,11 +11,11 @@ from tasks.marketapp_reports import (
     sync_rent_from_blockchain,
     _format_ton,
     _nano_to_ton,
-    _escape_html,
     userfriendly_to_raw,
     MSK,
     MARKETAPP_API_URL,
 )
+from utils.common import escape_html
 from utils.database import get_all_rent_events, get_db
 from utils.http_client import get_client
 
@@ -87,7 +87,7 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     await update.message.reply_text(
         "Синхронизация запущена в фоне — чат не блокирую, отвечу с готовым отчётом.\n"
-        f"Кошелёк: <code>{_escape_html(wallet)}</code>",
+        f"Кошелёк: <code>{escape_html(wallet)}</code>",
         parse_mode="HTML"
     )
     asyncio.create_task(
@@ -195,7 +195,7 @@ async def _run_rent_sync(bot, chat_id: int, wallet: str, api_token: str, is_owne
                 if rented:
                     lines.append(f"\nАктивных аренд: {len(rented)}")
                     for item in rented[:5]:
-                        name = _escape_html(item.get("nft_name", "?"))
+                        name = escape_html(item.get("nft_name", "?"))
                         price = _nano_to_ton(item.get("price_per_day", "0"))
                         lines.append(f"  - {name}: {_format_ton(price)} TON/день")
     except Exception:
@@ -374,7 +374,7 @@ async def marketappgifts_command(update: Update, context: ContextTypes.DEFAULT_T
 
     for addr, gift in sorted(per_gift.items(), key=lambda kv: kv[1]["nano"], reverse=True):
         ton = _format_ton(_nano_to_ton(str(gift["nano"])))
-        name = _escape_html(gift["name"]) if gift["name"] else "без названия"
+        name = escape_html(gift["name"]) if gift["name"] else "без названия"
         line = (
             f"<a href=\"https://getgems.io/nft/{addr}\">"
             f"{name}</a> — <b>{ton} TON</b> ({gift['count']} сд.)"

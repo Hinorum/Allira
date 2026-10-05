@@ -8,6 +8,8 @@ import json
 from contextlib import contextmanager
 from datetime import datetime
 
+from utils.common import normalize_ton_address
+
 logger = logging.getLogger(__name__)
 
 DB_PATH = "allira.db"
@@ -617,20 +619,8 @@ def _sync_save_rent_event(event: dict, wallet: str = "") -> bool:
         return _sync_upsert_rent_event(conn, event, wallet) > 0
 
 
-def _normalize_addr(addr: str) -> str:
-    addr = (addr or "").strip()
-    if addr.startswith("0:"):
-        return addr.lower()
-    if len(addr) == 48 and addr[:2] in ("EQ", "UQ"):
-        try:
-            urlsafe = addr.replace("-", "+").replace("_", "/")
-            padding = (4 - len(urlsafe) % 4) % 4
-            urlsafe += "=" * padding
-            decoded = base64.b64decode(urlsafe)
-            return "0:" + decoded[2:34].hex()
-        except Exception:
-            pass
-    return addr.lower()
+# Единый нормализатор TON-адресов (см. utils.common.normalize_ton_address).
+_normalize_addr = normalize_ton_address
 
 
 def _canonical_tx_hash(tx_hash: str) -> str:

@@ -9,6 +9,7 @@ from datetime import datetime
 from cachetools import TTLCache
 from telegram.ext import ContextTypes
 from utils.ai_responses import generate_post_content
+from utils.common import escape_html
 from utils.database import increment_stat
 from utils.http_client import get_client, with_retry
 
@@ -23,10 +24,6 @@ last_request_time = 0
 
 def get_smart_interval() -> int:
     return random.choice([43200, 50400])
-
-
-def _escape_html(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def get_fallback_crypto_data():
@@ -45,7 +42,7 @@ def format_market_data(coins):
     lines = ["<b>Топ криптовалют сегодня:</b>\n"]
 
     for i, coin in enumerate(top_coins, 1):
-        name = _escape_html(coin['name'])
+        name = escape_html(coin['name'])
         price = coin['current_price']
         change = coin.get('price_change_percentage_24h', 0) or 0
         emoji = "\U0001f7e2" if change > 0 else "\U0001f534" if change < 0 else "\u26aa"
@@ -61,7 +58,7 @@ def format_trending_data(data):
 
     for i, coin_data in enumerate(coins, 1):
         coin = coin_data['item']
-        name = _escape_html(coin['name'])
+        name = escape_html(coin['name'])
         symbol = coin['symbol']
         market_cap_rank = coin.get('market_cap_rank', 'N/A')
         lines.append(f"{i}. {name} ({symbol.upper()}) - Ранг #{market_cap_rank}")
@@ -236,12 +233,12 @@ async def do_autoposting(context: ContextTypes.DEFAULT_TYPE):
         text = (post_content or "").strip()
         if len(text) > 900:
             text = text[:897] + "..."
-        final_caption = f"{_escape_html(text)}\n\n#CryptoNews #AlliraBot"
+        final_caption = f"{escape_html(text)}\n\n#CryptoNews #AlliraBot"
         if len(final_caption) > 1024:
             # Экранирование раздуло текст — ужимаем текстовую часть с запасом
             # на худший случай (один символ превращается в сущность до 5 символов).
             safe_text = text[:190] + "..."
-            final_caption = f"{_escape_html(safe_text)}\n\n#CryptoNews #AlliraBot"
+            final_caption = f"{escape_html(safe_text)}\n\n#CryptoNews #AlliraBot"
 
         image_bytes = await generate_image(post_content)
 

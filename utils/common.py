@@ -1,3 +1,4 @@
+import base64
 import logging
 import os
 from logging.handlers import RotatingFileHandler
@@ -28,3 +29,25 @@ def setup_logging():
 
 def escape_html(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def normalize_ton_address(addr: str) -> str:
+    """Приводит TON-адрес к raw-виду 0:<hex>.
+
+    Раньше эта же логика жила дважды: database._normalize_addr и
+    marketapp_reports.userfriendly_to_raw. Один источник — меньше шансов,
+    что формат адреса начнёт зависеть от того, каким путём он пришёл.
+    """
+    addr = (addr or "").strip()
+    if addr.startswith("0:"):
+        return addr.lower()
+    if len(addr) == 48 and addr[:2] in ("EQ", "UQ"):
+        try:
+            urlsafe = addr.replace("-", "+").replace("_", "/")
+            padding = (4 - len(urlsafe) % 4) % 4
+            urlsafe += "=" * padding
+            decoded = base64.b64decode(urlsafe)
+            return "0:" + decoded[2:34].hex()
+        except Exception:
+            pass
+    return addr.lower()

@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import logging
 import httpx
 from datetime import datetime, timedelta, timezone, time as dt_time
@@ -11,6 +10,7 @@ from utils.database import (
     enrich_blockchain_events, get_all_rent_events
 )
 from utils.config import BotConfig
+from utils.common import normalize_ton_address
 from utils.http_client import get_client, with_retry
 
 logger = logging.getLogger(__name__)
@@ -24,10 +24,6 @@ MAX_PAGE_RETRIES = 3
 MAX_HISTORY_PAGES = 200
 
 MSK = timezone(timedelta(hours=3))
-
-
-def _escape_html(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _format_ton(value: float) -> str:
@@ -49,19 +45,12 @@ def _ts_days_ago(days: int) -> int:
 
 
 def userfriendly_to_raw(addr: str) -> str:
-    addr = (addr or "").strip()
-    if addr.startswith("0:"):
-        return addr.lower()
-    if len(addr) == 48 and addr[:2] in ("EQ", "UQ"):
-        try:
-            urlsafe = addr.replace("-", "+").replace("_", "/")
-            padding = (4 - len(urlsafe) % 4) % 4
-            urlsafe += "=" * padding
-            decoded = base64.b64decode(urlsafe)
-            return "0:" + decoded[2:34].hex()
-        except Exception:
-            pass
-    return addr.lower()
+    """EQ/UQ -> 0:hex.
+
+    Делегирует единому нормализатору из utils.common: раньше эта же логика
+    была продублирована ещё и в database._normalize_addr.
+    """
+    return normalize_ton_address(addr)
 
 
 @with_retry(max_retries=2, base_delay=5.0)
