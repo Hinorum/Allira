@@ -15,14 +15,30 @@ logger = logging.getLogger(__name__)
 DB_PATH = "allira.db"
 _local = threading.local()
 
+# Реестр открытых соединений: один на все потоки, защищён замком. Нужен, чтобы
+# close_all() закрывал не только своё соединение, а все — иначе дескрипторы
+# рабочих потоков (asyncio.to_thread) висели бы до выхода из процесса.
+_all_conns: list[sqlite3.Connection] = []
+_conns_lock = threading.Lock()
+
 
 def get_connection() -> sqlite3.Connection:
-    if not hasattr(_local, "conn") or _local.conn is None:
-        _local.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        _local.conn.row_factory = sqlite3.Row
-        _local.conn.execute("PRAGMA journal_mode=WAL")
-        _local.conn.execute("PRAGMA busy_timeout=5000")
-    return _local.conn
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.execute("SELECT 1").fetchone()
+        except sqlite3.Error:
+            # Соединение уже закрыли из другого потока — переоткрываем.
+            conn = None
+    if conn is None:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        _local.conn = conn
+        with _conns_lock:
+            _all_conns.append(conn)
+    return conn
 
 
 @contextmanager
@@ -37,11 +53,18 @@ def get_db():
 
 
 def close_all():
-    if hasattr(_local, "conn") and _local.conn is not None:
+    """Закрывает соединения всех потоков, а не только текущего."""
+    with _conns_lock:
+        conns = list(_all_conns)
+        _all_conns.clear()
+
+    for conn in conns:
         try:
-            _local.conn.close()
+            conn.close()
         except Exception:
             pass
+
+    if getattr(_local, "conn", None) is not None:
         _local.conn = None
 
 
