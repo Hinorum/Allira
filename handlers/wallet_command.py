@@ -23,10 +23,42 @@ logger = logging.getLogger(__name__)
 
 MAX_SYNC_PAGES = 1000
 
-# Чаты, у которых синк уже идёт. Без этого повторный /marketapprent во время
-# долгого сканирования запускал бы второй параллельный прогон по тому же
-# кошельку — двойная нагрузка на API и дубли в ответах.
-_sync_in_progress: set[int] = set()
+# Чаты, у которых уже идёт тяжёлая операция и её описание. Без этого повторный
+# /marketapprent (или /marketappgifts) во время долгого сканирования запускал бы
+# второй параллельный прогон: двойная нагрузка на API и дубли в ответах.
+_sync_in_progress: dict[int, str] = {}
+
+
+async def _resolve_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE, command: str) -> tuple[str, bool] | None:
+    """Разбор адреса кошелька из аргументов/конфига и проверка владельца.
+
+    Было продублировано в marketapprent_command и marketappgifts_command.
+    Возвращает (wallet, is_owner) либо None — тогда юзеру уже ответили.
+    """
+    wallet = ""
+    if context.args:
+        candidate = context.args[0].strip()
+        if userfriendly_to_raw(candidate).startswith("0:"):
+            wallet = candidate
+        else:
+            await update.message.reply_text(
+                "Неверный адрес кошелька.\n"
+                f"Использование: /{command} <адрес кошелька>"
+            )
+            return None
+    if not wallet:
+        wallet = context.bot_data.get("MARKETAPP_WALLET", "")
+
+    if not wallet:
+        await update.message.reply_text(
+            "Кошелёк не передан и MARKETAPP_WALLET не настроен.\n"
+            f"Использование: /{command} <адрес кошелька>"
+        )
+        return None
+
+    owner_wallet = context.bot_data.get("MARKETAPP_WALLET", "")
+    is_owner = bool(owner_wallet and userfriendly_to_raw(owner_wallet) == userfriendly_to_raw(wallet))
+    return wallet, is_owner
 
 
 def _dedupe_events(events: list) -> list:
@@ -51,39 +83,19 @@ def _total_nano(events: list, since_ts: int = 0) -> int:
 
 async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"/marketapprent вызван, args={context.args}")
+    resolved = await _resolve_wallet(update, context, "marketapprent")
+    if resolved is None:
+        return
+    wallet, is_owner = resolved
     api_token = context.bot_data.get("MARKETAPP_API_KEY")
 
-    wallet = ""
-    if context.args:
-        candidate = context.args[0].strip()
-        if userfriendly_to_raw(candidate).startswith("0:"):
-            wallet = candidate
-        else:
-            await update.message.reply_text(
-                "Неверный адрес кошелька.\n"
-                "Использование: /marketapprent <адрес кошелька>"
-            )
-            return
-    if not wallet:
-        wallet = context.bot_data.get("MARKETAPP_WALLET", "")
-
-    if not wallet:
+    chat_id = update.message.chat_id
+    if chat_id in _sync_in_progress:
         await update.message.reply_text(
-            "Кошелёк не передан и MARKETAPP_WALLET не настроен.\n"
-            "Использование: /marketapprent <адрес кошелька>"
+            f"Уже выполняется: {_sync_in_progress[chat_id]}. Подожди готовый отчёт."
         )
         return
-
-    wallet_raw = userfriendly_to_raw(wallet)
-    owner_wallet = context.bot_data.get("MARKETAPP_WALLET", "")
-    is_owner = bool(owner_wallet and userfriendly_to_raw(owner_wallet) == wallet_raw)
-
-    if update.message.chat_id in _sync_in_progress:
-        await update.message.reply_text(
-            "Синхронизация по этому чату уже идёт — подожди готовый отчёт."
-        )
-        return
-    _sync_in_progress.add(update.message.chat_id)
+    _sync_in_progress[chat_id] = "синхронизация аренды"
 
     await update.message.reply_text(
         "Синхронизация запущена в фоне — чат не блокирую, отвечу с готовым отчётом.\n"
@@ -91,7 +103,7 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
         parse_mode="HTML"
     )
     asyncio.create_task(
-        _rent_sync_task(context.bot, update.message.chat_id, wallet, api_token, is_owner)
+        _rent_sync_task(context.bot, chat_id, wallet, api_token, is_owner)
     )
 
 
@@ -110,7 +122,7 @@ async def _rent_sync_task(bot, chat_id: int, wallet: str, api_token: str, is_own
         except Exception:
             pass
     finally:
-        _sync_in_progress.discard(chat_id)
+        _sync_in_progress.pop(chat_id, None)
 
 
 async def _run_rent_sync(bot, chat_id: int, wallet: str, api_token: str, is_owner: bool):
@@ -295,46 +307,59 @@ async def _enrich_by_price(api_token: str, wallet: str) -> int:
 
 async def marketappgifts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"/marketappgifts вызван, args={context.args}")
-    wallet = ""
-    if context.args:
-        candidate = context.args[0].strip()
-        if userfriendly_to_raw(candidate).startswith("0:"):
-            wallet = candidate
-        else:
-            await update.message.reply_text(
-                "Неверный адрес кошелька.\n"
-                "Использование: /marketappgifts <адрес кошелька>"
-            )
-            return
-    if not wallet:
-        wallet = context.bot_data.get("MARKETAPP_WALLET", "")
-
-    if not wallet:
-        await update.message.reply_text(
-            "Кошелёк не передан и MARKETAPP_WALLET не настроен.\n"
-            "Использование: /marketappgifts <адрес кошелька>"
-        )
+    resolved = await _resolve_wallet(update, context, "marketappgifts")
+    if resolved is None:
         return
+    wallet, is_owner = resolved
 
     api_token = context.bot_data.get("MARKETAPP_API_KEY")
-    wallet_raw = userfriendly_to_raw(wallet)
-    owner_wallet = context.bot_data.get("MARKETAPP_WALLET", "")
-    is_owner = bool(owner_wallet and userfriendly_to_raw(owner_wallet) == wallet_raw)
     logger.info(
-        f"/marketappgifts: api_token={'есть' if api_token else 'НЕТ'} "
-        f"owner_wallet={owner_wallet!r} is_owner={is_owner}"
+        f"/marketappgifts: api_token={'есть' if api_token else 'НЕТ'} is_owner={is_owner}"
     )
 
+    chat_id = update.message.chat_id
+    if chat_id in _sync_in_progress:
+        await update.message.reply_text(
+            f"Уже выполняется: {_sync_in_progress[chat_id]}. Подожди готовый отчёт."
+        )
+        return
+    _sync_in_progress[chat_id] = "отчёт по подаркам"
+
+    await update.message.reply_text(
+        "Собираю отчёт по подаркам в фоне — чат не блокирую, отвечу с готовым."
+    )
+    asyncio.create_task(_gifts_report_task(context.bot, chat_id, wallet, api_token, is_owner))
+
+
+async def _gifts_report_task(bot, chat_id: int, wallet: str, api_token: str, is_owner: bool):
+    """Обогащение платежей по ценам NFT — самый тяжёлый шаг отчёта.
+
+    Цикл events × nfts × 30 дней считается в потоке, но всё равно держал
+    апдейт: сейчас идёт в фоне, как и синк аренды.
+    """
+    try:
+        await _run_gifts_report(bot, chat_id, wallet, api_token, is_owner)
+    except Exception as e:
+        logger.error(f"/marketappgifts: фоновый отчёт упал: {e}", exc_info=True)
+        try:
+            await bot.send_message(chat_id, "Отчёт прервался из-за ошибки. Попробуй позже.")
+        except Exception:
+            pass
+    finally:
+        _sync_in_progress.pop(chat_id, None)
+
+
+async def _run_gifts_report(bot, chat_id: int, wallet: str, api_token: str, is_owner: bool):
     events = _dedupe_events(await get_all_rent_events(wallet))
     logger.info(f"/marketappgifts: событий в БД={len(events)}, "
                 f"с-подарком={sum(1 for e in events if (e.get('nft_address') or '').strip())}")
     if not events:
-        await update.message.reply_text("По этому кошельку пока нет данных.")
+        await bot.send_message(chat_id, "По этому кошельку пока нет данных.")
         return
 
     has_nft_info = any((e.get("nft_address") or "").strip() for e in events)
     if not has_nft_info and api_token and is_owner:
-        await update.message.reply_text("Подбираю NFT по ценам аренды...")
+        await bot.send_message(chat_id, "Подбираю NFT по ценам аренды...")
         try:
             enriched = await _enrich_by_price(api_token, wallet)
             if enriched > 0:
@@ -357,7 +382,8 @@ async def marketappgifts_command(update: Update, context: ContextTypes.DEFAULT_T
     total_ton = _format_ton(_nano_to_ton(str(total_nano)))
 
     if not per_gift:
-        await update.message.reply_text(
+        await bot.send_message(
+            chat_id,
             f"Общий доход: <b>{total_ton} TON</b> ({len(events)} событий)\n\n"
             "Не удалось привязать платежи к конкретным NFT.\n"
             "Возможно, NFT уже не в аренде или цены не совпали.",
@@ -380,10 +406,10 @@ async def marketappgifts_command(update: Update, context: ContextTypes.DEFAULT_T
             f"{name}</a> — <b>{ton} TON</b> ({gift['count']} сд.)"
         )
         if current_len and current_len + len(name) + 60 > 3800:
-            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+            await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
             lines = [header]
             current_len = len(header)
         lines.append(line)
         current_len += len(line) + 1
 
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
