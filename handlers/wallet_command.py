@@ -11,6 +11,7 @@ from tasks.marketapp_reports import (
     sync_rent_from_blockchain,
     _format_ton,
     _nano_to_ton,
+    _ts_days_ago,
     userfriendly_to_raw,
     MSK,
     MARKETAPP_API_URL,
@@ -29,21 +30,34 @@ MAX_SYNC_PAGES = 1000
 _sync_in_progress: dict[int, str] = {}
 
 
-async def _resolve_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE, command: str) -> tuple[str, bool] | None:
+async def _resolve_wallet(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    command: str,
+    args: list[str] | None = None,
+    usage: str | None = None,
+) -> tuple[str, bool] | None:
     """Разбор адреса кошелька из аргументов/конфига и проверка владельца.
 
     Было продублировано в marketapprent_command и marketappgifts_command.
     Возвращает (wallet, is_owner) либо None — тогда юзеру уже ответили.
+
+    args — уже разобранные аргументы (по умолчанию context.args): у /marketapptop
+    первый аргумент — число дней, и адрес кошелька остаётся вторым.
+    usage — подсказка использования, если у команды есть ещё и другие аргументы.
     """
+    if args is None:
+        args = context.args
+    if usage is None:
+        usage = f"Использование: /{command} <адрес кошелька>"
     wallet = ""
-    if context.args:
-        candidate = context.args[0].strip()
+    if args:
+        candidate = args[0].strip()
         if userfriendly_to_raw(candidate).startswith("0:"):
             wallet = candidate
         else:
             await update.message.reply_text(
-                "Неверный адрес кошелька.\n"
-                f"Использование: /{command} <адрес кошелька>"
+                "Неверный адрес кошелька.\n" + usage
             )
             return None
     if not wallet:
@@ -51,8 +65,7 @@ async def _resolve_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE, co
 
     if not wallet:
         await update.message.reply_text(
-            "Кошелёк не передан и MARKETAPP_WALLET не настроен.\n"
-            f"Использование: /{command} <адрес кошелька>"
+            "Кошелёк не передан и MARKETAPP_WALLET не настроен.\n" + usage
         )
         return None
 
@@ -413,3 +426,224 @@ async def _run_gifts_report(bot, chat_id: int, wallet: str, api_token: str, is_o
         current_len += len(line) + 1
 
     await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+
+
+# --- /marketapptop: топ подарков по сумме и доходности ---
+
+TOP_LIMIT = 10
+
+
+def _parse_top_days(args: list[str]) -> tuple[int | None, list[str]]:
+    """Разбирает /marketapptop [дней] [адрес].
+
+    Возвращает (days, оставшиеся аргументы). days=None — за всё время.
+    Первый аргумент считается периодом, только если это чисто число (или
+    «всё»): адреса TON начинаются с EQ/UQ/0:, поэтому не пересекаются.
+    """
+    if not args:
+        return None, []
+    raw = args[0].strip().lower()
+    if raw in ("всё", "все", "all", "*"):
+        return None, args[1:]
+    if raw.isdigit():
+        days = int(raw)
+        if not 1 <= days <= 3650:
+            raise ValueError("период должен быть от 1 до 3650 дней")
+        return days, args[1:]
+    return None, args
+
+
+def _format_rate(value: float) -> str:
+    """TON/сут: два знака дают «0.00» у мелких подарков — показываем точнее."""
+    if value >= 10:
+        return f"{value:.2f}"
+    if value >= 1:
+        return f"{value:.3f}"
+    text = f"{value:.4f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _top_rows(events: list, since_ts: int) -> tuple[list, dict]:
+    """Группировка платежей за период по NFT: строки топа и сводка.
+
+    Платежи без привязки к NFT в топ не попадают (нельзя понять, какой
+    подарок заработал), но считаются в сводке — чтобы суммы сходились.
+    """
+    per_gift = OrderedDict()
+    summary = {
+        "total_nano": 0,
+        "count": 0,
+        "unlinked_nano": 0,
+        "unlinked_count": 0,
+        "first_ts": 0,
+        "last_ts": 0,
+    }
+
+    for ev in events:
+        ts = int(ev.get("ts", 0) or 0)
+        if ts < since_ts:
+            continue
+        nano = int(ev.get("price_nano", 0) or 0)
+        summary["total_nano"] += nano
+        summary["count"] += 1
+        if not summary["first_ts"] or ts < summary["first_ts"]:
+            summary["first_ts"] = ts
+        if ts > summary["last_ts"]:
+            summary["last_ts"] = ts
+
+        addr = (ev.get("nft_address") or "").strip()
+        if not addr:
+            summary["unlinked_count"] += 1
+            summary["unlinked_nano"] += nano
+            continue
+        name = (ev.get("nft_name") or "").strip()
+        entry = per_gift.setdefault(addr, {"name": name, "nano": 0, "count": 0})
+        entry["nano"] += nano
+        entry["count"] += 1
+
+    rows = sorted(per_gift.items(), key=lambda kv: kv[1]["nano"], reverse=True)
+    return rows, summary
+
+
+def _build_top_report(wallet: str, rows: list, summary: dict, days: int | None) -> str:
+    """HTML-сообщение с топом: сумма за период + доходность TON/сут.
+
+    Знаменатель один для всех строк (дни периода), чтобы рейтинг по сумме и
+    по доходности были сравнимы между собой, а не завышали разовые платежи.
+    """
+    now_ts = int(datetime.now(MSK).timestamp())
+    if days:
+        period_days = float(days)
+    else:
+        period_days = max(1.0, (now_ts - summary["first_ts"]) / 86400)
+
+    title = f"за {days} дн." if days else "за всё время"
+    total = _format_ton(_nano_to_ton(str(summary["total_nano"])))
+    lines = [
+        f"<b>ТОП подарков {title}</b>",
+        f"Кошелёк: <code>{escape_html(wallet)}</code>",
+        f"Период: {datetime.fromtimestamp(summary['first_ts'], MSK).strftime('%d.%m.%Y')} — "
+        f"{datetime.fromtimestamp(summary['last_ts'], MSK).strftime('%d.%m.%Y')} "
+        f"({period_days:.0f} дн.)",
+        f"Доход: <b>{total} TON</b> · {summary['count']} плат. · {len(rows)} подарков",
+        f"Топ-{min(TOP_LIMIT, len(rows))} по сумме, доходность = сумма ÷ дни периода:\n",
+    ]
+
+    for i, (addr, gift) in enumerate(rows[:TOP_LIMIT], 1):
+        ton_value = _nano_to_ton(str(gift["nano"]))
+        name = escape_html(gift["name"]) if gift["name"] else "без названия"
+        lines.append(
+            f"{i}. <a href=\"https://getgems.io/nft/{addr}\">{name}</a> — "
+            f"<b>{_format_ton(ton_value)} TON</b> ({gift['count']} плат.) · "
+            f"{_format_rate(ton_value / period_days)} TON/сут"
+        )
+
+    if summary["unlinked_count"]:
+        unlinked = _format_ton(_nano_to_ton(str(summary["unlinked_nano"])))
+        lines.append(
+            f"\nНе привязано к NFT: {summary['unlinked_count']} плат. на {unlinked} TON — "
+            "в топ не попали."
+        )
+
+    lines.append(f"\n<i>{datetime.now(MSK).strftime('%d.%m.%Y %H:%M')}</i>")
+    return "\n".join(lines)
+
+
+async def marketapptop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"/marketapptop вызван, args={context.args}")
+    try:
+        days, rest = _parse_top_days(context.args)
+    except ValueError as e:
+        await update.message.reply_text(
+            f"Неверный период: {e}.\n"
+            "Использование: /marketapptop [дней] [адрес кошелька]\n"
+            "Примеры: /marketapptop — за всё время, /marketapptop 7 — за 7 дней."
+        )
+        return
+
+    resolved = await _resolve_wallet(
+        update,
+        context,
+        "marketapptop",
+        rest,
+        usage=(
+            "Использование: /marketapptop [дней] [адрес кошелька]\n"
+            "Примеры: /marketapptop — за всё время, /marketapptop 7 — за 7 дней."
+        ),
+    )
+    if resolved is None:
+        return
+    wallet, is_owner = resolved
+
+    api_token = context.bot_data.get("MARKETAPP_API_KEY")
+    chat_id = update.message.chat_id
+    if chat_id in _sync_in_progress:
+        await update.message.reply_text(
+            f"Уже выполняется: {_sync_in_progress[chat_id]}. Подожди готовый отчёт."
+        )
+        return
+    _sync_in_progress[chat_id] = "топ подарков"
+
+    await update.message.reply_text(
+        "Собираю топ подарков в фоне — чат не блокирую, отвечу с готовым."
+    )
+    asyncio.create_task(
+        _top_report_task(context.bot, chat_id, wallet, api_token, is_owner, days)
+    )
+
+
+async def _top_report_task(bot, chat_id: int, wallet: str, api_token: str,
+                           is_owner: bool, days: int | None):
+    """Фоновый топ: обогащение NFT по ценам — тот же тяжёлый шаг, что и в отчёте."""
+    try:
+        await _run_top_report(bot, chat_id, wallet, api_token, is_owner, days)
+    except Exception as e:
+        logger.error(f"/marketapptop: фоновый топ упал: {e}", exc_info=True)
+        try:
+            await bot.send_message(chat_id, "Топ прервался из-за ошибки. Попробуй позже.")
+        except Exception:
+            pass
+    finally:
+        _sync_in_progress.pop(chat_id, None)
+
+
+async def _run_top_report(bot, chat_id: int, wallet: str, api_token: str,
+                          is_owner: bool, days: int | None):
+    events = _dedupe_events(await get_all_rent_events(wallet))
+    logger.info(f"/marketapptop: событий в БД={len(events)}, days={days}")
+    if not events:
+        await bot.send_message(chat_id, "По этому кошельку пока нет данных.")
+        return
+
+    has_nft_info = any((e.get("nft_address") or "").strip() for e in events)
+    if not has_nft_info and api_token and is_owner:
+        await bot.send_message(chat_id, "Подбираю NFT по ценам аренды...")
+        try:
+            enriched = await _enrich_by_price(api_token, wallet)
+            if enriched > 0:
+                events = _dedupe_events(await get_all_rent_events(wallet))
+                logger.info(f"/marketapptop: price enrichment обогатил {enriched} событий")
+        except Exception as e:
+            logger.error(f"/marketapptop: price enrichment: {e}", exc_info=True)
+
+    since_ts = _ts_days_ago(days) if days else 0
+    rows, summary = _top_rows(events, since_ts)
+
+    if not summary["count"]:
+        await bot.send_message(chat_id, "За этот период платежей не было.")
+        return
+
+    if not rows:
+        total = _format_ton(_nano_to_ton(str(summary["total_nano"])))
+        await bot.send_message(
+            chat_id,
+            f"За период: <b>{total} TON</b> ({summary['count']} плат.)\n\n"
+            "Не удалось привязать платежи к конкретным подаркам — топ не построить.\n"
+            "Попробуй /marketappgifts: он подбирает NFT по ценам аренды.",
+            parse_mode="HTML",
+        )
+        return
+
+    await bot.send_message(
+        chat_id, _build_top_report(wallet, rows, summary, days), parse_mode="HTML"
+    )
