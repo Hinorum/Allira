@@ -19,6 +19,8 @@ services:
         sync: false
       - key: ADMIN_CHAT_ID
         sync: false
+      - key: ADMIN_USER_IDS
+        sync: false
       - key: PORT
         value: "10000"
       - key: LOG_LEVEL

@@ -36,6 +36,8 @@ Telegram-бот с двумя ИИ-персонажами в крипто-тем
 | `/stop_tournament` | Остановить турнир |
 | `/marketapprent` | Данные по аренде кошелька |
 | `/marketappgifts` | Доход по каждому подарку отдельно |
+| `/ban` | Забанить юзера (реплаем на его сообщение или `/ban <id>`). Только для `ADMIN_USER_IDS` |
+| `/unban` | Разбанить юзера — по тем же правилам |
 
 ## Стек
 
@@ -55,6 +57,7 @@ cp .env.example .env
 | `BOT_TOKEN` | да | Токен от [@BotFather](https://t.me/BotFather) |
 | `OPENROUTER_API_KEY` | да | Ключ [openrouter.ai](https://openrouter.ai/keys) |
 | `ADMIN_CHAT_ID` | нет | Числовой Telegram ID — сюда придут алерты об ошибках |
+| `ADMIN_USER_IDS` | нет | Числовые ID админов через запятую — им доступны `/ban` и `/unban` |
 | `NEWS_CHANNEL_ID` | нет | Канал для автопостинга. Без него автопостинг выключен |
 | `MARKETAPP_API_KEY` | нет | Токен Marketapp для отчётов по аренде |
 | `MARKETAPP_WALLET` | нет | TON-кошелёк, по которому считается доход |

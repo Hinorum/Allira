@@ -16,11 +16,18 @@ class BotConfig:
     toncenter_api_key: str = ""
     tonapi_api_key: str = ""
     admin_chat_id: str = ""
+    admin_user_ids: tuple = ()
     bot_username: str = ""
     bot_id: int = 0
 
     @classmethod
     def from_env(cls) -> "BotConfig":
+        raw_admins = os.getenv("ADMIN_USER_IDS", "").replace(";", ",")
+        admin_ids = tuple(
+            int(part.strip())
+            for part in raw_admins.split(",")
+            if part.strip().lstrip("-").isdigit()
+        )
         return cls(
             bot_token=os.getenv("BOT_TOKEN", ""),
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY", ""),
@@ -29,6 +36,7 @@ class BotConfig:
             lane_model=os.getenv("LANE_MODEL", "google/gemma-4-31b-it:free"),
             news_channel_id=os.getenv("NEWS_CHANNEL_ID", ""),
             admin_chat_id=os.getenv("ADMIN_CHAT_ID", "").strip(),
+            admin_user_ids=admin_ids,
             port=int(os.getenv("PORT", "10000")),
             marketapp_api_key=os.getenv("MARKETAPP_API_KEY", "").strip(),
             marketapp_wallet=os.getenv("MARKETAPP_WALLET", "").strip(),

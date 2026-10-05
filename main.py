@@ -37,6 +37,7 @@ from handlers.message_handler import (
     LAST_SEEN_KEY,
 )
 from handlers.stats_command import stats_command, history_command, leaderboard_command
+from handlers.moderation import ban_command, unban_command
 from handlers.dice_tournament import (
     restore_tournaments,
     start_persist_task,
@@ -221,7 +222,12 @@ async def post_init(application: Application):
         "NEWS_CHANNEL_ID": config.news_channel_id,
         "MARKETAPP_API_KEY": config.marketapp_api_key,
         "MARKETAPP_WALLET": config.marketapp_wallet,
+        "ADMIN_USER_IDS": config.admin_user_ids,
     })
+    if not config.admin_user_ids:
+        logger.warning(
+            "ADMIN_USER_IDS не задан — команды /ban и /unban никому не доступны"
+        )
 
     try:
         await application.bot.delete_webhook(drop_pending_updates=False)
@@ -377,6 +383,8 @@ def main():
     application.add_handler(CommandHandler("clear", clear_context_command))
     application.add_handler(CommandHandler("marketapprent", marketapprent_command))
     application.add_handler(CommandHandler("marketappgifts", marketappgifts_command))
+    application.add_handler(CommandHandler("ban", ban_command))
+    application.add_handler(CommandHandler("unban", unban_command))
 
     application.add_handler(CallbackQueryHandler(
         show_help_callback, pattern="^show_help$"

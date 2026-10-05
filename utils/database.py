@@ -532,8 +532,23 @@ def _sync_is_user_banned(user_id: int) -> bool:
         return bool(row["is_banned"]) if row else False
 
 
+def _sync_set_user_banned(user_id: int, banned: bool):
+    with get_db() as conn:
+        # UPSERT: юзер мог ещё ни разу не писать (бан по id из списка),
+        # тогда UPDATE не затронул бы ни одной строки.
+        conn.execute("""
+            INSERT INTO users (user_id, username, first_name, message_count, is_banned)
+            VALUES (?, NULL, NULL, 0, ?)
+            ON CONFLICT(user_id) DO UPDATE SET is_banned = excluded.is_banned
+        """, (user_id, 1 if banned else 0))
+
+
 async def is_user_banned(user_id: int) -> bool:
     return await asyncio.to_thread(_sync_is_user_banned, user_id)
+
+
+async def set_user_banned(user_id: int, banned: bool):
+    await asyncio.to_thread(_sync_set_user_banned, user_id, banned)
 
 
 def _sync_save_marketapp_profit(period: str, profit_ton: float, raw_response: str = None):
