@@ -95,11 +95,13 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
     if is_private:
         text = message.text.strip()
         if user:
-            await upsert_user(user.id, user.username, user.first_name)
+            # Сначала лимит, потом счётчик: раньше upsert шёл первым и
+            # отклонённые попытки попадали в message_count как активность.
             if not await check_rate_limit(user.id, message.chat_id, DM_COOLDOWN, DM_MAX_PER_MINUTE):
                 await message.reply_text("Слишком часто! Подожди немного.")
                 return
-        logger.info(f"Личное сообщение от {user.username}: {text[:50]}...")
+            await upsert_user(user.id, user.username, user.first_name)
+        logger.info(f"Личное сообщение от {user.username} (len={len(text)})")
     else:
         is_mention = f"@{bot_username}" in message.text if bot_username else False
         is_reply = (message.reply_to_message and
@@ -112,7 +114,7 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
             return
 
         if not (is_mention or is_reply) and random.random() > RESPONSE_CHANCE:
-            logger.info(f"Пропущено (шанс {RESPONSE_CHANCE}): {message.text[:30]}")
+            logger.info(f"Пропущено (шанс {RESPONSE_CHANCE}): {len(message.text)} символов")
             return
 
         if user:

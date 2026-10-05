@@ -1,5 +1,4 @@
 import logging
-import random
 import re
 import time
 import uuid
@@ -346,7 +345,10 @@ def decide_speaker(text: str) -> str:
     elif allira_score > lane_score:
         return "allira"
 
-    return "allira" if random.random() > 0.4 else "lane"
+    # Равный счёт — детерминированный дефолт. Раньше здесь был случайный
+    # выбор: один и тот же текст скалывал то под Аллиру, то под Лэйн, а кэш
+    # ответов (модель + промпт) из-за смены персонажа промахивался вхолостую.
+    return "allira"
 
 async def generate_post_content(topic: str, speaker: str, model: str, api_key: str) -> str:
     if speaker == "allira":
