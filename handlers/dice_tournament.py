@@ -29,6 +29,21 @@ _persist_task: "asyncio.Task | None" = None
 PERSIST_INTERVAL = 2.0
 
 
+def _int_keyed(mapping: dict, field: str) -> dict:
+    """Возвращает словарь с int-ключами: JSON превращает user_id в строки.
+
+    Без этого броски, восстановленные после рестарта, не находились по
+    user.id (int) — игроки «не бросили», хотя кубики уже были засчитаны.
+    """
+    out = {}
+    for key, value in mapping.items():
+        try:
+            out[int(key)] = value
+        except (TypeError, ValueError):
+            logger.warning(f"Нечисловой ключ {key!r} в поле {field} состояния турнира — пропущен")
+    return out
+
+
 async def restore_tournaments():
     """Поднимает активные турниры из БД после рестарта."""
     try:
@@ -39,9 +54,19 @@ async def restore_tournaments():
             state.update(data)
             # id ключей в JSON приходят строками — возвращаем int
             if isinstance(state.get("players"), dict):
-                state["players"] = {int(k): v for k, v in state["players"].items()}
+                state["players"] = _int_keyed(state["players"], "players")
+            if isinstance(state.get("player_rolls_in_round"), dict):
+                state["player_rolls_in_round"] = _int_keyed(
+                    state["player_rolls_in_round"], "player_rolls_in_round"
+                )
             if isinstance(state.get("active_players_in_round"), list):
                 state["active_players_in_round"] = set(state["active_players_in_round"])
+            # JSON отдаёт пары списками, а код рассчитывает на кортежи
+            if isinstance(state.get("round_matches"), list):
+                state["round_matches"] = [
+                    tuple(match) for match in state["round_matches"]
+                    if isinstance(match, (list, tuple)) and len(match) == 2
+                ]
             _tournament_states[chat_id] = state
             if state.get("active"):
                 restored += 1
