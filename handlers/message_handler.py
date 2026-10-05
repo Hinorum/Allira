@@ -1,6 +1,7 @@
 import logging
 import re
 import random
+import time
 from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
@@ -24,6 +25,12 @@ GROUP_MAX_PER_MINUTE = 3
 HISTORY_KEY = "llm_history"
 MAX_HISTORY_TURNS = 8
 MAX_HISTORY_CHARS = 400
+# Реплики старше суток забываются: память жила вечно, и user_data расползался
+# тем больше, чем дольше работал процесс.
+HISTORY_TTL = 24 * 3600
+# Метка последней активности — по ней фоновая задача в main.py чистит
+# user_data давно не писавших юзеров.
+LAST_SEEN_KEY = "_last_activity"
 
 
 def _get_history(context: ContextTypes.DEFAULT_TYPE) -> list[dict]:
@@ -31,6 +38,11 @@ def _get_history(context: ContextTypes.DEFAULT_TYPE) -> list[dict]:
     if not isinstance(history, list):
         history = []
         context.user_data[HISTORY_KEY] = history
+    elif history:
+        cutoff = time.time() - HISTORY_TTL
+        fresh = [turn for turn in history if turn.get("ts", 0) >= cutoff]
+        if len(fresh) != len(history):
+            history[:] = fresh
     return history
 
 
@@ -42,6 +54,7 @@ def _append_history(context: ContextTypes.DEFAULT_TYPE, role: str, text: str, sp
         "role": role,
         "content": text.strip()[:MAX_HISTORY_CHARS],
         "speaker": speaker,
+        "ts": time.time(),
     })
     if len(history) > MAX_HISTORY_TURNS * 2:
         del history[:-MAX_HISTORY_TURNS * 2]
@@ -73,6 +86,11 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
 
     if user and await is_user_banned(user.id):
         return
+
+    if user:
+        # Метка активности: по ней фоновая задача убирает user_data
+        # юзеров, которые давно не писали.
+        context.user_data[LAST_SEEN_KEY] = time.time()
 
     if is_private:
         text = message.text.strip()

@@ -33,6 +33,8 @@ from handlers.message_handler import (
     handle_message,
     handle_private_message,
     _get_history,
+    HISTORY_KEY,
+    LAST_SEEN_KEY,
 )
 from handlers.stats_command import stats_command, history_command, leaderboard_command
 from handlers.dice_tournament import (
@@ -122,6 +124,26 @@ class HealthHandler(BaseHTTPRequestHandler):
         logging.getLogger(__name__).debug("health: " + fmt, *args)
 
 
+USER_DATA_TTL = 7 * 86400
+
+
+async def purge_stale_user_data(context: ContextTypes.DEFAULT_TYPE):
+    """Убирает user_data юзеров, которые не писали больше недели.
+
+    Память диалога живёт в user_data и без этой задачи копилась бы вечно —
+    процесс на бесплатном инстансе держится неделями и расползается.
+    """
+    now = time.time()
+    removed = 0
+    for user_id, data in list(context.application.user_data.items()):
+        last_seen = data.get(LAST_SEEN_KEY, 0) if isinstance(data, dict) else 0
+        if now - last_seen > USER_DATA_TTL:
+            context.application.user_data.pop(user_id, None)
+            removed += 1
+    if removed:
+        logger.info(f"Очищено неактивных профилей памяти: {removed}")
+
+
 async def _collect_health_stats() -> dict:
     total_messages, messages_today, total_users = await asyncio.gather(
         get_stat("total_messages"),
@@ -155,6 +177,10 @@ async def post_init(application: Application):
             logger.info(f"Убрано зависших записей турниров: {removed}")
     except Exception as e:
         logger.warning(f"Прунинг турниров не удался: {e}")
+
+    application.job_queue.run_repeating(
+        purge_stale_user_data, interval=3600, first=1800, name="purge_user_data"
+    )
 
     try:
         bot_info = await application.bot.get_me()
@@ -316,7 +342,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 async def clear_context_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     turns = len(_get_history(context)) // 2
-    context.user_data.clear()
+    # Чистим только память диалога: context.user_data.clear() затирал бы
+    # и остальные ключи пользователя (включая метку активности).
+    context.user_data.pop(HISTORY_KEY, None)
     if turns:
         await update.message.reply_text(
             f"=> Контекст сброшен, забыто {turns} реплик. Начинай с чистого листа."

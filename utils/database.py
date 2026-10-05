@@ -194,6 +194,25 @@ def _sync_upsert_user(user_id: int, username: str = None, first_name: str = None
         """, (user_id, username, first_name))
 
 
+def _maybe_prune(conn: sqlite3.Connection, now: float):
+    """Периодическая чистка служебных таблиц, не чаще раза в 5 минут.
+
+    messages мы чистим по возрасту, а rate_limits — по неактивности: раньше
+    таблица росла на каждую пару (user_id, chat_id) и не удалялась никогда.
+    """
+    last = getattr(_local, "last_prune", 0.0)
+    if now - last <= 300:
+        return
+    _local.last_prune = now
+    conn.execute(
+        "DELETE FROM messages WHERE timestamp < datetime('now', '-30 days')"
+    )
+    conn.execute(
+        "DELETE FROM rate_limits WHERE last_response_time < ? AND minute_start < ?",
+        (now - 3600, now - 3600),
+    )
+
+
 def _sync_log_message(user_id: int, chat_id: int, chat_type: str, speaker: str):
     with get_db() as conn:
         conn.execute("""
@@ -204,18 +223,13 @@ def _sync_log_message(user_id: int, chat_id: int, chat_type: str, speaker: str):
         # Таблица messages росла без прунинга. /stats и get_active_users
         # считают по ней, поэтому на бесплатном инстансе со временем запросы
         # деградировали. Чистим раз в ~1000 записей, не чаще раза в 5 минут.
-        last = getattr(_local, "last_prune", 0.0)
-        now = time.time()
-        if now - last > 300:
-            _local.last_prune = now
-            conn.execute(
-                "DELETE FROM messages WHERE timestamp < datetime('now', '-30 days')"
-            )
+        _maybe_prune(conn, time.time())
 
 
 def _sync_check_rate_limit(user_id: int, chat_id: int, cooldown: float = 3.0, max_per_minute: int = 5) -> bool:
     now = time.time()
     with get_db() as conn:
+        _maybe_prune(conn, now)
         row = conn.execute(
             "SELECT last_response_time, message_count_minute, minute_start FROM rate_limits WHERE user_id=? AND chat_id=?",
             (user_id, chat_id)
