@@ -1,6 +1,7 @@
 import logging
 import random
 import re
+import time
 import uuid
 from cachetools import TTLCache
 from utils.http_client import get_client, with_retry
@@ -18,6 +19,7 @@ FALLBACK_MODELS = [
 ]
 
 _model_failures: dict[str, int] = {}
+_model_last_failure: dict[str, float] = {}
 CIRCUIT_BREAKER_THRESHOLD = 3
 CIRCUIT_BREAKER_RESET = 300
 
@@ -99,14 +101,32 @@ def strip_reasoning(text: str) -> str:
 response_cache = TTLCache(maxsize=100, ttl=300)
 
 def _is_circuit_open(model: str) -> bool:
+    """True, если модель заблокирована после серии ошибок.
+
+    Раньше блокировка была навсегда: счётчик рос, а константа
+    CIRCUIT_BREAKER_RESET не использовалась — после трёх сбоев модель
+    не работала до рестарта процесса. Теперь по истечении паузы
+    пробуем её снова: провайдер мог оправиться.
+    """
     failures = _model_failures.get(model, 0)
-    return failures >= CIRCUIT_BREAKER_THRESHOLD
+    if failures < CIRCUIT_BREAKER_THRESHOLD:
+        return False
+
+    last_failure = _model_last_failure.get(model, 0.0)
+    if time.time() - last_failure >= CIRCUIT_BREAKER_RESET:
+        _model_failures.pop(model, None)
+        _model_last_failure.pop(model, None)
+        logger.info(f"Срок блокировки модели {model} истёк — пробуем снова")
+        return False
+    return True
 
 def _record_failure(model: str):
     _model_failures[model] = _model_failures.get(model, 0) + 1
+    _model_last_failure[model] = time.time()
 
 def _record_success(model: str):
     _model_failures.pop(model, None)
+    _model_last_failure.pop(model, None)
 
 @with_retry(max_retries=2, base_delay=1.0)
 async def _call_openrouter(payload: dict, headers: dict, timeout: float = 25.0):
