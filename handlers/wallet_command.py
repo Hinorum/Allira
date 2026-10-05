@@ -23,6 +23,11 @@ logger = logging.getLogger(__name__)
 
 MAX_SYNC_PAGES = 1000
 
+# Чаты, у которых синк уже идёт. Без этого повторный /marketapprent во время
+# долгого сканирования запускал бы второй параллельный прогон по тому же
+# кошельку — двойная нагрузка на API и дубли в ответах.
+_sync_in_progress: set[int] = set()
+
 
 def _dedupe_events(events: list) -> list:
     seen = set()
@@ -73,20 +78,51 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
     owner_wallet = context.bot_data.get("MARKETAPP_WALLET", "")
     is_owner = bool(owner_wallet and userfriendly_to_raw(owner_wallet) == wallet_raw)
 
+    if update.message.chat_id in _sync_in_progress:
+        await update.message.reply_text(
+            "Синхронизация по этому чату уже идёт — подожди готовый отчёт."
+        )
+        return
+    _sync_in_progress.add(update.message.chat_id)
+
     await update.message.reply_text(
-        f"Синхронизирую историю для кошелька:\n<code>{_escape_html(wallet)}</code>",
+        "Синхронизация запущена в фоне — чат не блокирую, отвечу с готовым отчётом.\n"
+        f"Кошелёк: <code>{_escape_html(wallet)}</code>",
         parse_mode="HTML"
     )
+    asyncio.create_task(
+        _rent_sync_task(context.bot, update.message.chat_id, wallet, api_token, is_owner)
+    )
 
+
+async def _rent_sync_task(bot, chat_id: int, wallet: str, api_token: str, is_owner: bool):
+    """Долгий синк кошелька в фоне.
+
+    Раньше он выполнялся прямо внутри хендлера: сканирование блокчейна
+    (до 1000 страниц) вставало между апдейтами и подвешивало весь бот.
+    """
+    try:
+        await _run_rent_sync(bot, chat_id, wallet, api_token, is_owner)
+    except Exception as e:
+        logger.error(f"/marketapprent: фоновая синхронизация упала: {e}", exc_info=True)
+        try:
+            await bot.send_message(chat_id, "Синхронизация прервалась из-за ошибки. Попробуй позже.")
+        except Exception:
+            pass
+    finally:
+        _sync_in_progress.discard(chat_id)
+
+
+async def _run_rent_sync(bot, chat_id: int, wallet: str, api_token: str, is_owner: bool):
     api_saved = 0
     blockchain_saved = 0
 
-    await update.message.reply_text("Сканирую полную историю из блокчейна...")
+    await bot.send_message(chat_id, "Сканирую полную историю из блокчейна...")
     blockchain_saved = await sync_rent_from_blockchain(wallet, max_pages=MAX_SYNC_PAGES, from_scratch=True)
     logger.info(f"/marketapprent: блокчейн-синк завершён, сохранено={blockchain_saved}")
 
     if api_token and is_owner:
-        await update.message.reply_text("Дополняю метаданными из Marketapp...")
+        await bot.send_message(chat_id, "Дополняю метаданными из Marketapp...")
         try:
             api_saved = await collect_rent_events(api_token, wallet)
         except Exception as e:
@@ -166,13 +202,13 @@ async def marketapprent_command(update: Update, context: ContextTypes.DEFAULT_TY
         pass
 
     lines.append(f"\n<i>{datetime.now(MSK).strftime('%d.%m.%Y %H:%M')}</i>")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
 
     if sorted_events:
-        await send_rent_history(update, sorted_events)
+        await send_rent_history(bot, chat_id, sorted_events)
 
 
-async def send_rent_history(update: Update, events: list):
+async def send_rent_history(bot, chat_id: int, events: list):
     lines = [f"Сдачи в аренду — всего {len(events)} событий:\n"]
     for ev in events:
         amount = _format_ton(_nano_to_ton(ev["price_nano"]))
@@ -189,7 +225,8 @@ async def send_rent_history(update: Update, events: list):
             lines.append(f"  https://getgems.io/nft/{nft_addr}")
 
     payload = "\n".join(lines).encode("utf-8")
-    await update.message.reply_document(
+    await bot.send_document(
+        chat_id=chat_id,
         document=InputFile(io.BytesIO(payload), filename="rent_history.txt"),
         caption=f"Все сдачи в аренду: <b>{len(events)}</b> событий, "
                 f"+{_format_ton(_nano_to_ton(sum(int(ev['price_nano'] or 0) for ev in events)))} TON",

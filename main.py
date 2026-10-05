@@ -378,6 +378,10 @@ def main():
     logger.info("Запуск в режиме polling")
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
+        # Без этого PTB обрабатывает апдейты строго последовательно: один долгий
+        # LLM-запрос или синк кошелька останавливал бы бота для всех юзеров.
+        # Ограниченный семафор — чтобы всплеск не выжег free-лимиты OpenRouter.
+        concurrent_updates=4,
     )
 
 
