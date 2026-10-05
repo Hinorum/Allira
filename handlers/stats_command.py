@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -13,13 +14,17 @@ logger = logging.getLogger(__name__)
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    total_users = await get_total_users()
-    total_tournaments = await get_total_tournaments()
-    messages_today = await get_messages_today()
-    total_messages = await get_stat("total_messages")
-
-    top_users = await get_active_users(days=30, limit=5)
-    top_speakers = await get_top_speakers(limit=3)
+    # Шесть независимых запросов раньше выполнялись последовательно — каждый
+    # это отдельный переход в поток. Собираем разом.
+    (total_users, total_tournaments, messages_today, total_messages,
+     top_users, top_speakers) = await asyncio.gather(
+        get_total_users(),
+        get_total_tournaments(),
+        get_messages_today(),
+        get_stat("total_messages"),
+        get_active_users(days=30, limit=5),
+        get_top_speakers(limit=3),
+    )
 
     # Раньше здесь был Markdown вида "**текст**" без parse_mode — звёздочки
     # доезжали до юзера как есть. Официализируем HTML и экранируем ники.

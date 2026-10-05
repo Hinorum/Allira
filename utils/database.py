@@ -368,7 +368,27 @@ def _sync_get_top_speakers(limit: int = 10) -> list:
 
 
 def _sync_get_active_users(days: int = 7, limit: int = 10) -> list:
+    """Топ активных игроков за указанный период.
+
+    Раньше сортировка шла по users.message_count — накопительному счётчику за
+    всё время, из-за чего подпись «за 30 дней» в /stats не соответствовала
+    ответу. Считаем по журналу messages (он чистится старше 30 дней).
+    """
     with get_db() as conn:
+        rows = conn.execute("""
+            SELECT u.username, u.first_name, COUNT(m.id) AS message_count
+            FROM users u
+            JOIN messages m ON m.user_id = u.user_id
+            WHERE m.timestamp > datetime('now', ?)
+            GROUP BY u.user_id
+            ORDER BY message_count DESC
+            LIMIT ?
+        """, (f"-{days} days", limit)).fetchall()
+        if rows:
+            return [dict(r) for r in rows]
+
+        # Журнал пуст (свежая база или сообщения ещё не логировались) —
+        # откатываемся на накопительный счётчик из users.
         rows = conn.execute("""
             SELECT username, first_name, message_count
             FROM users
