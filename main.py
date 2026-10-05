@@ -5,7 +5,13 @@ import json
 import uuid
 import asyncio
 from dotenv import load_dotenv
-from telegram import Update, InlineQueryResultArticle, InputTextMessageContent
+from telegram import (
+    Update,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
+    BotCommand,
+    BotCommandScopeChat,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -164,6 +170,60 @@ def run_health_server():
     server.serve_forever()
 
 
+# Команды для выпадающего меню "/" — их же Telegram подсказывает при наборе.
+# Ограничения API: до 100 команд, имя до 32 символов (без "/"), подпись до 256.
+BOT_COMMANDS: list[tuple[str, str]] = [
+    ("start", "Меню и приветствие"),
+    ("help", "Как мной пользоваться"),
+    ("marketapptop", "ТОП подарков: сумма и доходность (TON/сут)"),
+    ("marketappgifts", "Доход по каждому подарку отдельно"),
+    ("marketapprent", "Отчёт по аренде кошелька"),
+    ("stats", "Статистика бота"),
+    ("history", "Последние турниры"),
+    ("leaderboard", "Таблица лидеров"),
+    ("clear", "Забыть контекст разговора"),
+    ("start_tournament", "Запустить турнир на кубиках"),
+    ("stop_tournament", "Остановить турнир"),
+]
+
+ADMIN_COMMANDS: list[tuple[str, str]] = [
+    ("ban", "Забанить юзера (реплаем или с его id)"),
+    ("unban", "Разбанить юзера"),
+]
+
+
+def _as_bot_commands(pairs: list[tuple[str, str]]) -> list[BotCommand]:
+    return [BotCommand(name, description) for name, description in pairs]
+
+
+async def setup_bot_commands(bot) -> None:
+    """Команды в меню "/" для всех чатов и отдельный список — для админов.
+
+    Scope у Telegram подменяет список целиком, а не дополняет: у админов в
+    scope должен лежать общий список плюс /ban и /unban, иначе в личке с ботом
+    они бы увидели только модерацию.
+    """
+    try:
+        await bot.set_my_commands(_as_bot_commands(BOT_COMMANDS))
+    except Exception as e:
+        logger.warning(f"Не удалось задать команды меню: {e}")
+        return
+
+    admins = list(config.admin_user_ids)
+    if not admins:
+        return
+    # У BotCommandScopeChat один chat_id (мульти-чат у Telegram в этом scope нет),
+    # поэтому каждому админу отправляем свой список отдельным вызовом.
+    for admin_id in admins:
+        try:
+            await bot.set_my_commands(
+                _as_bot_commands(BOT_COMMANDS + ADMIN_COMMANDS),
+                scope=BotCommandScopeChat(chat_id=admin_id),
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось задать админ-команды для {admin_id}: {e}")
+
+
 async def post_init(application: Application):
     logger.info("Инициализация бота...")
 
@@ -193,6 +253,10 @@ async def post_init(application: Application):
     except Exception as e:
         logger.error(f"Ошибка получения информации о боте: {e}")
         bot_info = None
+
+    # Команды в меню "/" — ставим сразу после get_me, чтобы подсказки появились
+    # у всех пользователей, а не после остальной инициализации.
+    await setup_bot_commands(application.bot)
 
     if config.admin_chat_id and bot_info is not None:
         try:
