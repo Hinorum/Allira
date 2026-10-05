@@ -178,6 +178,15 @@ async def post_init(application: Application):
     else:
         logger.warning("ADMIN_CHAT_ID не задан — алерты об ошибках не придут в Telegram")
 
+    if config.admin_chat_id and not config.admin_chat_id.lstrip("-").isdigit():
+        # @username Телеграм принимает только для публичных супергрупп. Для
+        # личного чата нужен numeric id, иначе алерты молча не приходят.
+        logger.error(
+            f"ADMIN_CHAT_ID={config.admin_chat_id!r} не похож на числовой ID. "
+            f"Алерты придут, только если это публичный @username супергруппы. "
+            f"Для личного чата возьми ID через @userinfobot."
+        )
+
     application.bot_data.update({
         "DEFAULT_MODEL": config.default_model,
         "LANE_MODEL": config.lane_model,

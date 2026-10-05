@@ -54,7 +54,7 @@ cp .env.example .env
 |---|---|---|
 | `BOT_TOKEN` | да | Токен от [@BotFather](https://t.me/BotFather) |
 | `OPENROUTER_API_KEY` | да | Ключ [openrouter.ai](https://openrouter.ai/keys) |
-| `ADMIN_CHAT_ID` | нет | Твой Telegram ID — сюда придут алерты об ошибках |
+| `ADMIN_CHAT_ID` | нет | Числовой Telegram ID — сюда придут алерты об ошибках |
 | `NEWS_CHANNEL_ID` | нет | Канал для автопостинга. Без него автопостинг выключен |
 | `MARKETAPP_API_KEY` | нет | Токен Marketapp для отчётов по аренде |
 | `MARKETAPP_WALLET` | нет | TON-кошелёк, по которому считается доход |
@@ -67,6 +67,9 @@ cp .env.example .env
 | `LOG_LEVEL` | нет | Уровень логирования, по умолчанию `INFO` |
 
 Узнать свой Telegram ID: напиши [@userinfobot](https://t.me/userinfobot).
+Нужен именно **числовой ID** (например `123456789`). `@username` Телеграм
+принимает только для публичных супергрупп, для личного чата не подойдёт — алерты
+просто не придут.
 
 Модели по умолчанию — бесплатные на OpenRouter, но у них есть лимит запросов.
 Частые `429` — сигнал взять платную модель.
