@@ -53,6 +53,59 @@ def userfriendly_to_raw(addr: str) -> str:
     return normalize_ton_address(addr)
 
 
+async def _request_page(
+    label: str,
+    do_request,
+    *,
+    base_delay: float = 2.0,
+    grow_backoff: bool = False,
+):
+    """Общий ретрай одной страницы внешнего API.
+
+    Возвращает распарсенный JSON либо None, если попытки исчерпаны.
+    Раньше эта же конструкция (сеть / 429 / не-200 / битый JSON) была
+    продублирована четырежды: fetch_toncenter_txns, fetch_tonapi_events,
+    страница транзакций и история Marketapp — каждая со своими правками.
+    """
+    client = await get_client()
+    backoff = base_delay
+
+    def _bump():
+        nonlocal backoff
+        if grow_backoff:
+            backoff = min(backoff * 2, 30.0)
+
+    for attempt in range(MAX_PAGE_RETRIES):
+        try:
+            response = await do_request(client)
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+            logger.warning(f"{label} сеть (попытка {attempt + 1}/{MAX_PAGE_RETRIES}): {e}")
+            await asyncio.sleep(backoff)
+            _bump()
+            continue
+
+        if response.status_code == 429:
+            retry_after = int(response.headers.get("Retry-After", "5"))
+            wait = max(retry_after, backoff) if grow_backoff else retry_after
+            logger.warning(f"{label} 429 (попытка {attempt + 1}/{MAX_PAGE_RETRIES}), ожидание {wait}с...")
+            await asyncio.sleep(wait)
+            _bump()
+            continue
+
+        if response.status_code != 200:
+            logger.error(f"{label} статус {response.status_code}: {response.text[:200]}")
+            await asyncio.sleep(backoff)
+            continue
+
+        try:
+            return response.json()
+        except Exception:
+            logger.error(f"{label}: невалидный JSON: {response.text[:80]!r}")
+            await asyncio.sleep(backoff)
+            continue
+    return None
+
+
 @with_retry(max_retries=2, base_delay=5.0)
 async def fetch_toncenter_txns(address: str, limit: int = 100, lt: str = None, hash_val: str = None,
                                api_key: str = None) -> list | None:
@@ -64,43 +117,22 @@ async def fetch_toncenter_txns(address: str, limit: int = 100, lt: str = None, h
     if api_key:
         headers["X-API-Key"] = api_key
 
-    client = await get_client()
-    for attempt in range(MAX_PAGE_RETRIES):
-        try:
-            response = await client.get(
-                f"{TONCENTER_API_URL}/getTransactions",
-                params=params,
-                headers=headers,
-                timeout=20.0
-            )
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
-            logger.warning(f"TON Center сеть (попытка {attempt + 1}/{MAX_PAGE_RETRIES}): {e}")
-            await asyncio.sleep(2.0)
-            continue
+    async def do(client):
+        return await client.get(
+            f"{TONCENTER_API_URL}/getTransactions",
+            params=params,
+            headers=headers,
+            timeout=20.0
+        )
 
-        if response.status_code == 429:
-            retry_after = int(response.headers.get("Retry-After", "5"))
-            logger.warning(f"TON Center 429, ожидание {retry_after}с...")
-            await asyncio.sleep(retry_after)
-            continue
+    data = await _request_page("TON Center", do)
+    if data is None:
+        return None
 
-        if response.status_code != 200:
-            logger.error(f"TON Center API статус {response.status_code}: {response.text[:200]}")
-            await asyncio.sleep(2.0)
-            continue
-
-        try:
-            data = response.json()
-        except Exception:
-            logger.error(f"TON Center API: невалидный JSON (статус {response.status_code}, {response.text[:80]!r})")
-            await asyncio.sleep(2.0)
-            continue
-
-        if not data.get("ok"):
-            logger.error(f"TON Center API: {data}")
-            return None
-        return data.get("result", [])
-    return None
+    if not data.get("ok"):
+        logger.error(f"TON Center API: {data}")
+        return None
+    return data.get("result", [])
 
 
 @with_retry(max_retries=2, base_delay=3.0)
@@ -113,42 +145,21 @@ async def fetch_tonapi_events(address: str, before_lt: str = None, limit: int = 
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    client = await get_client()
-    for attempt in range(MAX_PAGE_RETRIES):
-        try:
-            response = await client.get(
-                f"{TONAPI_API_URL}/accounts/{address}/events",
-                params=params,
-                headers=headers,
-                timeout=20.0
-            )
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
-            logger.warning(f"tonapi сеть (попытка {attempt + 1}/{MAX_PAGE_RETRIES}): {e}")
-            await asyncio.sleep(2.0)
-            continue
+    async def do(client):
+        return await client.get(
+            f"{TONAPI_API_URL}/accounts/{address}/events",
+            params=params,
+            headers=headers,
+            timeout=20.0
+        )
 
-        if response.status_code == 429:
-            retry_after = int(response.headers.get("Retry-After", "5"))
-            logger.warning(f"tonapi 429 (попытка {attempt + 1}/{MAX_PAGE_RETRIES}), ожидание {retry_after}с...")
-            await asyncio.sleep(retry_after)
-            continue
+    data = await _request_page("tonapi", do)
+    if data is None:
+        return None
 
-        if response.status_code != 200:
-            logger.error(f"tonapi статус {response.status_code}: {response.text[:200]}")
-            await asyncio.sleep(2.0)
-            continue
-
-        try:
-            data = response.json()
-        except Exception:
-            logger.error(f"tonapi: невалидный JSON (статус {response.status_code}, {response.text[:80]!r})")
-            await asyncio.sleep(2.0)
-            continue
-
-        events = data.get("events") or []
-        logger.info(f"tonapi: страница перед lt={before_lt or 'begin'} — служебных событий {len(events)}")
-        return events
-    return None
+    events = data.get("events") or []
+    logger.info(f"tonapi: страница перед lt={before_lt or 'begin'} — служебных событий {len(events)}")
+    return events
 
 
 def _tonapi_extract_rent(event: dict, raw_wallet: str) -> dict | None:
@@ -290,12 +301,9 @@ async def _sync_from_toncenter(wallet: str, max_pages: int = 50, from_scratch: b
         if pages > 0:
             await asyncio.sleep(1.0 if not api_key else 0.3)
 
-        items = None
-        for attempt in range(MAX_PAGE_RETRIES):
-            items = await fetch_toncenter_txns(wallet, limit=100, lt=cur_lt, hash_val=cur_hash, api_key=api_key)
-            if items is not None:
-                break
-            await asyncio.sleep(2.0)
+        # fetch_toncenter_txns уже ретраит страницу внутри себя — раньше здесь
+        # стоял второй такой же цикл, и одна страница могла породить до 9 запросов.
+        items = await fetch_toncenter_txns(wallet, limit=100, lt=cur_lt, hash_val=cur_hash, api_key=api_key)
 
         if items is None:
             logger.error("TON Center недоступен — история синхронизирована не полностью")
@@ -400,46 +408,23 @@ async def fetch_rent_history(api_token: str, category: str, limit: int = 100,
         "User-Agent": "AlliraBot/1.0"
     }
 
-    client = await get_client()
-    backoff = 3.0
-    for attempt in range(MAX_PAGE_RETRIES):
-        try:
-            response = await client.get(
-                f"{MARKETAPP_API_URL}/v1/rent/{category}/history/",
-                params=params,
-                headers=headers,
-                timeout=15.0
-            )
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
-            logger.warning(f"Marketapp сеть (попытка {attempt + 1}/{MAX_PAGE_RETRIES}): {e}")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 30.0)
-            continue
+    async def do(client):
+        return await client.get(
+            f"{MARKETAPP_API_URL}/v1/rent/{category}/history/",
+            params=params,
+            headers=headers,
+            timeout=15.0
+        )
 
-        if response.status_code == 429:
-            retry_after = int(response.headers.get("Retry-After", "5"))
-            wait = max(retry_after, backoff)
-            logger.warning(f"Marketapp API 429 (попытка {attempt + 1}/{MAX_PAGE_RETRIES}), ожидание {wait}с...")
-            await asyncio.sleep(wait)
-            backoff = min(backoff * 2, 30.0)
-            continue
+    data = await _request_page(
+        f"Marketapp ({category}/history)", do, base_delay=3.0, grow_backoff=True
+    )
+    if data is None:
+        return None, None
 
-        if response.status_code != 200:
-            logger.error(f"Marketapp API статус {response.status_code} ({category}/history): {response.text[:200]}")
-            await asyncio.sleep(backoff)
-            continue
-
-        try:
-            data = response.json()
-        except Exception:
-            logger.error("Marketapp API: невалидный JSON")
-            await asyncio.sleep(backoff)
-            continue
-
-        items = data.get("items", [])
-        next_cursor = data.get("cursor") or data.get("next_cursor") or data.get("next_cursor_url") or None
-        return items, next_cursor
-    return None, None
+    items = data.get("items", [])
+    next_cursor = data.get("cursor") or data.get("next_cursor") or data.get("next_cursor_url") or None
+    return items, next_cursor
 
 
 async def fetch_income_for_period(api_token: str, since_ts: int, wallet: str = "") -> float:
