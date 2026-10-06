@@ -58,7 +58,7 @@ from handlers.dice_tournament import (
     start_tournament_from_menu,
 )
 from tasks.autoposting import setup_autoposting
-from tasks.marketapp_reports import setup_marketapp_jobs
+from tasks.marketapp_reports import setup_marketapp_jobs, LAST_LINKAGE
 
 load_dotenv()
 setup_logging()
@@ -168,6 +168,15 @@ async def _collect_health_stats() -> dict:
         "rent_events": rent["total"],
         "rent_events_linked": rent["linked"],
         "rent_events_last_ts": rent["last_ts"],
+        # Чем закончилась последняя попытка привязать платежи к подаркам:
+        # collected — сколько записей вернул Marketapp, matched — сколько
+        # совпало с блокчейном, error — причина, если упала.
+        "linkage": {
+            "age_s": int(time.time() - LAST_LINKAGE["at"]) if LAST_LINKAGE["at"] else None,
+            "collected": LAST_LINKAGE["collected"],
+            "matched": LAST_LINKAGE["matched"],
+            "error": LAST_LINKAGE["error"],
+        },
         # Только признаки «задано/не задано», сами секреты не отдаются.
         "config": {
             "marketapp_wallet": bool(config.marketapp_wallet),

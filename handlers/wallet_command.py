@@ -349,6 +349,12 @@ async def _ensure_rent_data(bot, chat_id: int, wallet: str, api_token: str, is_o
             logger.info(f"_ensure_rent_data: полный синк завершён, сохранено={saved}")
         except Exception as e:
             logger.error(f"_ensure_rent_data: синк упал: {e}", exc_info=True)
+            await bot.send_message(
+                chat_id,
+                "Синхронизация из блокчейна не удалась: "
+                f"<code>{escape_html(str(e)[:200])}</code>",
+                parse_mode="HTML",
+            )
         events = _dedupe_events(await get_all_rent_events(wallet))
         if not events:
             return events
@@ -360,6 +366,12 @@ async def _ensure_rent_data(bot, chat_id: int, wallet: str, api_token: str, is_o
             logger.info(f"_ensure_rent_data: marketapp-привязка, совпало={matched}")
         except Exception as e:
             logger.error(f"_ensure_rent_data: marketapp-привязка упала: {e}", exc_info=True)
+            await bot.send_message(
+                chat_id,
+                "Привязка через Marketapp не удалась: "
+                f"<code>{escape_html(str(e)[:200])}</code>",
+                parse_mode="HTML",
+            )
         events = _dedupe_events(await get_all_rent_events(wallet))
 
         if events and _count_linked(events) == 0:
@@ -372,6 +384,12 @@ async def _ensure_rent_data(bot, chat_id: int, wallet: str, api_token: str, is_o
                     logger.info(f"_ensure_rent_data: enrich по цене привязал {enriched}")
             except Exception as e:
                 logger.error(f"_ensure_rent_data: enrich по цене упал: {e}", exc_info=True)
+                await bot.send_message(
+                    chat_id,
+                    "Привязка по цене аренды не удалась: "
+                    f"<code>{escape_html(str(e)[:200])}</code>",
+                    parse_mode="HTML",
+                )
 
     return events
 

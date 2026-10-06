@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 import httpx
 from datetime import datetime, timedelta, timezone, time as dt_time
 from telegram.ext import ContextTypes
@@ -24,6 +25,22 @@ MAX_PAGE_RETRIES = 3
 MAX_HISTORY_PAGES = 200
 
 MSK = timezone(timedelta(hours=3))
+
+# Последняя попытка привязать платежи к подаркам (collect/обогащение) —
+# отдаётся в /health. Без неё «топ не построить» приходилось расшифровывать
+# по логам: здесь сразу видно, была ли попытка, сколько записей собрано,
+# сколько совпало и с какой ошибкой упала.
+LAST_LINKAGE: dict = {"at": 0, "collected": 0, "matched": 0, "error": ""}
+
+
+def record_linkage(collected: int | None = None, matched: int | None = None,
+                   error: str = "") -> None:
+    if collected is not None:
+        LAST_LINKAGE["collected"] = int(collected)
+    if matched is not None:
+        LAST_LINKAGE["matched"] = int(matched)
+    LAST_LINKAGE["error"] = (error or "")[:300]
+    LAST_LINKAGE["at"] = int(time.time())
 
 
 def _format_ton(value: float) -> str:
@@ -543,10 +560,12 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
             cursor = next_cursor
 
     logger.info(f"marketapp: собрано записей по кошельку: {len(collected)}")
+    record_linkage(collected=len(collected), matched=0)
     if not collected:
         return 0
 
     enriched = await enrich_blockchain_events(collected, wallet)
+    record_linkage(collected=len(collected), matched=enriched)
     logger.info(f"marketapp: enrich совпадений с блокчейн-событиями: {enriched} из {len(collected)}")
     if enriched:
         logger.info(f"Дополнено метаданными из Marketapp: {enriched}")
@@ -560,11 +579,13 @@ async def sync_rent_events_job(context: ContextTypes.DEFAULT_TYPE):
         wallet = bot_data.get("MARKETAPP_WALLET", "")
 
         if not api_token or not wallet:
+            record_linkage(error="нет MARKETAPP_API_KEY или MARKETAPP_WALLET")
             return
 
         await collect_rent_events(api_token, wallet)
     except Exception as e:
         logger.error(f"Ошибка сбора событий аренды: {e}", exc_info=True)
+        record_linkage(error=f"{type(e).__name__}: {e}")
 
 
 def format_daily_report(current_profit: float, previous_profit: float | None) -> str:
