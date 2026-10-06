@@ -318,6 +318,85 @@ async def _enrich_by_price(api_token: str, wallet: str) -> int:
     return await asyncio.to_thread(_do_enrich)
 
 
+def _count_linked(events: list) -> int:
+    """Сколько платежей привязано к конкретному подарку (есть nft_address)."""
+    return sum(1 for e in events if (e.get("nft_address") or "").strip())
+
+
+async def _ensure_rent_data(bot, chat_id: int, wallet: str, api_token: str, is_owner: bool) -> list:
+    """События аренды с гарантией, что база заполнена и платежи привязаны к NFT.
+
+    Free-план Render не даёт постоянного диска: SQLite стирается при каждом
+    деплое. Фоновые джобы добывают только новые платежи «сверху» истории, а
+    полную историю делает только from_scratch-синк — раньше его запускал
+    исключительно /marketapprent, поэтому /marketapptop и /marketappgifts
+    после деплоя отвечали «нет данных». Теперь отчёты сами запускают тот же
+    синк и привязку, что и ручная команда.
+    """
+    events = _dedupe_events(await get_all_rent_events(wallet))
+
+    if not events:
+        await bot.send_message(
+            chat_id,
+            "База пуста (Render стирает её при каждом деплое) — запускаю полную "
+            "синхронизацию истории, это займёт до нескольких минут.\n"
+            "Отвечу с готовым отчётом, команду не перезапускай.",
+        )
+        try:
+            saved = await sync_rent_from_blockchain(
+                wallet, max_pages=MAX_SYNC_PAGES, from_scratch=True
+            )
+            logger.info(f"_ensure_rent_data: полный синк завершён, сохранено={saved}")
+        except Exception as e:
+            logger.error(f"_ensure_rent_data: синк упал: {e}", exc_info=True)
+        events = _dedupe_events(await get_all_rent_events(wallet))
+        if not events:
+            return events
+
+    if events and _count_linked(events) == 0 and api_token and is_owner:
+        await bot.send_message(chat_id, "Привязываю платежи к подаркам через Marketapp...")
+        try:
+            matched = await collect_rent_events(api_token, wallet)
+            logger.info(f"_ensure_rent_data: marketapp-привязка, совпало={matched}")
+        except Exception as e:
+            logger.error(f"_ensure_rent_data: marketapp-привязка упала: {e}", exc_info=True)
+        events = _dedupe_events(await get_all_rent_events(wallet))
+
+        if events and _count_linked(events) == 0:
+            # Точный матч не сработал — пробуем примерять по цене аренды
+            # (медленный перебор events × nfts × 30 дней, но зато без истории).
+            try:
+                enriched = await _enrich_by_price(api_token, wallet)
+                if enriched:
+                    events = _dedupe_events(await get_all_rent_events(wallet))
+                    logger.info(f"_ensure_rent_data: enrich по цене привязал {enriched}")
+            except Exception as e:
+                logger.error(f"_ensure_rent_data: enrich по цене упал: {e}", exc_info=True)
+
+    return events
+
+
+def _no_linkage_reason(api_token: str, is_owner: bool) -> str:
+    """Почему платежи нельзя разложить по подаркам — для сообщения юзеру."""
+    if not api_token:
+        return "не задан MARKETAPP_API_KEY"
+    if not is_owner:
+        return "кошелёк не совпадает с MARKETAPP_WALLET — привязка доступна только для своего"
+    return "Marketapp не вернул совпадений (подробности в логах Render)"
+
+
+async def _send_no_linkage(bot, chat_id: int, events: list, api_token: str, is_owner: bool):
+    total = _format_ton(_nano_to_ton(str(sum(int(e.get("price_nano", 0) or 0) for e in events))))
+    await bot.send_message(
+        chat_id,
+        f"В базе {len(events)} платежей на {total} TON, но ни один не привязан к подарку:\n"
+        f"{_no_linkage_reason(api_token, is_owner)}.\n\n"
+        "Без привязки к NFT разложить доход по подаркам нельзя — суммы по кошельку "
+        "смотри в /marketapprent.",
+        parse_mode="HTML",
+    )
+
+
 async def marketappgifts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"/marketappgifts вызван, args={context.args}")
     resolved = await _resolve_wallet(update, context, "marketappgifts")
@@ -363,23 +442,18 @@ async def _gifts_report_task(bot, chat_id: int, wallet: str, api_token: str, is_
 
 
 async def _run_gifts_report(bot, chat_id: int, wallet: str, api_token: str, is_owner: bool):
-    events = _dedupe_events(await get_all_rent_events(wallet))
-    logger.info(f"/marketappgifts: событий в БД={len(events)}, "
-                f"с-подарком={sum(1 for e in events if (e.get('nft_address') or '').strip())}")
+    # Сами наполняем базу при деплое-обнулении и привязываем платежи к NFT
+    events = await _ensure_rent_data(bot, chat_id, wallet, api_token, is_owner)
+    logger.info(f"/marketappgifts: событий в БД={len(events)}, с-подарком={_count_linked(events)}")
     if not events:
-        await bot.send_message(chat_id, "По этому кошельку пока нет данных.")
+        await bot.send_message(
+            chat_id,
+            f"Платежей по кошельку <code>{escape_html(wallet)}</code> нет даже после "
+            "полной синхронизации.\n"
+            "Проверь MARKETAPP_WALLET и запусти /marketapprent — он покажет период сбора.",
+            parse_mode="HTML",
+        )
         return
-
-    has_nft_info = any((e.get("nft_address") or "").strip() for e in events)
-    if not has_nft_info and api_token and is_owner:
-        await bot.send_message(chat_id, "Подбираю NFT по ценам аренды...")
-        try:
-            enriched = await _enrich_by_price(api_token, wallet)
-            if enriched > 0:
-                events = _dedupe_events(await get_all_rent_events(wallet))
-                logger.info(f"/marketappgifts: price enrichment обогатил {enriched} событий")
-        except Exception as e:
-            logger.error(f"/marketappgifts: price enrichment: {e}", exc_info=True)
 
     per_gift = OrderedDict()
     for ev in events:
@@ -398,8 +472,9 @@ async def _run_gifts_report(bot, chat_id: int, wallet: str, api_token: str, is_o
         await bot.send_message(
             chat_id,
             f"Общий доход: <b>{total_ton} TON</b> ({len(events)} событий)\n\n"
-            "Не удалось привязать платежи к конкретным NFT.\n"
-            "Возможно, NFT уже не в аренде или цены не совпали.",
+            f"Причина: {_no_linkage_reason(api_token, is_owner)}.\n"
+            "Платежи не привязаны к конкретным подаркам — разложить доход по ним нельзя, "
+            "суммы по кошельку смотри в /marketapprent.",
             parse_mode="HTML",
         )
         return
@@ -609,22 +684,19 @@ async def _top_report_task(bot, chat_id: int, wallet: str, api_token: str,
 
 async def _run_top_report(bot, chat_id: int, wallet: str, api_token: str,
                           is_owner: bool, days: int | None):
-    events = _dedupe_events(await get_all_rent_events(wallet))
-    logger.info(f"/marketapptop: событий в БД={len(events)}, days={days}")
+    # Сами наполняем базу при деплое-обнулении и привязываем платежи к NFT
+    events = await _ensure_rent_data(bot, chat_id, wallet, api_token, is_owner)
+    logger.info(f"/marketapptop: событий в БД={len(events)}, "
+                f"с-подарком={_count_linked(events)}, days={days}")
     if not events:
-        await bot.send_message(chat_id, "По этому кошельку пока нет данных.")
+        await bot.send_message(
+            chat_id,
+            f"Платежей по кошельку <code>{escape_html(wallet)}</code> нет даже после "
+            "полной синхронизации.\n"
+            "Проверь MARKETAPP_WALLET и запусти /marketapprent — он покажет период сбора.",
+            parse_mode="HTML",
+        )
         return
-
-    has_nft_info = any((e.get("nft_address") or "").strip() for e in events)
-    if not has_nft_info and api_token and is_owner:
-        await bot.send_message(chat_id, "Подбираю NFT по ценам аренды...")
-        try:
-            enriched = await _enrich_by_price(api_token, wallet)
-            if enriched > 0:
-                events = _dedupe_events(await get_all_rent_events(wallet))
-                logger.info(f"/marketapptop: price enrichment обогатил {enriched} событий")
-        except Exception as e:
-            logger.error(f"/marketapptop: price enrichment: {e}", exc_info=True)
 
     since_ts = _ts_days_ago(days) if days else 0
     rows, summary = _top_rows(events, since_ts)
@@ -634,14 +706,8 @@ async def _run_top_report(bot, chat_id: int, wallet: str, api_token: str,
         return
 
     if not rows:
-        total = _format_ton(_nano_to_ton(str(summary["total_nano"])))
-        await bot.send_message(
-            chat_id,
-            f"За период: <b>{total} TON</b> ({summary['count']} плат.)\n\n"
-            "Не удалось привязать платежи к конкретным подаркам — топ не построить.\n"
-            "Попробуй /marketappgifts: он подбирает NFT по ценам аренды.",
-            parse_mode="HTML",
-        )
+        period_events = [e for e in events if int(e.get("ts", 0) or 0) >= since_ts]
+        await _send_no_linkage(bot, chat_id, period_events, api_token, is_owner)
         return
 
     await bot.send_message(
