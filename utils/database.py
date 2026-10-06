@@ -852,15 +852,27 @@ def _sync_get_rent_events_stats() -> dict:
     with get_db() as conn:
         row = conn.execute(
             "SELECT COUNT(*) AS total, "
+            "COUNT(DISTINCT tx_hash) AS distinct_hash, "
             "COALESCE(SUM(CASE WHEN nft_address IS NOT NULL AND nft_address <> '' "
             "THEN 1 ELSE 0 END), 0) AS linked, "
             "COALESCE(MAX(ts), 0) AS last_ts "
             "FROM marketapp_rent_events"
         ).fetchone()
+        by_source = {
+            (r["source"] or "-"): int(r["n"])
+            for r in conn.execute(
+                "SELECT COALESCE(NULLIF(source, ''), '-') AS source, COUNT(*) AS n "
+                "FROM marketapp_rent_events GROUP BY source"
+            ).fetchall()
+        }
         return {
             "total": int(row["total"] or 0),
+            # Дубли по хешу = один платёж, записанный дважды: total при
+            # существенно меньшем distinct_hash означает раздутый «доход».
+            "distinct_hash": int(row["distinct_hash"] or 0),
             "linked": int(row["linked"] or 0),
             "last_ts": int(row["last_ts"] or 0),
+            "by_source": by_source,
         }
 
 

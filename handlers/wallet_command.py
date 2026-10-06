@@ -484,6 +484,11 @@ async def _run_gifts_report(bot, chat_id: int, wallet: str, api_token: str, is_o
         entry["count"] += 1
 
     total_nano = sum(int(e.get("price_nano", 0) or 0) for e in events)
+    gifts_nano = sum(g["nano"] for g in per_gift.values())
+    linked_count = sum(g["count"] for g in per_gift.values())
+    unlinked_nano = total_nano - gifts_nano
+    unlinked_count = len(events) - linked_count
+
     total_ton = _format_ton(_nano_to_ton(str(total_nano)))
 
     if not per_gift:
@@ -497,9 +502,19 @@ async def _run_gifts_report(bot, chat_id: int, wallet: str, api_token: str, is_o
         )
         return
 
+    # Сумма по списку и общий доход — разные числа (непривязанные платежи в
+    # список не входят). Показываем оба явно, иначе заголовок «46 NFT / 41.53»
+    # не сходился с суммой строк списка.
+    summary_line = f"Всего платежей: {total_ton} TON · {len(events)} плат."
+    if unlinked_count:
+        summary_line += (
+            f" — не привязано {unlinked_count} плат. "
+            f"на {_format_ton(_nano_to_ton(str(unlinked_nano)))} TON"
+        )
     header = (
         f"<b>Доход по подаркам</b> ({wallet[:10]}...): "
-        f"{len(per_gift)} NFT / {total_ton} TON\n"
+        f"{len(per_gift)} NFT / {_format_ton(_nano_to_ton(str(gifts_nano)))} TON\n"
+        f"{summary_line}\n"
     )
     lines = [header]
     current_len = len(header)
@@ -612,13 +627,19 @@ def _build_top_report(wallet: str, rows: list, summary: dict, days: int | None) 
 
     title = f"за {days} дн." if days else "за всё время"
     total = _format_ton(_nano_to_ton(str(summary["total_nano"])))
+    # Доход за период и доход, разложенный по подаркам, — разные числа:
+    # непривязанные платежи считаются в общем итоге, но в топ не попадают.
+    linked_nano = summary["total_nano"] - summary["unlinked_nano"]
+    linked_count = summary["count"] - summary["unlinked_count"]
     lines = [
         f"<b>ТОП подарков {title}</b>",
         f"Кошелёк: <code>{escape_html(wallet)}</code>",
         f"Период: {datetime.fromtimestamp(summary['first_ts'], MSK).strftime('%d.%m.%Y')} — "
         f"{datetime.fromtimestamp(summary['last_ts'], MSK).strftime('%d.%m.%Y')} "
         f"({period_days:.0f} дн.)",
-        f"Доход: <b>{total} TON</b> · {summary['count']} плат. · {len(rows)} подарков",
+        f"Доход за период: <b>{total} TON</b> · {summary['count']} плат.",
+        f"Привязано к подаркам: <b>{_format_ton(_nano_to_ton(str(linked_nano)))} TON</b> · "
+        f"{linked_count} плат. · {len(rows)} подарков",
         f"Топ-{min(TOP_LIMIT, len(rows))} по сумме, доходность = сумма ÷ дни периода:\n",
     ]
 

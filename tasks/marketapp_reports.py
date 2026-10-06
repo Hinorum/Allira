@@ -30,15 +30,17 @@ MSK = timezone(timedelta(hours=3))
 # отдаётся в /health. Без неё «топ не построить» приходилось расшифровывать
 # по логам: здесь сразу видно, была ли попытка, сколько записей собрано,
 # сколько совпало и с какой ошибкой упала.
-LAST_LINKAGE: dict = {"at": 0, "collected": 0, "matched": 0, "error": ""}
+LAST_LINKAGE: dict = {"at": 0, "collected": 0, "matched": 0, "error": "", "categories": {}}
 
 
 def record_linkage(collected: int | None = None, matched: int | None = None,
-                   error: str = "") -> None:
+                   error: str = "", categories: dict | None = None) -> None:
     if collected is not None:
         LAST_LINKAGE["collected"] = int(collected)
     if matched is not None:
         LAST_LINKAGE["matched"] = int(matched)
+    if categories is not None:
+        LAST_LINKAGE["categories"] = dict(categories)
     LAST_LINKAGE["error"] = (error or "")[:300]
     LAST_LINKAGE["at"] = int(time.time())
 
@@ -501,6 +503,7 @@ async def fetch_my_rented(api_token: str) -> list | None:
 async def collect_rent_events(api_token: str, wallet: str) -> int:
     raw_wallet = userfriendly_to_raw(wallet)
     collected = []
+    by_cat: dict[str, int] = {}  # сколько записей дал каждая категория — в /health
 
     known = await get_all_rent_events(wallet)
     min_ts = min((int(e.get("ts", 0) or 0) for e in known), default=0)
@@ -511,6 +514,7 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
             await asyncio.sleep(5)
         cursor = None
         page_delay = 3.0
+        collected_before = len(collected)
         for page in range(MAX_HISTORY_PAGES):
             if page > 0:
                 await asyncio.sleep(page_delay)
@@ -559,13 +563,15 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
                 break
             cursor = next_cursor
 
-    logger.info(f"marketapp: собрано записей по кошельку: {len(collected)}")
-    record_linkage(collected=len(collected), matched=0)
+        by_cat[category] = len(collected) - collected_before
+
+    logger.info(f"marketapp: собрано записей по кошельку: {len(collected)} по категориям={by_cat}")
+    record_linkage(collected=len(collected), matched=0, categories=by_cat)
     if not collected:
         return 0
 
     enriched = await enrich_blockchain_events(collected, wallet)
-    record_linkage(collected=len(collected), matched=enriched)
+    record_linkage(collected=len(collected), matched=enriched, categories=by_cat)
     logger.info(f"marketapp: enrich совпадений с блокчейн-событиями: {enriched} из {len(collected)}")
     if enriched:
         logger.info(f"Дополнено метаданными из Marketapp: {enriched}")

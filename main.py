@@ -166,8 +166,10 @@ async def _collect_health_stats() -> dict:
         # Диагностика «нет данных» в отчётах: SQLite на Render стирается при
         # каждом деплое, и по этим счётчикам видно, наполнилась ли база аренды.
         "rent_events": rent["total"],
+        "rent_events_distinct": rent["distinct_hash"],
         "rent_events_linked": rent["linked"],
         "rent_events_last_ts": rent["last_ts"],
+        "rent_events_by_source": rent["by_source"],
         # Чем закончилась последняя попытка привязать платежи к подаркам:
         # collected — сколько записей вернул Marketapp, matched — сколько
         # совпало с блокчейном, error — причина, если упала.
@@ -175,6 +177,7 @@ async def _collect_health_stats() -> dict:
             "age_s": int(time.time() - LAST_LINKAGE["at"]) if LAST_LINKAGE["at"] else None,
             "collected": LAST_LINKAGE["collected"],
             "matched": LAST_LINKAGE["matched"],
+            "categories": LAST_LINKAGE["categories"],
             "error": LAST_LINKAGE["error"],
         },
         # Только признаки «задано/не задано», сами секреты не отдаются.
