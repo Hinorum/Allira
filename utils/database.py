@@ -865,6 +865,16 @@ def _sync_get_rent_events_stats() -> dict:
                 "FROM marketapp_rent_events GROUP BY source"
             ).fetchall()
         }
+        # Проверка единиц duration (в днях ли он): сумма платежей на сумму
+        # сроков даёт среднюю дневную ставку — правдоподобное значение
+        # подтверждает, что доходность по сроку считается верно.
+        dur = conn.execute(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(duration), 0) AS days, "
+            "COALESCE(SUM(CAST(price_nano AS REAL)), 0) AS nano "
+            "FROM marketapp_rent_events WHERE duration BETWEEN 1 AND 366"
+        ).fetchone()
+        dur_days = int(dur["days"] or 0)
+        dur_ton = (dur["nano"] or 0) / 1_000_000_000
         return {
             "total": int(row["total"] or 0),
             # Дубли по хешу = один платёж, записанный дважды: total при
@@ -873,6 +883,12 @@ def _sync_get_rent_events_stats() -> dict:
             "linked": int(row["linked"] or 0),
             "last_ts": int(row["last_ts"] or 0),
             "by_source": by_source,
+            "duration": {
+                "events": int(dur["n"] or 0),
+                "days": dur_days,
+                "ton": round(dur_ton, 4),
+                "ton_per_day": round(dur_ton / dur_days, 6) if dur_days else None,
+            },
         }
 
 

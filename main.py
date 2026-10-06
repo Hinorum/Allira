@@ -170,6 +170,7 @@ async def _collect_health_stats() -> dict:
         "rent_events_linked": rent["linked"],
         "rent_events_last_ts": rent["last_ts"],
         "rent_events_by_source": rent["by_source"],
+        "rent_duration": rent["duration"],
         # Чем закончилась последняя попытка привязать платежи к подаркам:
         # collected — сколько записей вернул Marketapp, matched — сколько
         # совпало с блокчейном, error — причина, если упала.

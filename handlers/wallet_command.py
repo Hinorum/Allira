@@ -605,9 +605,15 @@ def _top_rows(events: list, since_ts: int) -> tuple[list, dict]:
             summary["unlinked_nano"] += nano
             continue
         name = (ev.get("nft_name") or "").strip()
-        entry = per_gift.setdefault(addr, {"name": name, "nano": 0, "count": 0})
+        entry = per_gift.setdefault(addr, {"name": name, "nano": 0, "count": 0, "days": 0})
         entry["nano"] += nano
         entry["count"] += 1
+        # Срок аренды в днях из Marketapp. Считаем только правдоподобные
+        # значения: если вдруг придут секунды/часы, такие строки молча
+        # откатятся к доходности по дням периода.
+        duration = int(ev.get("duration", 0) or 0)
+        if 1 <= duration <= 366:
+            entry["days"] += duration
 
     rows = sorted(per_gift.items(), key=lambda kv: kv[1]["nano"], reverse=True)
     return rows, summary
@@ -640,16 +646,36 @@ def _build_top_report(wallet: str, rows: list, summary: dict, days: int | None) 
         f"Доход за период: <b>{total} TON</b> · {summary['count']} плат.",
         f"Привязано к подаркам: <b>{_format_ton(_nano_to_ton(str(linked_nano)))} TON</b> · "
         f"{linked_count} плат. · {len(rows)} подарков",
-        f"Топ-{min(TOP_LIMIT, len(rows))} по сумме, доходность = сумма ÷ дни периода:\n",
+        f"Топ-{min(TOP_LIMIT, len(rows))} по сумме, доходность = сумма ÷ срок аренды:\n",
     ]
 
+    period_fallback = False
     for i, (addr, gift) in enumerate(rows[:TOP_LIMIT], 1):
         ton_value = _nano_to_ton(str(gift["nano"]))
         name = escape_html(gift["name"]) if gift["name"] else "без названия"
+        days = int(gift.get("days", 0) or 0)
+        if days:
+            # Реальный срок аренды: 3.00 TON за 30 дней = 0.100 TON/сут.
+            rate = ton_value / days
+            term = f"{gift['count']} плат., {days} дн."
+            mark = ""
+        else:
+            # Срока в данных нет — считаем от периода и помечаем, чтобы
+            # число можно было воспроизвести, а не гадать, откуда оно.
+            rate = ton_value / period_days
+            term = f"{gift['count']} плат."
+            mark = "*"
+            period_fallback = True
         lines.append(
             f"{i}. <a href=\"https://getgems.io/nft/{addr}\">{name}</a> — "
-            f"<b>{_format_ton(ton_value)} TON</b> ({gift['count']} плат.) · "
-            f"{_format_rate(ton_value / period_days)} TON/сут"
+            f"<b>{_format_ton(ton_value)} TON</b> ({term}) · "
+            f"{_format_rate(rate)} TON/сут{mark}"
+        )
+
+    if period_fallback:
+        lines.append(
+            f"\n* срок аренды неизвестен — доходность таких строк отнесена "
+            f"к дням периода ({period_days:.0f} дн.)"
         )
 
     if summary["unlinked_count"]:
