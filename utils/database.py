@@ -837,5 +837,31 @@ async def get_all_rent_events(wallet: str = "") -> list:
     return await asyncio.to_thread(_sync_get_all_rent_events, wallet)
 
 
+def _sync_get_rent_events_stats() -> dict:
+    """Счётчики базы аренды для /health и диагностики.
+
+    Render (free) не даёт постоянного диска: SQLite стирается при каждом
+    деплое, и без этих чисел «нет данных» в отчётах приходится выяснять
+    вслепую по логам и репликам бота.
+    """
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS total, "
+            "COALESCE(SUM(CASE WHEN nft_address IS NOT NULL AND nft_address <> '' "
+            "THEN 1 ELSE 0 END), 0) AS linked, "
+            "COALESCE(MAX(ts), 0) AS last_ts "
+            "FROM marketapp_rent_events"
+        ).fetchone()
+        return {
+            "total": int(row["total"] or 0),
+            "linked": int(row["linked"] or 0),
+            "last_ts": int(row["last_ts"] or 0),
+        }
+
+
+async def get_rent_events_stats() -> dict:
+    return await asyncio.to_thread(_sync_get_rent_events_stats)
+
+
 async def enrich_blockchain_events(events: list, wallet: str = "") -> int:
     return await asyncio.to_thread(_sync_enrich_blockchain_events, events, wallet)

@@ -4,6 +4,7 @@ import logging
 import json
 import uuid
 import asyncio
+from datetime import datetime
 from dotenv import load_dotenv
 from telegram import (
     Update,
@@ -28,7 +29,7 @@ from cachetools import TTLCache
 from utils.common import setup_logging, escape_html
 from utils.database import (
     init_db, increment_stat, get_stat, get_total_users, get_messages_today,
-    close_all, prune_live_states,
+    close_all, prune_live_states, get_rent_events_stats,
 )
 from utils.config import BotConfig
 from utils.http_client import close_client
@@ -152,15 +153,30 @@ async def purge_stale_user_data(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _collect_health_stats() -> dict:
-    total_messages, messages_today, total_users = await asyncio.gather(
+    total_messages, messages_today, total_users, rent = await asyncio.gather(
         get_stat("total_messages"),
         get_messages_today(),
         get_total_users(),
+        get_rent_events_stats(),
     )
     return {
         "total_messages": total_messages,
         "messages_today": messages_today,
         "total_users": total_users,
+        # Диагностика «нет данных» в отчётах: SQLite на Render стирается при
+        # каждом деплое, и по этим счётчикам видно, наполнилась ли база аренды.
+        "rent_events": rent["total"],
+        "rent_events_linked": rent["linked"],
+        "rent_events_last_ts": rent["last_ts"],
+        # Только признаки «задано/не задано», сами секреты не отдаются.
+        "config": {
+            "marketapp_wallet": bool(config.marketapp_wallet),
+            "marketapp_api_key": bool(config.marketapp_api_key),
+            "sync_jobs": bool(config.marketapp_api_key and config.marketapp_wallet),
+            "tonapi_key": bool(config.tonapi_api_key),
+            "toncenter_key": bool(config.toncenter_api_key),
+            "admin_ids": len(config.admin_user_ids),
+        },
     }
 
 
@@ -292,6 +308,27 @@ async def post_init(application: Application):
         logger.warning(
             "ADMIN_USER_IDS не задан — команды /ban и /unban никому не доступны"
         )
+
+    # Сразу видно в логах Render, откуда берутся данные отчётов: базу аренды
+    # free-план стирает при каждом деплое, и без этой строки непонятно,
+    # «нет данных» — это пустой кошелёк или деплой обнулил SQLite.
+    rent_stats = await get_rent_events_stats()
+    last_event = (
+        datetime.fromtimestamp(rent_stats["last_ts"]).strftime("%d.%m.%Y %H:%M")
+        if rent_stats["last_ts"] else "-"
+    )
+    logger.info(
+        "Состояние данных: событий аренды %s (привязано к NFT %s), последнее от %s | "
+        "MARKETAPP_WALLET=%s MARKETAPP_API_KEY=%s синк-джобы=%s | "
+        "TONAPI=%s TONCENTER=%s админов=%s",
+        rent_stats["total"], rent_stats["linked"], last_event,
+        "да" if config.marketapp_wallet else "НЕТ",
+        "да" if config.marketapp_api_key else "НЕТ",
+        "да" if (config.marketapp_api_key and config.marketapp_wallet) else "НЕТ",
+        "да" if config.tonapi_api_key else "НЕТ",
+        "да" if config.toncenter_api_key else "НЕТ",
+        len(config.admin_user_ids),
+    )
 
     try:
         await application.bot.delete_webhook(drop_pending_updates=False)
