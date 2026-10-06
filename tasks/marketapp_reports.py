@@ -30,17 +30,26 @@ MSK = timezone(timedelta(hours=3))
 # отдаётся в /health. Без неё «топ не построить» приходилось расшифровывать
 # по логам: здесь сразу видно, была ли попытка, сколько записей собрано,
 # сколько совпало и с какой ошибкой упала.
-LAST_LINKAGE: dict = {"at": 0, "collected": 0, "matched": 0, "error": "", "categories": {}}
+LAST_LINKAGE: dict = {
+    "at": 0, "collected": 0, "matched": 0, "error": "",
+    "categories": {}, "api_keys": [], "direction": {"in": 0, "out": 0},
+}
 
 
 def record_linkage(collected: int | None = None, matched: int | None = None,
-                   error: str = "", categories: dict | None = None) -> None:
+                   error: str = "", categories: dict | None = None,
+                   api_keys: list | None = None,
+                   direction: dict | None = None) -> None:
     if collected is not None:
         LAST_LINKAGE["collected"] = int(collected)
     if matched is not None:
         LAST_LINKAGE["matched"] = int(matched)
     if categories is not None:
         LAST_LINKAGE["categories"] = dict(categories)
+    if api_keys is not None:
+        LAST_LINKAGE["api_keys"] = list(api_keys)
+    if direction is not None:
+        LAST_LINKAGE["direction"] = dict(direction)
     LAST_LINKAGE["error"] = (error or "")[:300]
     LAST_LINKAGE["at"] = int(time.time())
 
@@ -504,6 +513,8 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
     raw_wallet = userfriendly_to_raw(wallet)
     collected = []
     by_cat: dict[str, int] = {}  # сколько записей дал каждая категория — в /health
+    api_keys: list[str] | None = None  # какие поля реально отдаёт API — в /health
+    direction = {"in": 0, "out": 0}  # записи, где кошелёк получает / платит
 
     known = await get_all_rent_events(wallet)
     min_ts = min((int(e.get("ts", 0) or 0) for e in known), default=0)
@@ -521,6 +532,8 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
             items, next_cursor = await fetch_rent_history(api_token, category, limit=100, cursor=cursor)
             if not items:
                 break
+            if api_keys is None:
+                api_keys = sorted(items[0].keys())
             oldest = min((int(ev.get("ts", 0) or 0) for ev in items), default=0)
             if min_ts and oldest and oldest < min_ts - 604800:
                 logger.info(
@@ -542,6 +555,10 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
                 dst_raw = userfriendly_to_raw(item.get("dst", ""))
                 if src_raw != raw_wallet and dst_raw != raw_wallet:
                     continue
+                if dst_raw == raw_wallet:
+                    direction["in"] += 1
+                elif src_raw == raw_wallet:
+                    direction["out"] += 1
                 if not int(item.get("price_nano", "0") or 0) > 0:
                     continue
                 record = {
@@ -566,12 +583,14 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
         by_cat[category] = len(collected) - collected_before
 
     logger.info(f"marketapp: собрано записей по кошельку: {len(collected)} по категориям={by_cat}")
-    record_linkage(collected=len(collected), matched=0, categories=by_cat)
+    record_linkage(collected=len(collected), matched=0, categories=by_cat,
+                   api_keys=api_keys, direction=direction)
     if not collected:
         return 0
 
     enriched = await enrich_blockchain_events(collected, wallet)
-    record_linkage(collected=len(collected), matched=enriched, categories=by_cat)
+    record_linkage(collected=len(collected), matched=enriched, categories=by_cat,
+                   api_keys=api_keys, direction=direction)
     logger.info(f"marketapp: enrich совпадений с блокчейн-событиями: {enriched} из {len(collected)}")
     if enriched:
         logger.info(f"Дополнено метаданными из Marketapp: {enriched}")

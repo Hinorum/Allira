@@ -179,6 +179,8 @@ async def _collect_health_stats() -> dict:
             "collected": LAST_LINKAGE["collected"],
             "matched": LAST_LINKAGE["matched"],
             "categories": LAST_LINKAGE["categories"],
+            "api_keys": LAST_LINKAGE["api_keys"],
+            "direction": LAST_LINKAGE["direction"],
             "error": LAST_LINKAGE["error"],
         },
         # Только признаки «задано/не задано», сами секреты не отдаются.

@@ -873,6 +873,12 @@ def _sync_get_rent_events_stats() -> dict:
             "COALESCE(SUM(CAST(price_nano AS REAL)), 0) AS nano "
             "FROM marketapp_rent_events WHERE duration BETWEEN 1 AND 366"
         ).fetchone()
+        # Сырые значения duration > 0, включая невпавшие в диапазон: по min/max
+        # видно, в каких единицах приходит срок (дни/часы/секунды) и приходит ли.
+        dur_raw = conn.execute(
+            "SELECT COUNT(*) AS n, MIN(duration) AS mn, MAX(duration) AS mx "
+            "FROM marketapp_rent_events WHERE duration > 0"
+        ).fetchone()
         dur_days = int(dur["days"] or 0)
         dur_ton = (dur["nano"] or 0) / 1_000_000_000
         return {
@@ -884,6 +890,9 @@ def _sync_get_rent_events_stats() -> dict:
             "last_ts": int(row["last_ts"] or 0),
             "by_source": by_source,
             "duration": {
+                "nonzero": int(dur_raw["n"] or 0),
+                "min": int(dur_raw["mn"] or 0),
+                "max": int(dur_raw["mx"] or 0),
                 "events": int(dur["n"] or 0),
                 "days": dur_days,
                 "ton": round(dur_ton, 4),
