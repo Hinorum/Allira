@@ -692,7 +692,12 @@ def _sync_enrich_blockchain_event(conn, event: dict, wallet: str = "") -> int:
 
     # Робастный матч: ts-окно + цена с допуском + кошелёк в src|dst
     if existing is None and ts:
-        params = [_normalize_addr(wallet), ts - 7200, ts + 7200]
+        # В условии ЧЕТЫРЕ плейсхолдера: wallet нужен и для src, и для dst.
+        # Раньше здесь передавалось 3 параметра, и первый же непрошедший по
+        # hash платёж ронял ProgrammingError, убивая весь батч привязки —
+        # отсюда «нет данных по топу» при живых 252 платежах в базе.
+        norm_wallet = _normalize_addr(wallet)
+        params = [norm_wallet, norm_wallet, ts - 7200, ts + 7200]
         rows = conn.execute(
             "SELECT id, src, dst, price_nano FROM marketapp_rent_events "
             "WHERE (src=? OR dst=?) AND ts BETWEEN ? AND ?",
