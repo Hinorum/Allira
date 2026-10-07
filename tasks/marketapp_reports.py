@@ -22,6 +22,25 @@ TONCENTER_API_URL = "https://toncenter.com/api/v2"
 TONAPI_API_URL = "https://tonapi.io/v2"
 RENT_CATEGORIES = ["gifts", "usernames", "numbers"]
 RENT_COMMENT_MARKERS = ("marketapp", "rent")
+
+# Служебные пометки Marketapp: входящий перевод с таким комментарием — не
+# платёж за аренду (13 штук на 0.2497 TON, по ~0.019 каждая, раздували бы
+# «доход»). Список пополняется, когда в rent_comments (/health) всплывает
+# новая подпись, у которой нет привязанных к NFT платежей.
+NON_RENT_COMMENTS = ("rent settings has been updated",)
+
+
+def is_rent_comment(comment: str | None) -> bool:
+    """Комментарий транзакции означает платёж за аренду.
+
+    Подстроки RENT_COMMENT_MARKERS ловят все виды аренды (чтобы не потерять
+    платёж), NON_RENT_COMMENTS вычитает известные служебные сообщения
+    (чтобы не раздувать доход).
+    """
+    text = (comment or "").lower()
+    if not any(marker in text for marker in RENT_COMMENT_MARKERS):
+        return False
+    return not any(marker in text for marker in NON_RENT_COMMENTS)
 MAX_PAGE_RETRIES = 3
 MAX_HISTORY_PAGES = 200
 # Потолок страниц для полного скана истории блокчейна (свежая база).
@@ -276,7 +295,7 @@ def _tonapi_extract_rent(event: dict, raw_wallet: str) -> dict | None:
             continue
         tt = action.get("TonTransfer", {})
         comment = tt.get("comment", "") or ""
-        if not any(marker in comment.lower() for marker in RENT_COMMENT_MARKERS):
+        if not is_rent_comment(comment):
             continue
         recipient = tt.get("recipient", {}) or {}
         dst = recipient.get("address", "")
@@ -499,7 +518,7 @@ async def _sync_from_toncenter(wallet: str, max_pages: int = 50, from_scratch: b
                 continue
 
             message = in_msg.get("message", "")
-            if not any(marker in message.lower() for marker in RENT_COMMENT_MARKERS):
+            if not is_rent_comment(message):
                 continue
 
             utime = item.get("utime", 0)
