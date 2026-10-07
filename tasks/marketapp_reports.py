@@ -9,7 +9,8 @@ from telegram.ext import ContextTypes
 from utils.database import (
     save_marketapp_profit, get_previous_profit, get_profit_for_period,
     save_blockchain_rent_events, get_sync_state, set_sync_state,
-    enrich_blockchain_events, get_all_rent_events
+    enrich_blockchain_events, get_all_rent_events,
+    get_linkage_feed, set_linkage_feed
 )
 from utils.config import BotConfig
 from utils.common import normalize_ton_address
@@ -42,7 +43,19 @@ def is_rent_comment(comment: str | None) -> bool:
         return False
     return not any(marker in text for marker in NON_RENT_COMMENTS)
 MAX_PAGE_RETRIES = 3
-MAX_HISTORY_PAGES = 200
+# Потолок страниц на одну категорию за прогон: лента Marketapp общая,
+# платформенная — чтобы дойти до старта окна блокчейна, нужно ~450 страниц.
+MAX_HISTORY_PAGES = 1000
+# Общий бюджет страниц на весь прогон привязки (≈25 мин при паузе 3 с):
+# держит джобу внутри её интервала. Прогон, остановленный по бюджету,
+# границу «непрочитанного» не двигает — глубина догоняется дальше.
+LINKAGE_RUN_BUDGET = 500
+# Сколько страниц разрешено читать отчёту, когда привязки ещё нет вовсе:
+# раньше отчёт упирался в полное чтение ленты (~20 мин ожидания).
+LINKAGE_REPORT_BUDGET = 60
+# Страховка инкрементального чтения: заново перечитываем сутки сверху —
+# вдруг новые записи в их ленте встают не строго сверху.
+LINKAGE_REREAD_S = 86400
 # Потолок страниц для полного скана истории блокчейна (свежая база).
 MAX_SYNC_PAGES = 1000
 
@@ -61,6 +74,9 @@ LAST_LINKAGE: dict = {
     # нельзя отличить «у Marketapp просто мало истории» от «мы молча
     # отбрасываем».
     "pages": 0, "dropped": {"no_wallet": 0, "no_price": 0}, "stops": {},
+    # До какой глубины ленты прочитано по категориям (top_ts — граница
+    # «непрочитанного», depth_ts — самая старая прочитанная ts).
+    "feed": {},
 }
 
 # Первый ответ rent/history за жизнь процесса (см. fetch_rent_history).
@@ -107,7 +123,8 @@ def record_linkage(collected: int | None = None, matched: int | None = None,
                    direction: dict | None = None,
                    pages: int | None = None,
                    dropped: dict | None = None,
-                   stops: dict | None = None) -> None:
+                   stops: dict | None = None,
+                   feed: dict | None = None) -> None:
     if collected is not None:
         LAST_LINKAGE["collected"] = int(collected)
     if matched is not None:
@@ -124,6 +141,8 @@ def record_linkage(collected: int | None = None, matched: int | None = None,
         LAST_LINKAGE["dropped"] = dict(dropped)
     if stops is not None:
         LAST_LINKAGE["stops"] = dict(stops)
+    if feed is not None:
+        LAST_LINKAGE["feed"] = dict(feed)
     LAST_LINKAGE["error"] = (error or "")[:300]
     LAST_LINKAGE["at"] = int(time.time())
 
@@ -735,7 +754,19 @@ async def fetch_my_rented(api_token: str) -> list | None:
         return None
 
 
-async def collect_rent_events(api_token: str, wallet: str) -> int:
+async def collect_rent_events(api_token: str, wallet: str,
+                              page_budget: int | None = None) -> int:
+    """Читает ленту истории Marketapp и привязывает записи к платежам.
+
+    Их лента общая, платформенная (~450 страниц на 100 дней), поэтому:
+      * чтение инкрементальное — граница «непрочитанного» (top_ts) хранится
+        по каждой категории в linkage_feed_state, и обычный прогон читает
+        только новое (≈5 страниц вместо 450);
+      * первый прогон читает до старта окна блокчейна, но не больше
+        бюджета страниц: глубина догоняется следующими прогонами;
+      * отчёт передаёт свой маленький бюджет, чтобы не ждать глубокого
+        чтения ленты.
+    """
     raw_wallet = userfriendly_to_raw(wallet)
     collected = []
     by_cat: dict[str, int] = {}  # сколько записей дал каждая категория — в /health
@@ -746,34 +777,87 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
     pages_read = 0
     dropped = {"no_wallet": 0, "no_price": 0}
     stops: dict[str, str] = {}
+    budget = LINKAGE_RUN_BUDGET if page_budget is None else max(int(page_budget), 1)
 
     known = await get_all_rent_events(wallet)
     min_ts = min((int(e.get("ts", 0) or 0) for e in known), default=0)
-    logger.info(f"marketapp: блокчейн-событий по кошельку={len(known)}, min_ts={min_ts}")
+    logger.info(
+        f"marketapp: блокчейн-событий по кошельку={len(known)}, min_ts={min_ts}, "
+        f"бюджет страниц={budget}"
+    )
+    if not known:
+        # Обогащение сопоставляет записи API с блокчейн-событиями: без
+        # событий глубокое чтение ленты — чистая трата запросов. После
+        # каждого деплоя база пуста, а джоба привязки стартует раньше синка.
+        stops = {c: "нет блокчейн-событий" for c in RENT_CATEGORIES}
+        record_linkage(collected=0, matched=0,
+                       categories={c: 0 for c in RENT_CATEGORIES},
+                       api_keys=[], direction=direction,
+                       pages=0, dropped=dropped, stops=stops, feed={})
+        return 0
+
+    # Границы чтения по категориям: top_ts — ts самой новой записи прошлого
+    # прогона (глубже уже прочитано), depth_ts — как глубоко дошли вообще.
+    feed = await get_linkage_feed(wallet)
+    window_start = min_ts - 604800  # за 7 дней до самого старого платежа
 
     for i, category in enumerate(RENT_CATEGORIES):
+        if budget <= 0:
+            stops[category] = "бюджет страниц исчерпан"
+            by_cat[category] = 0
+            continue
         if i > 0:
             await asyncio.sleep(5)
+        state = feed.get(category) or {}
+        prev_top = int(state.get("top_ts", 0) or 0)
         cursor = None
         page_delay = 3.0
         collected_before = len(collected)
+        newest = 0     # самая новая ts на прогоне — новая граница «непрочитанного»
+        deepest = 0    # самая старая прочитанная ts — глубина покрытия
+        finished = False  # дошли до упора, а не остановились по бюджету
+        stop_reason = ""
         for page in range(MAX_HISTORY_PAGES):
+            if budget <= 0:
+                stop_reason = "бюджет страниц исчерпан"
+                break
             if page > 0:
                 await asyncio.sleep(page_delay)
-            items, next_cursor = await fetch_rent_history(api_token, category, limit=100, cursor=cursor)
+            items, next_cursor = await fetch_rent_history(
+                api_token, category, limit=100, cursor=cursor)
             if not items:
-                stops[category] = "нет записей на странице"
+                stop_reason = "нет записей на странице"
+                finished = True
                 break
+            budget -= 1
             pages_read += 1
             if api_keys is None:
                 api_keys = sorted(items[0].keys())
-            oldest = min((int(ev.get("ts", 0) or 0) for ev in items), default=0)
-            if min_ts and oldest and oldest < min_ts - 604800:
+            page_ts = [int(ev.get("ts", 0) or 0) for ev in items]
+            oldest = min(page_ts, default=0)
+            newest = max(newest, max(page_ts, default=0))
+            if oldest:
+                deepest = min(deepest, oldest) if deepest else oldest
+            # 1) Инкремент: ниже границы прошлого прогона уже всё прочитано
+            #    (сутки перечитываем заново — страховка от нестрогой
+            #    сортировки их ленты).
+            if prev_top and oldest and oldest <= prev_top - LINKAGE_REREAD_S:
+                logger.info(
+                    f"marketapp: {category}/history — ниже границы прошлого прогона "
+                    f"(oldest={oldest} <= {prev_top - LINKAGE_REREAD_S}), "
+                    f"прочитано страниц: {page + 1}"
+                )
+                stop_reason = "уже прочитано в прошлых прогонах"
+                finished = True
+                break
+            # 2) Старше окна блокчейна — глубже листать незачем.
+            if window_start and oldest and oldest < window_start:
                 logger.info(
                     f"marketapp: {category}/history — история ушла старее блокчейн-границы "
-                    f"(oldest={oldest} < min_ts={min_ts}), останавливаюсь на странице {page + 1}"
+                    f"(oldest={oldest} < window={window_start}), останавливаюсь на странице {page + 1}"
                 )
-                stops[category] = "история старее блокчейна"
+                stop_reason = "история старее блокчейна"
+                finished = True
                 break
             if page == 0:
                 sample = items[0] if items else {}
@@ -814,25 +898,40 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
                 collected.append(record)
 
             if not next_cursor:
-                stops[category] = "курсор кончился"
+                stop_reason = "курсор кончился"
+                finished = True
                 break
             cursor = next_cursor
         else:
-            stops[category] = "лимит страниц"
+            stop_reason = "лимит страниц"
+            finished = True
 
+        stops[category] = stop_reason
         by_cat[category] = len(collected) - collected_before
 
+        # Границу двигаем только по завершённому чтению: прогон, снятый по
+        # бюджету, не должен закрыть категорию — иначе глубину будет нечем
+        # догонять, ведь курсор их API всегда идёт сверху, начать с середины
+        # нельзя.
+        if finished and newest:
+            old_depth = int(state.get("depth_ts", 0) or 0)
+            depth = old_depth
+            if deepest:
+                depth = min(old_depth, deepest) if old_depth else deepest
+            feed[category] = {"top_ts": newest, "depth_ts": depth}
+
+    await set_linkage_feed(wallet, feed)
     logger.info(f"marketapp: собрано записей по кошельку: {len(collected)} по категориям={by_cat}")
     record_linkage(collected=len(collected), matched=0, categories=by_cat,
                    api_keys=api_keys, direction=direction,
-                   pages=pages_read, dropped=dropped, stops=stops)
+                   pages=pages_read, dropped=dropped, stops=stops, feed=feed)
     if not collected:
         return 0
 
     enriched = await enrich_blockchain_events(collected, wallet)
     record_linkage(collected=len(collected), matched=enriched, categories=by_cat,
                    api_keys=api_keys, direction=direction,
-                   pages=pages_read, dropped=dropped, stops=stops)
+                   pages=pages_read, dropped=dropped, stops=stops, feed=feed)
     logger.info(f"marketapp: enrich совпадений с блокчейн-событиями: {enriched} из {len(collected)}")
     if enriched:
         logger.info(f"Дополнено метаданными из Marketapp: {enriched}")

@@ -221,6 +221,10 @@ async def _collect_health_stats() -> dict:
             "pages": LAST_LINKAGE["pages"],
             "dropped": dict(LAST_LINKAGE["dropped"]),
             "stops": dict(LAST_LINKAGE["stops"]),
+            # Глубина чтения ленты по категориям: top_ts — граница, ниже
+            # которой прошлый прогон уже всё прочитал (по ней следующий
+            # прогон читает только новое), depth_ts — как глубоко дошли.
+            "feed": dict(LAST_LINKAGE["feed"]),
             # Чем привязались: hash — тот же tx (точно), exact — совпали
             # src/dst/ts, price_tight — цена в ±300 сек, price — в ±2 ч.
             "match_paths": dict(LAST_MATCH_PATHS),

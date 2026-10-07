@@ -14,6 +14,7 @@ from tasks.marketapp_reports import (
     _ts_days_ago,
     userfriendly_to_raw,
     MAX_SYNC_PAGES,
+    LINKAGE_REPORT_BUDGET,
     MSK,
     MARKETAPP_API_URL,
 )
@@ -361,7 +362,11 @@ async def _ensure_rent_data(bot, chat_id: int, wallet: str, api_token: str, is_o
     if events and _count_linked(events) == 0 and api_token and is_owner:
         await bot.send_message(chat_id, "Привязываю платежи к подаркам через Marketapp...")
         try:
-            matched = await collect_rent_events(api_token, wallet)
+            # Небольшой бюджет: отчёт не должен ждать глубокого чтения
+            # ленты Marketapp (~20 мин). Глубину добьёт фоновая джоба.
+            matched = await collect_rent_events(
+                api_token, wallet, page_budget=LINKAGE_REPORT_BUDGET
+            )
             logger.info(f"_ensure_rent_data: marketapp-привязка, совпало={matched}")
         except Exception as e:
             logger.error(f"_ensure_rent_data: marketapp-привязка упала: {e}", exc_info=True)

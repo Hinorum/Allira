@@ -186,6 +186,16 @@ def init_db():
                 last_sync_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
+            -- Границы прочитанной ленты Marketapp (JSON по категориям):
+            -- без них каждый прогон привязки листал платформенную ленту
+            -- с самой новой записи до старта окна блокчейна (~450 запросов,
+            -- из них две трети — пустые категории).
+            CREATE TABLE IF NOT EXISTS linkage_feed_state (
+                address TEXT PRIMARY KEY,
+                feed TEXT DEFAULT '',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 name TEXT PRIMARY KEY,
                 applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -876,6 +886,39 @@ def _sync_set_sync_state(address: str, lt: str, hash_val: str, utime: int):
         """, (address, lt, hash_val, utime))
 
 
+def _sync_get_linkage_feed(address: str) -> dict:
+    """Границы прочитанной ленты Marketapp по категориям (JSON).
+
+    Формат: {"gifts": {"top_ts": <ts самой новой записи на прошлом прогоне>,
+    "depth_ts": <самая старая прочитанная ts>}}. Хранится отдельно от
+    blockchain_sync_state: та таблица — чекпоинт скана, и лишняя строка в
+    ней сломала бы логику «нет чекпоинта -> полный синк» после деплоя.
+    """
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT feed FROM linkage_feed_state WHERE address = ?",
+            (_normalize_addr(address),)
+        ).fetchone()
+        if not row or not row["feed"]:
+            return {}
+        try:
+            data = json.loads(row["feed"])
+        except (TypeError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+
+def _sync_set_linkage_feed(address: str, feed: dict) -> None:
+    with get_db() as conn:
+        conn.execute("""
+            INSERT INTO linkage_feed_state (address, feed)
+            VALUES (?, ?)
+            ON CONFLICT(address) DO UPDATE SET
+                feed = excluded.feed,
+                updated_at = CURRENT_TIMESTAMP
+        """, (_normalize_addr(address), json.dumps(feed, ensure_ascii=False)))
+
+
 def _sync_get_all_rent_events(wallet: str = "") -> list:
     # Без LIMIT выборка держала в памяти ВСЮ таблицу аренды — на free-инстансе
     # с десятками тысяч платежей это прямой путь к OOM. Держим свежие 50k
@@ -904,6 +947,14 @@ async def get_sync_state(address: str) -> dict | None:
 
 async def set_sync_state(address: str, lt: str, hash_val: str, utime: int):
     return await asyncio.to_thread(_sync_set_sync_state, address, lt, hash_val, utime)
+
+
+async def get_linkage_feed(address: str) -> dict:
+    return await asyncio.to_thread(_sync_get_linkage_feed, address)
+
+
+async def set_linkage_feed(address: str, feed: dict) -> None:
+    return await asyncio.to_thread(_sync_set_linkage_feed, address, feed)
 
 
 async def get_all_rent_events(wallet: str = "") -> list:
