@@ -167,7 +167,13 @@ async def _request_page(
             _note_http_error(f"{label}: невалидный JSON")
             await asyncio.sleep(backoff)
             continue
-    _note_http_error(f"{label}: попытки исчерпаны")
+    # Конкретную причину (429 / статус / сеть / JSON) не затираем — только
+    # помечаем, что попытки кончились: по ней в /health видно, что именно
+    # остановило скан.
+    if LAST_HTTP_ERROR["text"]:
+        LAST_HTTP_ERROR["text"] = f"{LAST_HTTP_ERROR['text']} (попытки исчерпаны)"
+    else:
+        _note_http_error(f"{label}: попытки исчерпаны")
     return None
 
 
@@ -374,14 +380,27 @@ async def _sync_from_toncenter(wallet: str, max_pages: int = 50, from_scratch: b
 
     boundary_lt = None
     boundary_hash = None
+    start_lt = None
+    start_hash = None
     if not from_scratch:
         sync_state = await get_sync_state(wallet)
         if sync_state:
-            boundary_lt = sync_state.get("last_synced_lt")
-            boundary_hash = sync_state.get("last_synced_hash")
+            prev = LAST_SYNC.get("toncenter") or {}
+            if prev and not prev.get("complete"):
+                # Прошлый прогон оборвался (rate limit и т.п.): граница — не
+                # потолок, а точка старта. Идём от неё ГЛУБЖЕ: иначе каждая
+                # попытка начинала бы сначала, упиралась в ту же ошибку и
+                # история оставалась бы оборванной навсегда.
+                start_lt = sync_state.get("last_synced_lt")
+                start_hash = sync_state.get("last_synced_hash")
+            else:
+                # История дописана до конца: граница — точка останова, всё
+                # что новее, уже просканировано.
+                boundary_lt = sync_state.get("last_synced_lt")
+                boundary_hash = sync_state.get("last_synced_hash")
 
-    cur_lt = None
-    cur_hash = None
+    cur_lt = start_lt
+    cur_hash = start_hash
     new_events = []
     pages = 0
     scan_complete = False
@@ -498,18 +517,21 @@ async def sync_blockchain_rent_job(context: ContextTypes.DEFAULT_TYPE):
         wallet = context.bot_data.get("MARKETAPP_WALLET", "")
         if not wallet:
             return
-        # Свежая база (деплой на бесплатном Render стирает диск) — чекпоинта
-        # нет. Трёх страниц хватает лишь на первые дни, а после первого
-        # прогона граница уже записана, и история НИКОГДА не углубляется:
-        # период отчёта и итог скачет — то 1899 событий, то 251. Первый
-        # прогон гонит полную историю, дальше — только новые транзакции.
+        # Три режима:
+        #  * свежая база (деплой на бесплатном Render стирает диск) — полный
+        #    синк с нуля;
+        #  * история дописана не до конца (прошлый прогон оборвался по rate
+        #    limit) — продолжаем с границы, но с большим лимитом страниц:
+        #    иначе оборванный скан оставался бы оборванным навсегда;
+        #  * всё синхронизировано — только новые транзакции (3 страницы).
         sync_state = await get_sync_state(wallet)
-        full = not sync_state
-        await sync_rent_from_blockchain(
-            wallet,
-            max_pages=MAX_SYNC_PAGES if full else 3,
-            from_scratch=full,
-        )
+        prev = LAST_SYNC.get("toncenter") or {}
+        if not sync_state:
+            await sync_rent_from_blockchain(wallet, max_pages=MAX_SYNC_PAGES, from_scratch=True)
+        elif prev.get("complete") is False:
+            await sync_rent_from_blockchain(wallet, max_pages=MAX_SYNC_PAGES, from_scratch=False)
+        else:
+            await sync_rent_from_blockchain(wallet, max_pages=3, from_scratch=False)
     except Exception as e:
         logger.error(f"Ошибка синхронизации блокчейна: {e}", exc_info=True)
 
