@@ -175,15 +175,12 @@ async def _collect_health_stats() -> dict:
         "rent_events_span_days": rent["span_days"],
         "rent_events_by_source": rent["by_source"],
         "rent_duration": rent["duration"],
-        # Последний прогон скана блокчейна: какой путь сработал (tonapi или
-        # toncenter), сколько страниц пройдено и дошёл ли до конца истории.
+        # Последние прогоны скана (ключ — источник tonapi/toncenter):
+        # страницы, завершённость, сохранено и ошибка. По ним видно, что
+        # именно встало, если история перестала расти.
         "rent_sync": {
-            "age_s": int(time.time() - LAST_SYNC["at"]) if LAST_SYNC["at"] else None,
-            "path": LAST_SYNC["path"],
-            "pages": LAST_SYNC["pages"],
-            "complete": LAST_SYNC["complete"],
-            "saved": LAST_SYNC["saved"],
-            "error": LAST_SYNC["error"],
+            path: {"age_s": int(time.time() - v["at"]), **v}
+            for path, v in LAST_SYNC.items()
         },
         # Чем закончилась последняя попытка привязать платежи к подаркам:
         # collected — сколько записей вернул Marketapp, matched — сколько

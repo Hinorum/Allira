@@ -40,12 +40,22 @@ LAST_LINKAGE: dict = {
 # Первый ответ rent/history за жизнь процесса (см. fetch_rent_history).
 LAST_HISTORY_META: dict = {"envelope_keys": [], "items": 0, "has_cursor": False}
 
-# Последний прогон скана блокчейна — для /health: какой путь сработал
-# (tonapi или toncenter), сколько страниц пройдено и дошёл ли до конца.
-# Без этого «в базе 698 событий и они не растут» приходилось объяснять
-# вслепую: видно и обрыв, и ошибку, и то, что история дописана не до конца.
-LAST_SYNC: dict = {"at": 0, "path": "", "pages": 0, "complete": False,
-                   "saved": 0, "error": ""}
+# Последние прогоны скана блокчейна (ключ — путь tonapi/toncenter) — для
+# /health: сколько страниц пройдено, дошёл ли до конца истории, сколько
+# сохранено и ошибка, если была. Без этого «в базе 698 событий и они не
+# растут» приходилось объяснять вслепую: видно и обрыв, и ошибку, и то,
+# что история дописана не до конца.
+LAST_SYNC: dict = {}
+
+
+def _record_sync(path: str, pages: int, complete: bool, saved: int, error: str = ""):
+    LAST_SYNC[path] = {
+        "at": time.time(),
+        "pages": pages,
+        "complete": complete,
+        "saved": saved,
+        "error": error,
+    }
 
 
 def record_linkage(collected: int | None = None, matched: int | None = None,
@@ -236,14 +246,20 @@ async def _sync_from_tonapi(wallet: str, max_pages: int = 50, from_scratch: bool
     api_key = BotConfig.from_env().tonapi_api_key
     logger.info(f"[tonapi sync] wallet={wallet} raw={raw_wallet} api_key={bool(api_key)} from_scratch={from_scratch} max_pages={max_pages}")
 
+    # Граница нужна и для решения «писать ли чекпоинт»: tonapi пишет свой
+    # event-lt, TON Center — tx-lt, пространства разные. Поэтому чекпоинт
+    # ставит только тот, у кого его не было (TON Center гонится последним
+    # и перекрывает), иначе каждый прогон TON Center заново прочёсывает
+    # всю историю.
+    sync_state = await get_sync_state(wallet)
+    had_state = bool(sync_state and sync_state.get("last_synced_lt"))
+
     boundary = None
-    if not from_scratch:
-        sync_state = await get_sync_state(wallet)
-        if sync_state and sync_state.get("last_synced_lt"):
-            try:
-                boundary = int(sync_state["last_synced_lt"])
-            except (TypeError, ValueError):
-                boundary = None
+    if not from_scratch and had_state:
+        try:
+            boundary = int(sync_state["last_synced_lt"])
+        except (TypeError, ValueError):
+            boundary = None
 
     before_lt = None
     new_events = []
@@ -260,9 +276,7 @@ async def _sync_from_tonapi(wallet: str, max_pages: int = 50, from_scratch: bool
         if not events:
             if events is None:
                 saved = await save_blockchain_rent_events(new_events, wallet) if new_events else 0
-                LAST_SYNC.update({"at": time.time(), "path": "tonapi", "pages": pages,
-                                  "complete": False, "saved": saved,
-                                  "error": "страница не вернулась"})
+                _record_sync("tonapi", pages, False, saved, "страница не вернулась")
                 return 0, False
             scan_complete = True
             break
@@ -297,26 +311,40 @@ async def _sync_from_tonapi(wallet: str, max_pages: int = 50, from_scratch: bool
         saved = 0
         logger.warning(f"[tonapi sync] найденных событий аренды: 0 (страниц перебрано: {pages}, scan_complete={scan_complete})")
 
-    # Чекпоинт ставим по фактически пройденной границе, а не только при полном
-    # скане. Раньше прогон с max_pages=3, не дошедший до конца, границу не писал —
-    # и следующий прогон снова начинал с той же точки, крутя одни и те же страницы.
-    if deep_lt is not None and deep_utime:
+    # Чекпоинт ставим по фактически пройденной границе — но только если его
+    # не было вовсе: иначе event-lt tonapi затирает tx-lt TON Center, и тот
+    # на каждом прогоне заново прочёсывает всю историю. Раньше прогон с
+    # max_pages=3 границу не писал, и следующий начинал с той же точки.
+    if deep_lt is not None and deep_utime and not had_state:
         await set_sync_state(wallet, str(deep_lt), "", deep_utime)
 
-    LAST_SYNC.update({"at": time.time(), "path": "tonapi", "pages": pages,
-                      "complete": scan_complete, "saved": saved, "error": ""})
+    _record_sync("tonapi", pages, scan_complete, saved)
     return saved, True
 
 
 async def sync_rent_from_blockchain(wallet: str, max_pages: int = 50, from_scratch: bool = False) -> int:
+    """Скан истории аренды: гоним ОБА источника и сливаем результат.
+
+    TON Center отвечает транзакциями с полным текстом комментария и даёт
+    заметно более полную базу (1847 событий против 698 у tonapi, у которого
+    часть комментариев не доходит и глубина истории ограничена). tonapi
+    идёт первым — TON Center пишет чекпоинт последним (tx-lt), и следующие
+    прогоны обходятся без полного прочёсывания. Дублей нет: дедуп по
+    tx_hash и по ts±300 + src/dst. Упавший источник не отменяет второй.
+    """
     logger.info(f"[sync] старт wallet={wallet} max_pages={max_pages} from_scratch={from_scratch}")
-    saved, ok = await _sync_from_tonapi(wallet, max_pages, from_scratch)
-    if ok:
-        logger.info(f"[sync] tonapi путь завершён: saved={saved}")
-        return saved
-    logger.warning("tonapi недоступен — переключаюсь на TON Center")
-    saved = await _sync_from_toncenter(wallet, max_pages, from_scratch)
-    logger.info(f"[sync] toncenter путь завершён: saved={saved}")
+    saved = 0
+    try:
+        saved += (await _sync_from_tonapi(wallet, max_pages, from_scratch))[0]
+    except Exception as e:
+        logger.warning(f"[sync] tonapi упал: {e}", exc_info=True)
+        _record_sync("tonapi", 0, False, 0, f"{type(e).__name__}: {e}"[:200])
+    try:
+        saved += await _sync_from_toncenter(wallet, max_pages, from_scratch)
+    except Exception as e:
+        logger.warning(f"[sync] TON Center упал: {e}", exc_info=True)
+        _record_sync("toncenter", 0, False, 0, f"{type(e).__name__}: {e}"[:200])
+    logger.info(f"[sync] завершён: saved={saved}")
     return saved
 
 
@@ -431,8 +459,7 @@ async def _sync_from_toncenter(wallet: str, max_pages: int = 50, from_scratch: b
     if new_events:
         saved = await save_blockchain_rent_events(new_events, wallet)
         logger.info(f"Блокчейн: сохранено {saved} событий аренды")
-    LAST_SYNC.update({"at": time.time(), "path": "toncenter", "pages": pages,
-                      "complete": scan_complete, "saved": saved, "error": scan_error})
+    _record_sync("toncenter", pages, scan_complete, saved, scan_error)
     return saved
 
 
