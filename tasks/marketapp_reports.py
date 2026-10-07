@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import time
 import httpx
@@ -163,6 +164,15 @@ async def _request_page(
         try:
             return response.json()
         except Exception:
+            # TON Center отдаёт строки с сырыми управляющими символами
+            # (переносы внутри комментариев/метаданных): тело при этом
+            # полностью валидно и закрыто, но строгий json их не терпит —
+            # из-за одного такого символа скан падал на конкретной странице
+            # и история больше никогда не уходила глубже. Разбираем мягко.
+            try:
+                return json.loads(response.text, strict=False)
+            except Exception:
+                pass
             # Начало И конец тела: по хвосту видно, что ответ обрезан на
             # середине (тонкий gateway), а не отдан битым намеренно.
             text = response.text
