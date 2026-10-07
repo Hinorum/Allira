@@ -623,20 +623,17 @@ async def get_previous_profit(period: str) -> dict | None:
 _normalize_addr = normalize_ton_address
 
 
-def _canonical_tx_hash(tx_hash: str) -> str:
-    h = (tx_hash or "").strip()
-    if not h:
-        return ""
-    if h.startswith("0x"):
-        h = h[2:]
+def _decode_hash(value: str) -> str | None:
+    """Хеш в hex, если строка декодируется ровно в 32 байта (hex или base64)."""
+    v = value[2:] if value.startswith("0x") else value
     raw = None
-    if len(h) == 64:
+    if len(v) == 64:
         try:
-            raw = bytes.fromhex(h)
+            raw = bytes.fromhex(v)
         except ValueError:
             raw = None
     if raw is None:
-        b = h.replace("-", "+").replace("_", "/")
+        b = v.replace("-", "+").replace("_", "/")
         b += "=" * ((4 - len(b) % 4) % 4)
         try:
             raw = base64.b64decode(b)
@@ -644,6 +641,28 @@ def _canonical_tx_hash(tx_hash: str) -> str:
             raw = None
     if raw is not None and len(raw) == 32:
         return raw.hex()
+    return None
+
+
+def _canonical_tx_hash(tx_hash: str) -> str:
+    """Хеш транзакции в каноничном виде (hex).
+
+    Источники отдают его по-разному: hex, base64, «0x…», а TONAPI —
+    event_id вида «<hash>:<lt>». Перебираем кандидатов (целиком и по
+    частям через двоеточие) и берём первый, что декодируется в 32 байта.
+    Без этого хеш TONAPI никогда не совпадал с хешем TON Center, и вся
+    привязка уходила в запасную ветку «по цене в окне ±2ч».
+    """
+    h = (tx_hash or "").strip()
+    if not h:
+        return ""
+    candidates = [h]
+    if ":" in h:
+        candidates.extend(p for p in h.split(":") if p)
+    for cand in candidates:
+        got = _decode_hash(cand)
+        if got:
+            return got
     return h.lower()
 
 
@@ -675,7 +694,7 @@ def _sync_find_rent_event(conn, ts: int, src: str, dst: str, wallet: str = ""):
 # Каким способом привязался последний батч: по хешу транзакции (точно),
 # по точному совпадению src/dst/ts или по цене в окне ±2ч (эвристика).
 # Разбивка видна в /health — по ней отличим надёжную привязку от угадывания.
-LAST_MATCH_PATHS: dict = {"hash": 0, "exact": 0, "price": 0}
+LAST_MATCH_PATHS: dict = {"hash": 0, "exact": 0, "price_tight": 0, "price": 0}
 
 
 def _sync_enrich_blockchain_event(conn, event: dict, wallet: str = "") -> int:
@@ -708,27 +727,32 @@ def _sync_enrich_blockchain_event(conn, event: dict, wallet: str = "") -> int:
         # hash платёж ронял ProgrammingError, убивая весь батч привязки —
         # отсюда «нет данных по топу» при живых 252 платежах в базе.
         norm_wallet = _normalize_addr(wallet)
-        params = [norm_wallet, norm_wallet, ts - 7200, ts + 7200]
-        rows = conn.execute(
-            "SELECT id, src, dst, price_nano FROM marketapp_rent_events "
-            "WHERE (src=? OR dst=?) AND ts BETWEEN ? AND ?",
-            params,
-        ).fetchall()
         if price > 0:
-            candidates = []
-            for r in rows:
-                row_price = int(float(r["price_nano"] or 0))
-                if row_price > 0:
-                    diff = abs(row_price - price)
-                    if diff / max(row_price, price, 1) < 0.05:
-                        candidates.append(r)
-            if len(candidates) == 1:
-                existing = candidates[0]
-                path = "price"
-            elif len(candidates) > 1:
-                best = min(candidates, key=lambda r: abs(int(float(r["price_nano"] or 0)) - price))
-                existing = best
-                path = "price"
+            # Окно сужаем от ±300 секунд к ±2 часам: запись Marketapp и
+            # платёж — одна операция (цена и время совпадают), но src/dst
+            # у API другие, а хеш может быть закодирован иначе. Часовое
+            # окно раньше было единственным, что работало, — и оно же
+            # могло приписать платёж соседнему по цене переводу.
+            for window, label in ((300, "price_tight"), (7200, "price")):
+                rows = conn.execute(
+                    "SELECT id, src, dst, price_nano FROM marketapp_rent_events "
+                    "WHERE (src=? OR dst=?) AND ts BETWEEN ? AND ?",
+                    (norm_wallet, norm_wallet, ts - window, ts + window),
+                ).fetchall()
+                candidates = []
+                for r in rows:
+                    row_price = int(float(r["price_nano"] or 0))
+                    if row_price > 0:
+                        diff = abs(row_price - price)
+                        if diff / max(row_price, price, 1) < 0.05:
+                            candidates.append(r)
+                if candidates:
+                    existing = min(
+                        candidates,
+                        key=lambda r: abs(int(float(r["price_nano"] or 0)) - price),
+                    )
+                    path = label
+                    break
 
     if existing is None:
         return 0
@@ -754,7 +778,7 @@ def _sync_enrich_blockchain_event(conn, event: dict, wallet: str = "") -> int:
 
 
 def _sync_enrich_blockchain_events(events: list, wallet: str = "") -> int:
-    LAST_MATCH_PATHS.update({"hash": 0, "exact": 0, "price": 0})
+    LAST_MATCH_PATHS.update({"hash": 0, "exact": 0, "price_tight": 0, "price": 0})
     with get_db() as conn:
         saved = 0
         for event in events:
