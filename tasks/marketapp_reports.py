@@ -64,7 +64,8 @@ LAST_LINKAGE: dict = {
 }
 
 # Первый ответ rent/history за жизнь процесса (см. fetch_rent_history).
-LAST_HISTORY_META: dict = {"envelope_keys": [], "items": 0, "has_cursor": False}
+LAST_HISTORY_META: dict = {"envelope_keys": [], "items": 0, "has_cursor": False,
+                           "sample_tx_hash": None}
 
 # Последние прогоны скана блокчейна (ключ — путь tonapi/toncenter) — для
 # /health: сколько страниц пройдено, дошёл ли до конца истории, сколько
@@ -672,6 +673,10 @@ async def fetch_rent_history(api_token: str, category: str, limit: int = 100,
             "envelope_keys": sorted(data.keys()),
             "items": len(items),
             "has_cursor": bool(next_cursor),
+            # Образец их tx_hash: по нему видно, отдаёт ли API настоящий
+            # хеш транзакции (hex/base64) или внутренний идентификатор —
+            # от этого зависит, сработает ли привязка «по хешу».
+            "sample_tx_hash": (items[0].get("tx_hash") if items else None),
         })
     return items, next_cursor
 

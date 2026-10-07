@@ -684,7 +684,7 @@ def _sync_find_rent_event(conn, ts: int, src: str, dst: str, wallet: str = ""):
     if ts > 10_000_000_000:  # миллисекунды -> секунды
         ts //= 1000
     row = conn.execute(
-        "SELECT id, wallet FROM marketapp_rent_events "
+        "SELECT id, wallet, price_nano FROM marketapp_rent_events "
         "WHERE ts BETWEEN ? AND ? AND src=? AND dst=? LIMIT 1",
         (ts - 300, ts + 300, norm_src, norm_dst)
     ).fetchone()
@@ -719,12 +719,20 @@ def _sync_enrich_blockchain_event(conn, event: dict, wallet: str = "") -> int:
     path = ""
     if canon_hash:
         existing = conn.execute(
-            "SELECT id FROM marketapp_rent_events WHERE tx_hash=? LIMIT 1", (canon_hash,)
+            "SELECT id, price_nano FROM marketapp_rent_events WHERE tx_hash=? LIMIT 1",
+            (canon_hash,),
         ).fetchone()
         if existing is not None:
             path = "hash"
     if existing is None:
         existing = _sync_find_rent_event(conn, ts, src, dst, wallet)
+        if existing is not None:
+            path = "exact"
+    # У Marketapp src/dst записаны с другой стороны (в /health это видно:
+    # direction = out, то есть в их записи мы — отправитель). Сверяем и
+    # перевёрнутую пару: это то же точное совпадение, а не подбор по цене.
+    if existing is None:
+        existing = _sync_find_rent_event(conn, ts, dst, src, wallet)
         if existing is not None:
             path = "exact"
 
@@ -766,6 +774,17 @@ def _sync_enrich_blockchain_event(conn, event: dict, wallet: str = "") -> int:
         return 0
     if path:
         LAST_MATCH_PATHS[path] = LAST_MATCH_PATHS.get(path, 0) + 1
+
+    # Деньги считаем по блокчейну: price_nano хранит реально полученную
+    # сумму, а Marketapp отдаёт свою цену аренды — после обогащения доход
+    # разъезжался с поступлениями (проверено: +0.31 TON на 63 записях).
+    # Их ценой заполняем только пустое поле.
+    stored_price = ""
+    if "price_nano" in existing.keys():
+        stored_price = str(existing["price_nano"] or "")
+    price_value = stored_price if stored_price not in ("", "0", "0.0") \
+        else str(event.get("price_nano", "0"))
+
     conn.execute("""
         UPDATE marketapp_rent_events
         SET category=?, nft_address=?, nft_name=?, collection_address=?,
@@ -776,7 +795,7 @@ def _sync_enrich_blockchain_event(conn, event: dict, wallet: str = "") -> int:
         event.get("address", ""),
         event.get("name", ""),
         event.get("collection_address", ""),
-        event.get("price_nano", "0"),
+        price_value,
         1 if event.get("is_extend") else 0,
         int(event.get("duration", 0) or 0),
         _normalize_addr(wallet),
