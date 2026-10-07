@@ -55,6 +55,12 @@ MSK = timezone(timedelta(hours=3))
 LAST_LINKAGE: dict = {
     "at": 0, "collected": 0, "matched": 0, "error": "",
     "categories": {}, "api_keys": [], "direction": {"in": 0, "out": 0},
+    # Почему записей меньше, чем платежей в блокчейне: no_wallet — API вернул
+    # чужие записи, no_price — записи без суммы, pages/stops — сколько страниц
+    # прочитано и на какой причине остановились. Без этого «66 из 759»
+    # нельзя отличить «у Marketapp просто мало истории» от «мы молча
+    # отбрасываем».
+    "pages": 0, "dropped": {"no_wallet": 0, "no_price": 0}, "stops": {},
 }
 
 # Первый ответ rent/history за жизнь процесса (см. fetch_rent_history).
@@ -97,7 +103,10 @@ def _note_http_error(text: str):
 def record_linkage(collected: int | None = None, matched: int | None = None,
                    error: str = "", categories: dict | None = None,
                    api_keys: list | None = None,
-                   direction: dict | None = None) -> None:
+                   direction: dict | None = None,
+                   pages: int | None = None,
+                   dropped: dict | None = None,
+                   stops: dict | None = None) -> None:
     if collected is not None:
         LAST_LINKAGE["collected"] = int(collected)
     if matched is not None:
@@ -108,8 +117,35 @@ def record_linkage(collected: int | None = None, matched: int | None = None,
         LAST_LINKAGE["api_keys"] = list(api_keys)
     if direction is not None:
         LAST_LINKAGE["direction"] = dict(direction)
+    if pages is not None:
+        LAST_LINKAGE["pages"] = int(pages)
+    if dropped is not None:
+        LAST_LINKAGE["dropped"] = dict(dropped)
+    if stops is not None:
+        LAST_LINKAGE["stops"] = dict(stops)
     LAST_LINKAGE["error"] = (error or "")[:300]
     LAST_LINKAGE["at"] = int(time.time())
+
+
+def record_price_nano(item: dict) -> str:
+    """Сумма платежа из записи Marketapp в нано — с фолбэком на price.
+
+    API отдаёт и price_nano, и price (в TON); если нано-поле пустое или ноль,
+    запись раньше молча выбрасывалась, и платеж оставался «не привязанным»,
+    хотя данные для привязки были.
+    """
+    raw = str(item.get("price_nano") or "").strip()
+    try:
+        nano = int(float(raw)) if raw else 0
+    except (TypeError, ValueError):
+        nano = 0
+    if nano > 0:
+        return str(nano)
+    try:
+        price = float(item.get("price") or 0)
+    except (TypeError, ValueError):
+        price = 0.0
+    return str(int(price * 1_000_000_000)) if price > 0 else ""
 
 
 def _format_ton(value: float) -> str:
@@ -662,7 +698,7 @@ async def fetch_income_for_period(api_token: str, since_ts: int, wallet: str = "
                     break
                 if raw_wallet and userfriendly_to_raw(item.get("src", "")) != raw_wallet and userfriendly_to_raw(item.get("dst", "")) != raw_wallet:
                     continue
-                total_ton += _nano_to_ton(item.get("price_nano", "0"))
+                total_ton += _nano_to_ton(record_price_nano(item) or "0")
             if stop or not next_cursor:
                 break
             cursor = next_cursor
@@ -700,6 +736,11 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
     by_cat: dict[str, int] = {}  # сколько записей дал каждая категория — в /health
     api_keys: list[str] | None = None  # какие поля реально отдаёт API — в /health
     direction = {"in": 0, "out": 0}  # записи, где кошелёк получает / платит
+    # Диагностика полноты выгрузки (см. LAST_LINKAGE): страницы прочитаны,
+    # записи отброшены и причина остановки пагинации по каждой категории.
+    pages_read = 0
+    dropped = {"no_wallet": 0, "no_price": 0}
+    stops: dict[str, str] = {}
 
     known = await get_all_rent_events(wallet)
     min_ts = min((int(e.get("ts", 0) or 0) for e in known), default=0)
@@ -716,7 +757,9 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
                 await asyncio.sleep(page_delay)
             items, next_cursor = await fetch_rent_history(api_token, category, limit=100, cursor=cursor)
             if not items:
+                stops[category] = "нет записей на странице"
                 break
+            pages_read += 1
             if api_keys is None:
                 api_keys = sorted(items[0].keys())
             oldest = min((int(ev.get("ts", 0) or 0) for ev in items), default=0)
@@ -725,6 +768,7 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
                     f"marketapp: {category}/history — история ушла старее блокчейн-границы "
                     f"(oldest={oldest} < min_ts={min_ts}), останавливаюсь на странице {page + 1}"
                 )
+                stops[category] = "история старее блокчейна"
                 break
             if page == 0:
                 sample = items[0] if items else {}
@@ -739,12 +783,15 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
                 src_raw = userfriendly_to_raw(item.get("src", ""))
                 dst_raw = userfriendly_to_raw(item.get("dst", ""))
                 if src_raw != raw_wallet and dst_raw != raw_wallet:
+                    dropped["no_wallet"] += 1
                     continue
                 if dst_raw == raw_wallet:
                     direction["in"] += 1
                 elif src_raw == raw_wallet:
                     direction["out"] += 1
-                if not int(item.get("price_nano", "0") or 0) > 0:
+                price_nano = record_price_nano(item)
+                if not price_nano:
+                    dropped["no_price"] += 1
                     continue
                 record = {
                     "tx_hash": item.get("tx_hash") or "",
@@ -757,25 +804,30 @@ async def collect_rent_events(api_token: str, wallet: str) -> int:
                     "ts": int(item.get("ts", 0) or 0),
                     "src": item.get("src", ""),
                     "dst": item.get("dst", ""),
-                    "price_nano": item.get("price_nano", "0"),
+                    "price_nano": price_nano,
                 }
                 collected.append(record)
 
             if not next_cursor:
+                stops[category] = "курсор кончился"
                 break
             cursor = next_cursor
+        else:
+            stops[category] = "лимит страниц"
 
         by_cat[category] = len(collected) - collected_before
 
     logger.info(f"marketapp: собрано записей по кошельку: {len(collected)} по категориям={by_cat}")
     record_linkage(collected=len(collected), matched=0, categories=by_cat,
-                   api_keys=api_keys, direction=direction)
+                   api_keys=api_keys, direction=direction,
+                   pages=pages_read, dropped=dropped, stops=stops)
     if not collected:
         return 0
 
     enriched = await enrich_blockchain_events(collected, wallet)
     record_linkage(collected=len(collected), matched=enriched, categories=by_cat,
-                   api_keys=api_keys, direction=direction)
+                   api_keys=api_keys, direction=direction,
+                   pages=pages_read, dropped=dropped, stops=stops)
     logger.info(f"marketapp: enrich совпадений с блокчейн-событиями: {enriched} из {len(collected)}")
     if enriched:
         logger.info(f"Дополнено метаданными из Marketapp: {enriched}")

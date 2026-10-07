@@ -214,6 +214,13 @@ async def _collect_health_stats() -> dict:
             "categories": LAST_LINKAGE["categories"],
             "api_keys": LAST_LINKAGE["api_keys"],
             "direction": LAST_LINKAGE["direction"],
+            # Полнота выгрузки Marketapp: страниц прочитано, сколько записей
+            # отброшено (чужие кошельки / без суммы) и на какой причине
+            # остановилась пагинация по категориям — по этому видно, мало ли
+            # отдаёт их API или мы сами чего-то не дочитываем.
+            "pages": LAST_LINKAGE["pages"],
+            "dropped": dict(LAST_LINKAGE["dropped"]),
+            "stops": dict(LAST_LINKAGE["stops"]),
             # Чем привязались: hash — тот же tx (точно), exact — совпали
             # src/dst/ts, price_tight — цена в ±300 сек, price — в ±2 ч.
             "match_paths": dict(LAST_MATCH_PATHS),
