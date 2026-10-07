@@ -65,7 +65,7 @@ LAST_HTTP_ERROR: dict = {"at": 0, "text": ""}
 
 
 def _note_http_error(text: str):
-    LAST_HTTP_ERROR.update({"at": time.time(), "text": text[:160]})
+    LAST_HTTP_ERROR.update({"at": time.time(), "text": text[:300]})
 
 
 def record_linkage(collected: int | None = None, matched: int | None = None,
@@ -163,11 +163,13 @@ async def _request_page(
         try:
             return response.json()
         except Exception:
-            # Тело обязательно в заметку: без него «невалидный JSON» не
-            # отличает HTML-страницу rate limit от оборванного ответа.
-            body = response.text[:80].replace("\n", " ").replace("\r", " ")
-            logger.error(f"{label}: невалидный JSON: {body!r}")
-            _note_http_error(f"{label}: невалидный JSON: {body!r}")
+            # Начало И конец тела: по хвосту видно, что ответ обрезан на
+            # середине (тонкий gateway), а не отдан битым намеренно.
+            text = response.text
+            logger.error(f"{label}: невалидный JSON len={len(text)}: "
+                         f"{text[:60]!r} … {text[-60:]!r}")
+            _note_http_error(f"{label}: невалидный JSON len={len(text)}: "
+                             f"{text[:60]!r} … {text[-40:]!r}")
             await asyncio.sleep(backoff)
             continue
     # Конкретную причину (429 / статус / сеть / JSON) не затираем — только
@@ -199,8 +201,21 @@ async def fetch_toncenter_txns(address: str, limit: int = 100, lt: str = None, h
             timeout=20.0
         )
 
-    data = await _request_page("TON Center", do)
-    if data is None:
+    # Страницу глубокой истории TON Center отдаёт обрезанной: тело обрывается
+    # на середине, JSON не парсится, и скан вставал намертво. Дробим: сначала
+    # просятся страницы меньшего размера, пока не влезут. Ошибка не про размер
+    # (сеть/429/статус) — дробить бессмысленно, выходим сразу.
+    for split_limit in (limit, max(25, limit // 4), 10):
+        if params["limit"] != split_limit:
+            params["limit"] = split_limit
+            logger.warning(f"TON Center: страница не влезла — пробую {split_limit} транзакций")
+        data = await _request_page("TON Center", do)
+        if data is None:
+            if "невалидный JSON" not in LAST_HTTP_ERROR.get("text", ""):
+                return None
+            continue
+        break
+    else:
         return None
 
     if not data.get("ok"):
