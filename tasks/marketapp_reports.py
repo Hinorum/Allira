@@ -50,12 +50,18 @@ LAST_SYNC: dict = {}
 
 
 def _record_sync(path: str, pages: int, complete: bool, saved: int, error: str = ""):
+    prev = LAST_SYNC.get(path)
     LAST_SYNC[path] = {
         "at": time.time(),
         "pages": pages,
         "complete": complete,
         "saved": saved,
         "error": error,
+        # Прогон до этого: без него непонятно, что дал ПОЛНЫЙ скан (первый
+        # после деплоя), — его запись затирается следующим, инкрементальным.
+        "prev": None if not prev else {
+            k: prev[k] for k in ("at", "pages", "complete", "saved")
+        },
     }
 
 
