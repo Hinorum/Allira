@@ -40,6 +40,13 @@ LAST_LINKAGE: dict = {
 # Первый ответ rent/history за жизнь процесса (см. fetch_rent_history).
 LAST_HISTORY_META: dict = {"envelope_keys": [], "items": 0, "has_cursor": False}
 
+# Последний прогон скана блокчейна — для /health: какой путь сработал
+# (tonapi или toncenter), сколько страниц пройдено и дошёл ли до конца.
+# Без этого «в базе 698 событий и они не растут» приходилось объяснять
+# вслепую: видно и обрыв, и ошибку, и то, что история дописана не до конца.
+LAST_SYNC: dict = {"at": 0, "path": "", "pages": 0, "complete": False,
+                   "saved": 0, "error": ""}
+
 
 def record_linkage(collected: int | None = None, matched: int | None = None,
                    error: str = "", categories: dict | None = None,
@@ -252,8 +259,10 @@ async def _sync_from_tonapi(wallet: str, max_pages: int = 50, from_scratch: bool
         events = await fetch_tonapi_events(wallet, before_lt=before_lt, api_key=api_key)
         if not events:
             if events is None:
-                if new_events:
-                    await save_blockchain_rent_events(new_events, wallet)
+                saved = await save_blockchain_rent_events(new_events, wallet) if new_events else 0
+                LAST_SYNC.update({"at": time.time(), "path": "tonapi", "pages": pages,
+                                  "complete": False, "saved": saved,
+                                  "error": "страница не вернулась"})
                 return 0, False
             scan_complete = True
             break
@@ -294,6 +303,8 @@ async def _sync_from_tonapi(wallet: str, max_pages: int = 50, from_scratch: bool
     if deep_lt is not None and deep_utime:
         await set_sync_state(wallet, str(deep_lt), "", deep_utime)
 
+    LAST_SYNC.update({"at": time.time(), "path": "tonapi", "pages": pages,
+                      "complete": scan_complete, "saved": saved, "error": ""})
     return saved, True
 
 
@@ -326,6 +337,7 @@ async def _sync_from_toncenter(wallet: str, max_pages: int = 50, from_scratch: b
     new_events = []
     pages = 0
     scan_complete = False
+    scan_error = ""
     deep_lt = None
     deep_hash = None
     deep_utime = 0
@@ -340,6 +352,7 @@ async def _sync_from_toncenter(wallet: str, max_pages: int = 50, from_scratch: b
 
         if items is None:
             logger.error("TON Center недоступен — история синхронизирована не полностью")
+            scan_error = "TON Center недоступен"
             break
 
         if not items:
@@ -402,6 +415,7 @@ async def _sync_from_toncenter(wallet: str, max_pages: int = 50, from_scratch: b
             break
 
         if not page_cursor_lt or not page_cursor_hash:
+            scan_error = "история кончилась без явного конца (нет курсора)"
             break
 
         cur_lt, cur_hash = page_cursor_lt, page_cursor_hash
@@ -413,11 +427,13 @@ async def _sync_from_toncenter(wallet: str, max_pages: int = 50, from_scratch: b
     if scan_complete and deep_lt and deep_hash:
         await set_sync_state(wallet, deep_lt, deep_hash, deep_utime)
 
+    saved = 0
     if new_events:
         saved = await save_blockchain_rent_events(new_events, wallet)
         logger.info(f"Блокчейн: сохранено {saved} событий аренды")
-        return saved
-    return 0
+    LAST_SYNC.update({"at": time.time(), "path": "toncenter", "pages": pages,
+                      "complete": scan_complete, "saved": saved, "error": scan_error})
+    return saved
 
 
 async def sync_blockchain_rent_job(context: ContextTypes.DEFAULT_TYPE):

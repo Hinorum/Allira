@@ -895,7 +895,8 @@ def _sync_get_rent_events_stats() -> dict:
             "COUNT(DISTINCT tx_hash) AS distinct_hash, "
             "COALESCE(SUM(CASE WHEN nft_address IS NOT NULL AND nft_address <> '' "
             "THEN 1 ELSE 0 END), 0) AS linked, "
-            "COALESCE(MAX(ts), 0) AS last_ts "
+            "COALESCE(MAX(ts), 0) AS last_ts, "
+            "COALESCE(MIN(ts), 0) AS oldest_ts "
             "FROM marketapp_rent_events"
         ).fetchone()
         by_source = {
@@ -929,6 +930,13 @@ def _sync_get_rent_events_stats() -> dict:
             "distinct_hash": int(row["distinct_hash"] or 0),
             "linked": int(row["linked"] or 0),
             "last_ts": int(row["last_ts"] or 0),
+            # Глубина истории: если скан оборвался, oldest_ts встаёт на
+            # последние дни, и «доход за период» молча недосчитывает.
+            "oldest_ts": int(row["oldest_ts"] or 0),
+            "span_days": (
+                round((int(row["last_ts"] or 0) - int(row["oldest_ts"] or 0)) / 86400, 1)
+                if row["oldest_ts"] else 0
+            ),
             "by_source": by_source,
             "duration": {
                 "nonzero": int(dur_raw["n"] or 0),

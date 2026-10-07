@@ -58,7 +58,7 @@ from handlers.dice_tournament import (
     start_tournament_from_menu,
 )
 from tasks.autoposting import setup_autoposting
-from tasks.marketapp_reports import setup_marketapp_jobs, LAST_LINKAGE, LAST_HISTORY_META
+from tasks.marketapp_reports import setup_marketapp_jobs, LAST_LINKAGE, LAST_HISTORY_META, LAST_SYNC
 
 load_dotenv()
 setup_logging()
@@ -169,8 +169,22 @@ async def _collect_health_stats() -> dict:
         "rent_events_distinct": rent["distinct_hash"],
         "rent_events_linked": rent["linked"],
         "rent_events_last_ts": rent["last_ts"],
+        # Глубина истории: если скан блокчейна оборвался, oldest_ts встаёт
+        # на последние дни и «доход за период» молча недосчитывает.
+        "rent_events_oldest_ts": rent["oldest_ts"],
+        "rent_events_span_days": rent["span_days"],
         "rent_events_by_source": rent["by_source"],
         "rent_duration": rent["duration"],
+        # Последний прогон скана блокчейна: какой путь сработал (tonapi или
+        # toncenter), сколько страниц пройдено и дошёл ли до конца истории.
+        "rent_sync": {
+            "age_s": int(time.time() - LAST_SYNC["at"]) if LAST_SYNC["at"] else None,
+            "path": LAST_SYNC["path"],
+            "pages": LAST_SYNC["pages"],
+            "complete": LAST_SYNC["complete"],
+            "saved": LAST_SYNC["saved"],
+            "error": LAST_SYNC["error"],
+        },
         # Чем закончилась последняя попытка привязать платежи к подаркам:
         # collected — сколько записей вернул Marketapp, matched — сколько
         # совпало с блокчейном, error — причина, если упала.
