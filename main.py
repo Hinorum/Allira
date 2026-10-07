@@ -29,7 +29,7 @@ from cachetools import TTLCache
 from utils.common import setup_logging, escape_html
 from utils.database import (
     init_db, increment_stat, get_stat, get_total_users, get_messages_today,
-    close_all, prune_live_states, get_rent_events_stats,
+    close_all, prune_live_states, get_rent_events_stats, LAST_MATCH_PATHS,
 )
 from utils.config import BotConfig
 from utils.http_client import close_client
@@ -181,6 +181,9 @@ async def _collect_health_stats() -> dict:
             "categories": LAST_LINKAGE["categories"],
             "api_keys": LAST_LINKAGE["api_keys"],
             "direction": LAST_LINKAGE["direction"],
+            # Чем привязались: hash — тот же tx (точно), exact — совпали
+            # src/dst/ts, price — угадано по сумме в окне ±2ч.
+            "match_paths": dict(LAST_MATCH_PATHS),
             "error": LAST_LINKAGE["error"],
         },
         # Только признаки «задано/не задано», сами секреты не отдаются.

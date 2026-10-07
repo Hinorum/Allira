@@ -608,12 +608,12 @@ def _top_rows(events: list, since_ts: int) -> tuple[list, dict]:
         entry = per_gift.setdefault(addr, {"name": name, "nano": 0, "count": 0, "days": 0})
         entry["nano"] += nano
         entry["count"] += 1
-        # Срок аренды в днях из Marketapp. Считаем только правдоподобные
-        # значения: если вдруг придут секунды/часы, такие строки молча
-        # откатятся к доходности по дням периода.
+        # Срок аренды: API отдаёт duration в СЕКУНДАХ (86400 = 1 день,
+        # максимум в проде — 12096000 = 140 дней). Иные значения считаем
+        # мусором и молча откатываемся к доходности по дням периода.
         duration = int(ev.get("duration", 0) or 0)
-        if 1 <= duration <= 366:
-            entry["days"] += duration
+        if 86_400 <= duration <= 31_536_000:
+            entry["days"] += duration / 86400
 
     rows = sorted(per_gift.items(), key=lambda kv: kv[1]["nano"], reverse=True)
     return rows, summary
@@ -653,11 +653,11 @@ def _build_top_report(wallet: str, rows: list, summary: dict, days: int | None) 
     for i, (addr, gift) in enumerate(rows[:TOP_LIMIT], 1):
         ton_value = _nano_to_ton(str(gift["nano"]))
         name = escape_html(gift["name"]) if gift["name"] else "без названия"
-        days = int(gift.get("days", 0) or 0)
+        days = float(gift.get("days", 0) or 0)
         if days:
             # Реальный срок аренды: 3.00 TON за 30 дней = 0.100 TON/сут.
             rate = ton_value / days
-            term = f"{gift['count']} плат., {days} дн."
+            term = f"{gift['count']} плат., {days:g} дн."
             mark = ""
         else:
             # Срока в данных нет — считаем от периода и помечаем, чтобы

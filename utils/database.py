@@ -672,6 +672,12 @@ def _sync_find_rent_event(conn, ts: int, src: str, dst: str, wallet: str = ""):
     return row
 
 
+# Каким способом привязался последний батч: по хешу транзакции (точно),
+# по точному совпадению src/dst/ts или по цене в окне ±2ч (эвристика).
+# Разбивка видна в /health — по ней отличим надёжную привязку от угадывания.
+LAST_MATCH_PATHS: dict = {"hash": 0, "exact": 0, "price": 0}
+
+
 def _sync_enrich_blockchain_event(conn, event: dict, wallet: str = "") -> int:
     tx_hash = event.get("tx_hash")
     canon_hash = _canonical_tx_hash(tx_hash) if tx_hash else None
@@ -683,12 +689,17 @@ def _sync_enrich_blockchain_event(conn, event: dict, wallet: str = "") -> int:
     price = int(float(event.get("price_nano") or 0))
 
     existing = None
+    path = ""
     if canon_hash:
         existing = conn.execute(
             "SELECT id FROM marketapp_rent_events WHERE tx_hash=? LIMIT 1", (canon_hash,)
         ).fetchone()
+        if existing is not None:
+            path = "hash"
     if existing is None:
         existing = _sync_find_rent_event(conn, ts, src, dst, wallet)
+        if existing is not None:
+            path = "exact"
 
     # Робастный матч: ts-окно + цена с допуском + кошелёк в src|dst
     if existing is None and ts:
@@ -713,12 +724,16 @@ def _sync_enrich_blockchain_event(conn, event: dict, wallet: str = "") -> int:
                         candidates.append(r)
             if len(candidates) == 1:
                 existing = candidates[0]
+                path = "price"
             elif len(candidates) > 1:
                 best = min(candidates, key=lambda r: abs(int(float(r["price_nano"] or 0)) - price))
                 existing = best
+                path = "price"
 
     if existing is None:
         return 0
+    if path:
+        LAST_MATCH_PATHS[path] = LAST_MATCH_PATHS.get(path, 0) + 1
     conn.execute("""
         UPDATE marketapp_rent_events
         SET category=?, nft_address=?, nft_name=?, collection_address=?,
@@ -739,6 +754,7 @@ def _sync_enrich_blockchain_event(conn, event: dict, wallet: str = "") -> int:
 
 
 def _sync_enrich_blockchain_events(events: list, wallet: str = "") -> int:
+    LAST_MATCH_PATHS.update({"hash": 0, "exact": 0, "price": 0})
     with get_db() as conn:
         saved = 0
         for event in events:
@@ -865,13 +881,14 @@ def _sync_get_rent_events_stats() -> dict:
                 "FROM marketapp_rent_events GROUP BY source"
             ).fetchall()
         }
-        # Проверка единиц duration (в днях ли он): сумма платежей на сумму
-        # сроков даёт среднюю дневную ставку — правдоподобное значение
-        # подтверждает, что доходность по сроку считается верно.
+        # Проверка единиц duration: API отдаёт секунды (86400..31536000 =
+        # 1..365 дн.). Сумма платежей на сумму сроков даёт среднюю дневную
+        # ставку — правдоподобное значение подтверждает, что доходность
+        # по сроку считается верно.
         dur = conn.execute(
-            "SELECT COUNT(*) AS n, COALESCE(SUM(duration), 0) AS days, "
+            "SELECT COUNT(*) AS n, COALESCE(SUM(duration), 0) AS secs, "
             "COALESCE(SUM(CAST(price_nano AS REAL)), 0) AS nano "
-            "FROM marketapp_rent_events WHERE duration BETWEEN 1 AND 366"
+            "FROM marketapp_rent_events WHERE duration BETWEEN 86400 AND 31536000"
         ).fetchone()
         # Сырые значения duration > 0, включая невпавшие в диапазон: по min/max
         # видно, в каких единицах приходит срок (дни/часы/секунды) и приходит ли.
@@ -879,7 +896,7 @@ def _sync_get_rent_events_stats() -> dict:
             "SELECT COUNT(*) AS n, MIN(duration) AS mn, MAX(duration) AS mx "
             "FROM marketapp_rent_events WHERE duration > 0"
         ).fetchone()
-        dur_days = int(dur["days"] or 0)
+        dur_days = (dur["secs"] or 0) / 86400
         dur_ton = (dur["nano"] or 0) / 1_000_000_000
         return {
             "total": int(row["total"] or 0),
@@ -894,7 +911,7 @@ def _sync_get_rent_events_stats() -> dict:
                 "min": int(dur_raw["mn"] or 0),
                 "max": int(dur_raw["mx"] or 0),
                 "events": int(dur["n"] or 0),
-                "days": dur_days,
+                "days": round(dur_days, 2),
                 "ton": round(dur_ton, 4),
                 "ton_per_day": round(dur_ton / dur_days, 6) if dur_days else None,
             },
