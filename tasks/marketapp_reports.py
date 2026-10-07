@@ -529,12 +529,15 @@ async def _sync_from_toncenter(wallet: str, max_pages: int = 50, from_scratch: b
         pages += 1
 
     # Чекпоинт ставим по фактически пройденной границе — даже если скан
-    # оборвался. Без этого каждый прогон начинал бы с начала и вечно упирался
-    # в ту же ошибку (у TON Center — rate limit примерно на 19-й странице);
-    # с чекпоинтом прогресс накапливается и история дописывается за пару
-    # прогонов.
+    # оборвался (иначе каждая попытка начинала бы с начала и вечно упиралась
+    # в ту же ошибку). Но граница может ТОЛЬКО углубляться: инкрементальный
+    # прогон, не дошедший до старой границы, выдавал бы мелкую точку (3
+    # страницы от новейшей транзакции) — глубокая история при этом терялась.
     if deep_lt and deep_hash:
-        await set_sync_state(wallet, deep_lt, deep_hash, deep_utime)
+        state = await get_sync_state(wallet)
+        stored_utime = int((state or {}).get("last_synced_utime") or 0)
+        if not state or not stored_utime or int(deep_utime or 0) < stored_utime:
+            await set_sync_state(wallet, deep_lt, deep_hash, deep_utime)
 
     saved = 0
     if new_events:
