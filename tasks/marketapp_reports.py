@@ -58,6 +58,16 @@ def _record_sync(path: str, pages: int, complete: bool, saved: int, error: str =
     }
 
 
+# Последняя ошибка сетевого слоя (запрос + причина) — подмешивается в
+# ошибку скана для /health: без неё «TON Center недоступен» не отличает
+# rate limit от 500-го и не говорит, на какой странице скан встал.
+LAST_HTTP_ERROR: dict = {"at": 0, "text": ""}
+
+
+def _note_http_error(text: str):
+    LAST_HTTP_ERROR.update({"at": time.time(), "text": text[:160]})
+
+
 def record_linkage(collected: int | None = None, matched: int | None = None,
                    error: str = "", categories: dict | None = None,
                    api_keys: list | None = None,
@@ -130,6 +140,7 @@ async def _request_page(
             response = await do_request(client)
         except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
             logger.warning(f"{label} сеть (попытка {attempt + 1}/{MAX_PAGE_RETRIES}): {e}")
+            _note_http_error(f"{label}: сеть — {e}")
             await asyncio.sleep(backoff)
             _bump()
             continue
@@ -138,12 +149,14 @@ async def _request_page(
             retry_after = int(response.headers.get("Retry-After", "5"))
             wait = max(retry_after, backoff) if grow_backoff else retry_after
             logger.warning(f"{label} 429 (попытка {attempt + 1}/{MAX_PAGE_RETRIES}), ожидание {wait}с...")
+            _note_http_error(f"{label}: 429, ждём {wait}с")
             await asyncio.sleep(wait)
             _bump()
             continue
 
         if response.status_code != 200:
             logger.error(f"{label} статус {response.status_code}: {response.text[:200]}")
+            _note_http_error(f"{label}: статус {response.status_code}")
             await asyncio.sleep(backoff)
             continue
 
@@ -151,8 +164,10 @@ async def _request_page(
             return response.json()
         except Exception:
             logger.error(f"{label}: невалидный JSON: {response.text[:80]!r}")
+            _note_http_error(f"{label}: невалидный JSON")
             await asyncio.sleep(backoff)
             continue
+    _note_http_error(f"{label}: попытки исчерпаны")
     return None
 
 
@@ -181,6 +196,9 @@ async def fetch_toncenter_txns(address: str, limit: int = 100, lt: str = None, h
 
     if not data.get("ok"):
         logger.error(f"TON Center API: {data}")
+        # Причина уходит в /health: ok=false у TON Center — это обычно и есть
+        # rate limit либо отклонённый запрос, а не сетевая недоступность.
+        _note_http_error(f"TON Center: ok=false — {data.get('reason') or data}")
         return None
     return data.get("result", [])
 
@@ -276,7 +294,9 @@ async def _sync_from_tonapi(wallet: str, max_pages: int = 50, from_scratch: bool
         if not events:
             if events is None:
                 saved = await save_blockchain_rent_events(new_events, wallet) if new_events else 0
-                _record_sync("tonapi", pages, False, saved, "страница не вернулась")
+                reason = ("страница не вернулась; " + LAST_HTTP_ERROR["text"]
+                          if LAST_HTTP_ERROR["text"] else "страница не вернулась")
+                _record_sync("tonapi", pages, False, saved, reason)
                 return 0, False
             scan_complete = True
             break
@@ -372,7 +392,10 @@ async def _sync_from_toncenter(wallet: str, max_pages: int = 50, from_scratch: b
 
     while pages < max_pages and not scan_complete:
         if pages > 0:
-            await asyncio.sleep(1.0 if not api_key else 0.3)
+            # TON Center без ключа ограничен 1 запросом в секунду; даже с
+            # ключом гонка 0.3с/страница рвалась на ~19-й странице. Полный
+            # скан при 1с — это ~20 секунд, переплата несущественна.
+            await asyncio.sleep(1.0)
 
         # fetch_toncenter_txns уже ретраит страницу внутри себя — раньше здесь
         # стоял второй такой же цикл, и одна страница могла породить до 9 запросов.
@@ -452,13 +475,20 @@ async def _sync_from_toncenter(wallet: str, max_pages: int = 50, from_scratch: b
         deep_utime = page_last_utime
         pages += 1
 
-    if scan_complete and deep_lt and deep_hash:
+    # Чекпоинт ставим по фактически пройденной границе — даже если скан
+    # оборвался. Без этого каждый прогон начинал бы с начала и вечно упирался
+    # в ту же ошибку (у TON Center — rate limit примерно на 19-й странице);
+    # с чекпоинтом прогресс накапливается и история дописывается за пару
+    # прогонов.
+    if deep_lt and deep_hash:
         await set_sync_state(wallet, deep_lt, deep_hash, deep_utime)
 
     saved = 0
     if new_events:
         saved = await save_blockchain_rent_events(new_events, wallet)
         logger.info(f"Блокчейн: сохранено {saved} событий аренды")
+    if scan_error and LAST_HTTP_ERROR["text"]:
+        scan_error = f"{scan_error} ({LAST_HTTP_ERROR['text']})"
     _record_sync("toncenter", pages, scan_complete, saved, scan_error)
     return saved
 
