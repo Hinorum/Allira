@@ -163,8 +163,11 @@ async def _request_page(
         try:
             return response.json()
         except Exception:
-            logger.error(f"{label}: невалидный JSON: {response.text[:80]!r}")
-            _note_http_error(f"{label}: невалидный JSON")
+            # Тело обязательно в заметку: без него «невалидный JSON» не
+            # отличает HTML-страницу rate limit от оборванного ответа.
+            body = response.text[:80].replace("\n", " ").replace("\r", " ")
+            logger.error(f"{label}: невалидный JSON: {body!r}")
+            _note_http_error(f"{label}: невалидный JSON: {body!r}")
             await asyncio.sleep(backoff)
             continue
     # Конкретную причину (429 / статус / сеть / JSON) не затираем — только
@@ -393,6 +396,12 @@ async def _sync_from_toncenter(wallet: str, max_pages: int = 50, from_scratch: b
                 # история оставалась бы оборванной навсегда.
                 start_lt = sync_state.get("last_synced_lt")
                 start_hash = sync_state.get("last_synced_hash")
+                if not start_hash:
+                    # Границу записал tonapi (он пишет пустой hash) — TON
+                    # Center от неё пагинировать не может: без hash запрос
+                    # уходит битым. Идём с начала истории, дублей не будет
+                    # (дедуп по tx_hash и по ts±300 + src/dst).
+                    start_lt = start_hash = None
             else:
                 # История дописана до конца: граница — точка останова, всё
                 # что новее, уже просканировано.

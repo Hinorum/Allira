@@ -30,6 +30,7 @@ from utils.common import setup_logging, escape_html
 from utils.database import (
     init_db, increment_stat, get_stat, get_total_users, get_messages_today,
     close_all, prune_live_states, get_rent_events_stats, LAST_MATCH_PATHS,
+    get_sync_state,
 )
 from utils.config import BotConfig
 from utils.http_client import close_client
@@ -153,11 +154,17 @@ async def purge_stale_user_data(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _collect_health_stats() -> dict:
-    total_messages, messages_today, total_users, rent = await asyncio.gather(
+    async def _sync_state():
+        if not config.marketapp_wallet:
+            return None
+        return await get_sync_state(config.marketapp_wallet)
+
+    total_messages, messages_today, total_users, rent, sync_state = await asyncio.gather(
         get_stat("total_messages"),
         get_messages_today(),
         get_total_users(),
         get_rent_events_stats(),
+        _sync_state(),
     )
     return {
         "total_messages": total_messages,
@@ -182,6 +189,17 @@ async def _collect_health_stats() -> dict:
             path: {"age_s": int(time.time() - v["at"]), **v}
             for path, v in LAST_SYNC.items()
         },
+        # Чекпоинт, от которого продолжается скан. hash_len=0 означает, что
+        # границу записал tonapi (он пишет пустой hash) — пагинация TON Center
+        # от такой границы невозможна, и скан уходит в полный перебор.
+        "rent_sync_state": (
+            None if not sync_state else {
+                "lt": sync_state.get("last_synced_lt"),
+                "hash_len": len(sync_state.get("last_synced_hash") or ""),
+                "utime": sync_state.get("last_synced_utime"),
+                "at": sync_state.get("last_sync_at"),
+            }
+        ),
         # Чем закончилась последняя попытка привязать платежи к подаркам:
         # collected — сколько записей вернул Marketapp, matched — сколько
         # совпало с блокчейном, error — причина, если упала.
