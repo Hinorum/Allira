@@ -168,6 +168,7 @@ def init_db():
                 duration INTEGER DEFAULT 0,
                 source TEXT DEFAULT 'marketapp',
                 wallet TEXT DEFAULT '',
+                comment TEXT DEFAULT '',
                 recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -204,6 +205,13 @@ def init_db():
         if "wallet" not in cols:
             conn.execute("ALTER TABLE marketapp_rent_events ADD COLUMN wallet TEXT DEFAULT ''")
             logger.info("Миграция: добавлена колонка wallet в marketapp_rent_events")
+
+        # Комментарий транзакции — единственный признак, по которому в отчёт
+        # попадает именно аренда: остальные входящие переводы сюда фильтруются
+        # маркерами, а без текста разобраться, какие переводы лишние, нельзя.
+        if "comment" not in cols:
+            conn.execute("ALTER TABLE marketapp_rent_events ADD COLUMN comment TEXT DEFAULT ''")
+            logger.info("Миграция: добавлена колонка comment в marketapp_rent_events")
 
         # Раньше эти два UPDATE по всей таблице аренды гонялись на КАЖДОМ старте
         # и замедляли деплой по мере роста данных. Одноразовый бэкфилл.
@@ -813,8 +821,8 @@ def _sync_save_blockchain_rent_events(events: list, wallet: str = "") -> int:
                 continue
             cursor = conn.execute("""
                 INSERT OR IGNORE INTO marketapp_rent_events
-                    (tx_hash, ts, src, dst, price_nano, source, wallet)
-                VALUES (?, ?, ?, ?, ?, 'blockchain', ?)
+                    (tx_hash, ts, src, dst, price_nano, source, wallet, comment)
+                VALUES (?, ?, ?, ?, ?, 'blockchain', ?, ?)
             """, (
                 canon_hash or tx_hash,
                 ts,
@@ -822,6 +830,7 @@ def _sync_save_blockchain_rent_events(events: list, wallet: str = "") -> int:
                 dst,
                 str(ev.get("value_nano", "0")),
                 wallet,
+                (ev.get("comment") or "")[:200],
             ))
             saved += cursor.rowcount
         return saved
@@ -923,6 +932,23 @@ def _sync_get_rent_events_stats() -> dict:
         ).fetchone()
         dur_days = (dur["secs"] or 0) / 86400
         dur_ton = (dur["nano"] or 0) / 1_000_000_000
+        # Структура комментариев: платежи аренды помечены в блокчейне текстом,
+        # и по top-12 видно, что реально попало в «доход» и сколько TON на
+        # каждую подпись приходится. linked — сколько из этих платежей
+        # подтверждены записью самого Marketapp (привязка к NFT).
+        cmts = conn.execute(
+            "SELECT comment, COUNT(*) AS n, "
+            "COALESCE(SUM(CASE WHEN nft_address IS NOT NULL AND nft_address <> '' "
+            "THEN 1 ELSE 0 END), 0) AS linked, "
+            "COALESCE(SUM(CAST(price_nano AS REAL)), 0) AS nano "
+            "FROM marketapp_rent_events "
+            "WHERE comment IS NOT NULL AND comment <> '' "
+            "GROUP BY comment ORDER BY n DESC LIMIT 12"
+        ).fetchall()
+        no_comment = conn.execute(
+            "SELECT COUNT(*) AS n FROM marketapp_rent_events "
+            "WHERE comment IS NULL OR comment = ''"
+        ).fetchone()
         return {
             "total": int(row["total"] or 0),
             # Дубли по хешу = один платёж, записанный дважды: total при
@@ -946,6 +972,18 @@ def _sync_get_rent_events_stats() -> dict:
                 "days": round(dur_days, 2),
                 "ton": round(dur_ton, 4),
                 "ton_per_day": round(dur_ton / dur_days, 6) if dur_days else None,
+            },
+            "comments": {
+                "no_comment": int(no_comment["n"] or 0),
+                "top": [
+                    {
+                        "comment": r["comment"],
+                        "n": int(r["n"] or 0),
+                        "linked": int(r["linked"] or 0),
+                        "ton": round((r["nano"] or 0) / 1_000_000_000, 4),
+                    }
+                    for r in cmts
+                ],
             },
         }
 

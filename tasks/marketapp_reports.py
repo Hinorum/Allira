@@ -294,6 +294,7 @@ def _tonapi_extract_rent(event: dict, raw_wallet: str) -> dict | None:
             "src": sender.get("address", ""),
             "dst": dst,
             "value_nano": str(amount),
+            "comment": comment[:200],
         }
     return None
 
@@ -512,6 +513,7 @@ async def _sync_from_toncenter(wallet: str, max_pages: int = 50, from_scratch: b
                 "src": in_msg.get("source", ""),
                 "dst": dest,
                 "value_nano": str(value),
+                "comment": message[:200],
             })
 
         if found_boundary:

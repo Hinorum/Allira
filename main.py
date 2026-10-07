@@ -181,6 +181,10 @@ async def _collect_health_stats() -> dict:
         "rent_events_oldest_ts": rent["oldest_ts"],
         "rent_events_span_days": rent["span_days"],
         "rent_events_by_source": rent["by_source"],
+        # Какие комментарии транзакций составляют «доход»: аренда помечена в
+        # блокчейне текстом, а посторонние переводы сюда попадают, если проходят
+        # маркер. По «сколько привязано к NFT» видно, где фильтр пускает лишнее.
+        "rent_comments": rent["comments"],
         "rent_duration": rent["duration"],
         # Последние прогоны скана (ключ — источник tonapi/toncenter):
         # страницы, завершённость, сохранено и ошибка. По ним видно, что
