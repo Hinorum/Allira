@@ -58,7 +58,7 @@ from handlers.dice_tournament import (
     start_tournament_from_menu,
 )
 from tasks.autoposting import setup_autoposting
-from tasks.marketapp_reports import setup_marketapp_jobs, LAST_LINKAGE
+from tasks.marketapp_reports import setup_marketapp_jobs, LAST_LINKAGE, LAST_HISTORY_META
 
 load_dotenv()
 setup_logging()
@@ -182,8 +182,11 @@ async def _collect_health_stats() -> dict:
             "api_keys": LAST_LINKAGE["api_keys"],
             "direction": LAST_LINKAGE["direction"],
             # Чем привязались: hash — тот же tx (точно), exact — совпали
-            # src/dst/ts, price — угадано по сумме в окне ±2ч.
+            # src/dst/ts, price_tight — цена в ±300 сек, price — в ±2 ч.
             "match_paths": dict(LAST_MATCH_PATHS),
+            # Первый ответ rent/history: ключи конверта, записей на странице
+            # и был ли курсор — видно, обрывается ли пагинация.
+            "history_meta": dict(LAST_HISTORY_META),
             "error": LAST_LINKAGE["error"],
         },
         # Только признаки «задано/не задано», сами секреты не отдаются.

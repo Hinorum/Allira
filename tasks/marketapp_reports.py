@@ -35,6 +35,9 @@ LAST_LINKAGE: dict = {
     "categories": {}, "api_keys": [], "direction": {"in": 0, "out": 0},
 }
 
+# Первый ответ rent/history за жизнь процесса (см. fetch_rent_history).
+LAST_HISTORY_META: dict = {"envelope_keys": [], "items": 0, "has_cursor": False}
+
 
 def record_linkage(collected: int | None = None, matched: int | None = None,
                    error: str = "", categories: dict | None = None,
@@ -452,6 +455,16 @@ async def fetch_rent_history(api_token: str, category: str, limit: int = 100,
 
     items = data.get("items", [])
     next_cursor = data.get("cursor") or data.get("next_cursor") or data.get("next_cursor_url") or None
+    # Метаданные ПЕРВОГО ответа за жизнь процесса — чтобы по /health видно
+    # было, не обрываем ли мы пагинацию из-за незнакомого ключа курсора:
+    # 68 записей при 1899 платежах могли значить и «API больше не отдаёт»,
+    # и «мы читаем не тот ключ». По ключам конверта это отличается.
+    if not LAST_HISTORY_META["envelope_keys"]:
+        LAST_HISTORY_META.update({
+            "envelope_keys": sorted(data.keys()),
+            "items": len(items),
+            "has_cursor": bool(next_cursor),
+        })
     return items, next_cursor
 
 
