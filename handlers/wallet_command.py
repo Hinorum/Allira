@@ -13,6 +13,7 @@ from tasks.marketapp_reports import (
     _nano_to_ton,
     _ts_days_ago,
     userfriendly_to_raw,
+    MAX_SYNC_PAGES,
     MSK,
     MARKETAPP_API_URL,
 )
@@ -21,8 +22,6 @@ from utils.database import get_all_rent_events, get_db
 from utils.http_client import get_client
 
 logger = logging.getLogger(__name__)
-
-MAX_SYNC_PAGES = 1000
 
 # Чаты, у которых уже идёт тяжёлая операция и её описание. Без этого повторный
 # /marketapprent (или /marketappgifts) во время долгого сканирования запускал бы

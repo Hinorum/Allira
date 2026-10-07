@@ -23,6 +23,8 @@ RENT_CATEGORIES = ["gifts", "usernames", "numbers"]
 RENT_COMMENT_MARKERS = ("marketapp", "rent")
 MAX_PAGE_RETRIES = 3
 MAX_HISTORY_PAGES = 200
+# Потолок страниц для полного скана истории блокчейна (свежая база).
+MAX_SYNC_PAGES = 1000
 
 MSK = timezone(timedelta(hours=3))
 
@@ -423,7 +425,18 @@ async def sync_blockchain_rent_job(context: ContextTypes.DEFAULT_TYPE):
         wallet = context.bot_data.get("MARKETAPP_WALLET", "")
         if not wallet:
             return
-        await sync_rent_from_blockchain(wallet, max_pages=3)
+        # Свежая база (деплой на бесплатном Render стирает диск) — чекпоинта
+        # нет. Трёх страниц хватает лишь на первые дни, а после первого
+        # прогона граница уже записана, и история НИКОГДА не углубляется:
+        # период отчёта и итог скачет — то 1899 событий, то 251. Первый
+        # прогон гонит полную историю, дальше — только новые транзакции.
+        sync_state = await get_sync_state(wallet)
+        full = not sync_state
+        await sync_rent_from_blockchain(
+            wallet,
+            max_pages=MAX_SYNC_PAGES if full else 3,
+            from_scratch=full,
+        )
     except Exception as e:
         logger.error(f"Ошибка синхронизации блокчейна: {e}", exc_info=True)
 
