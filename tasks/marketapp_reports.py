@@ -10,7 +10,7 @@ from utils.database import (
     save_marketapp_profit, get_previous_profit, get_profit_for_period,
     save_blockchain_rent_events, get_sync_state, set_sync_state,
     enrich_blockchain_events, get_all_rent_events,
-    get_linkage_feed, set_linkage_feed
+    get_linkage_feed, set_linkage_feed, get_rent_events_stats
 )
 from utils.config import BotConfig
 from utils.common import normalize_ton_address
@@ -58,6 +58,19 @@ LINKAGE_REPORT_BUDGET = 60
 LINKAGE_REREAD_S = 86400
 # Потолок страниц для полного скана истории блокчейна (свежая база).
 MAX_SYNC_PAGES = 1000
+# «Лишнее» событие: глубже максимума своей страницы настолько, что это не
+# может быть обычным порядком ленты. У tonapi попадались старые события с
+# чужим lt/timestamp на свежей позиции: их lt уводил пагинацию (before_lt)
+# в начало истории, скан закрывался пустой страницей как «конец», а
+# чекпоинт писался по ним же — история обрезалась навсегда. Событие с таким
+# разрывом не участвует в управлении сканом (пагинация/граница/чекпоинт);
+# если оно действительно старое — страница его настоящего возраста вернёт.
+OUTLIER_GAP_S = 90 * 86400
+# Чекпоинт «глубже данных» только при разрыве сильнее этого: хвост истории
+# без единого платежа — норма (у кошелька первые ~10 месяцев — вовсе без
+# аренды), поэтому ложная тревога здесь дешевле, чем вечный инкремент по
+# 3 страницы с обрезанной историей.
+COHERENCY_GAP_S = 400 * 86400
 
 MSK = timezone(timedelta(hours=3))
 
@@ -418,21 +431,32 @@ async def _sync_from_tonapi(wallet: str, max_pages: int = 50, from_scratch: bool
             scan_complete = True
             break
 
+        page_max_ts = max(
+            (int(ev.get("timestamp", 0) or 0) for ev in events), default=0
+        )
         for ev in events:
             try:
                 lt = int(ev.get("lt", 0) or 0)
             except (TypeError, ValueError):
                 lt = 0
-            if boundary is not None and lt <= boundary:
+            ts = int(ev.get("timestamp", 0) or 0)
+            # «Лишнее» старое событие на свежей странице: его lt/timestamp
+            # не должны двигать ни пагинацию, ни границу, ни чекпоинт —
+            # иначе before_lt прыгает в начало истории, скан «завершается»
+            # пустой страницей, а глубина чекпоинта отражает выдумку, а не
+            # прочитанные данные (см. OUTLIER_GAP_S).
+            is_outlier = bool(page_max_ts and ts and page_max_ts - ts > OUTLIER_GAP_S)
+            if boundary is not None and lt <= boundary and not is_outlier:
                 deep_lt = boundary
-                deep_utime = int(ev.get("timestamp", 0) or 0)
+                deep_utime = ts
                 scan_complete = True
                 break
             rent = _tonapi_extract_rent(ev, raw_wallet)
             if rent:
                 new_events.append(rent)
-            deep_lt = lt
-            deep_utime = int(ev.get("timestamp", 0) or 0)
+            if not is_outlier:
+                deep_lt = lt
+                deep_utime = ts
 
         if scan_complete:
             break
@@ -652,7 +676,24 @@ async def sync_blockchain_rent_job(context: ContextTypes.DEFAULT_TYPE):
         elif prev.get("complete") is False:
             await sync_rent_from_blockchain(wallet, max_pages=MAX_SYNC_PAGES, from_scratch=False)
         else:
-            await sync_rent_from_blockchain(wallet, max_pages=3, from_scratch=False)
+            # Чекпоинт может врать о глубине: страница с «лишним» старым
+            # событием уводила пагинацию в начало истории, скан закрывался
+            # пустой страницей как «конец», а чекпоинт писался по нему же.
+            # Тогда история висела обрезанной навсегда: инкремент читал
+            # 3 страницы у верха и никогда не возвращался вглубь. Если база
+            # отстаёт от чекпоинта сильнее, чем на COHERENCY_GAP_S, — прогон
+            # идёт с границы и дочитывает недостающее, вместо «тихих» 3
+            # страниц.
+            oldest = (await get_rent_events_stats()).get("oldest_ts") or 0
+            state_utime = int(sync_state.get("last_synced_utime") or 0)
+            if oldest and state_utime and oldest > state_utime + COHERENCY_GAP_S:
+                logger.info(
+                    f"[sync] история не сходится: база от {oldest}, чекпоинт от "
+                    f"{state_utime} — догоняю с границы"
+                )
+                await sync_rent_from_blockchain(wallet, max_pages=MAX_SYNC_PAGES, from_scratch=False)
+            else:
+                await sync_rent_from_blockchain(wallet, max_pages=3, from_scratch=False)
     except Exception as e:
         logger.error(f"Ошибка синхронизации блокчейна: {e}", exc_info=True)
 
