@@ -76,6 +76,16 @@ COHERENCY_GAP_S = 400 * 86400
 # обрезанными (тело JSON рвётся) — их дробит защита внутри fetch_*.
 TONAPI_PAGE_LIMIT = 500
 TONCENTER_PAGE_LIMIT = 500
+# Пэйсинг чтения ленты Marketapp: их API ни разу не вернул 429, поэтому
+# стартуем с 1.5с (было 3с), а на ошибке пауза удваивается до 8с — темп
+# падает только тогда, когда есть с чем осторожничать.
+LINKAGE_PAGE_DELAY = 1.5
+LINKAGE_PAGE_DELAY_MAX = 8.0
+# Лимит одной страницы их ленты: если API примет больше сотни — глубина
+# читается впятеро меньше страниц; если отклонит — откат на 100
+# (см. fetch_rent_history).
+MARKETAPP_PAGE_LIMIT = 500
+_history_limit = {"value": MARKETAPP_PAGE_LIMIT}
 
 MSK = timezone(timedelta(hours=3))
 
@@ -99,7 +109,7 @@ LAST_LINKAGE: dict = {
 
 # Первый ответ rent/history за жизнь процесса (см. fetch_rent_history).
 LAST_HISTORY_META: dict = {"envelope_keys": [], "items": 0, "has_cursor": False,
-                           "sample_tx_hash": None,
+                           "sample_tx_hash": None, "page_limit": 0,
                            "sample_cursor": {"len": 0, "numeric": False}}
 
 # Последние прогоны скана блокчейна (ключ — путь tonapi/toncenter) — для
@@ -716,8 +726,9 @@ async def sync_blockchain_rent_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 @with_retry(max_retries=2, base_delay=5.0)
-async def fetch_rent_history(api_token: str, category: str, limit: int = 100,
+async def fetch_rent_history(api_token: str, category: str, limit: int = None,
                              cursor: str = None) -> tuple[list | None, str | None]:
+    limit = _history_limit["value"] if limit is None else limit
     params = {"limit": limit}
     if cursor:
         params["cursor"] = cursor
@@ -737,9 +748,22 @@ async def fetch_rent_history(api_token: str, category: str, limit: int = 100,
     data = await _request_page(
         f"Marketapp ({category}/history)", do, base_delay=3.0, grow_backoff=True
     )
+    if data is None and limit > 100 and _history_limit["value"] == limit:
+        # Крупную страницу отклонили (обрыв тела, 4xx на limit) — откатываемся
+        # на сотню и запоминаем, чтобы дальше не долбить. Ошибка не про
+        # размер (сеть/429) — лимит не трогаем, его лечит ретрай.
+        text = LAST_HTTP_ERROR.get("text", "")
+        if any(s in text for s in ("невалидный JSON", " 400", " 413", " 422")):
+            logger.warning(f"Marketapp: страница из {limit} записей не принята — откат на 100")
+            _history_limit["value"] = limit = 100
+            params["limit"] = 100
+            data = await _request_page(
+                f"Marketapp ({category}/history)", do, base_delay=3.0, grow_backoff=True
+            )
     if data is None:
         return None, None
 
+    LAST_HISTORY_META["page_limit"] = limit
     items = data.get("items", [])
     next_cursor = data.get("cursor") or data.get("next_cursor") or data.get("next_cursor_url") or None
     # Метаданные ПЕРВОГО ответа за жизнь процесса — чтобы по /health видно
@@ -776,8 +800,8 @@ async def fetch_income_for_period(api_token: str, since_ts: int, wallet: str = "
         cursor = None
         for page in range(MAX_HISTORY_PAGES):
             if page > 0:
-                await asyncio.sleep(3.0)
-            items, next_cursor = await fetch_rent_history(api_token, category, limit=100, cursor=cursor)
+                await asyncio.sleep(LINKAGE_PAGE_DELAY)
+            items, next_cursor = await fetch_rent_history(api_token, category, cursor=cursor)
             if not items:
                 break
             stop = False
@@ -914,7 +938,7 @@ async def collect_rent_events(api_token: str, wallet: str,
         boundary_ok = incremental or has_deep
         cursor = start_cursor
         start_from_top = cursor is None
-        page_delay = 3.0
+        page_delay = LINKAGE_PAGE_DELAY
         collected_before = len(collected)
         pages_cat = 0
         dirty = False  # состояние изменилось, даже если страниц не прочли
@@ -928,8 +952,11 @@ async def collect_rent_events(api_token: str, wallet: str,
                 break
             if page > 0:
                 await asyncio.sleep(page_delay)
-            items, next_cursor = await fetch_rent_history(
-                api_token, category, limit=100, cursor=cursor)
+            items, next_cursor = await fetch_rent_history(api_token, category, cursor=cursor)
+            if items:
+                page_delay = max(LINKAGE_PAGE_DELAY, page_delay * 0.75)
+            else:
+                page_delay = min(page_delay * 2, LINKAGE_PAGE_DELAY_MAX)
             if not items:
                 if cursor is None or incremental:
                     # Пусто с верха либо дошли до самого конца ленты.
