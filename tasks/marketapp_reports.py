@@ -134,7 +134,8 @@ LAST_HISTORY_META: dict = {"envelope_keys": [], "items": 0, "has_cursor": False,
 LAST_SYNC: dict = {}
 
 
-def _record_sync(path: str, pages: int, complete: bool, saved: int, error: str = ""):
+def _record_sync(path: str, pages: int, complete: bool, saved: int, error: str = "",
+                 via: str = "", page_ts: list | None = None, saved_ts_min: int = 0):
     prev = LAST_SYNC.get(path)
     LAST_SYNC[path] = {
         "at": time.time(),
@@ -142,6 +143,17 @@ def _record_sync(path: str, pages: int, complete: bool, saved: int, error: str =
         "complete": complete,
         "saved": saved,
         "error": error,
+        # Чем закончился именно этот прогон: «конец истории», «граница»,
+        # «хвост» или «лимит страниц». Без этого complete=true не отличает
+        # настоящий конец от ложного — инцидент с обрезанной историей так
+        # и выглядел: complete=true, а страниц прочитано 13.
+        "via": via,
+        # ts-диапазон [старый, новый] последней прочитанной страницы: где
+        # чтение физически остановилось, даже если чекпоинт врёт о глубине.
+        "page_ts": page_ts or [],
+        # Самое старое событие, сохранённое этим прогоном: разрыв с page_ts
+        # показывает, что из прочитанного не дошло до базы.
+        "saved_ts_min": saved_ts_min,
         # Прогон до этого: без него непонятно, что дал ПОЛНЫЙ скан (первый
         # после деплоя), — его запись затирается следующим, инкрементальным.
         "prev": None if not prev else {
@@ -456,6 +468,8 @@ async def _sync_from_tonapi(wallet: str, max_pages: int = 50, from_scratch: bool
     scan_complete = False
     deep_lt = None
     deep_utime = 0
+    via = ""           # чем закончился прогон — для /health
+    last_page_ts: list = []  # ts-диапазон последней прочитанной страницы
 
     while pages < max_pages and not scan_complete:
         if pages > 0:
@@ -467,14 +481,19 @@ async def _sync_from_tonapi(wallet: str, max_pages: int = 50, from_scratch: bool
                 saved = await save_blockchain_rent_events(new_events, wallet) if new_events else 0
                 reason = ("страница не вернулась; " + LAST_HTTP_ERROR["text"]
                           if LAST_HTTP_ERROR["text"] else "страница не вернулась")
-                _record_sync("tonapi", pages, False, saved, reason)
+                _record_sync("tonapi", pages, False, saved, reason,
+                             via="ошибка", page_ts=last_page_ts)
                 return 0, False
+            via = "конец истории (пустая страница)"
             scan_complete = True
             break
 
-        page_max_ts = max(
-            (int(ev.get("timestamp", 0) or 0) for ev in events), default=0
-        )
+        page_ts_vals = [
+            t for t in (int(ev.get("timestamp", 0) or 0) for ev in events) if t
+        ]
+        page_max_ts = max(page_ts_vals, default=0)
+        if page_ts_vals:
+            last_page_ts = [min(page_ts_vals), page_max_ts]
         for ev in events:
             try:
                 lt = int(ev.get("lt", 0) or 0)
@@ -490,6 +509,7 @@ async def _sync_from_tonapi(wallet: str, max_pages: int = 50, from_scratch: bool
             if boundary is not None and lt <= boundary and not is_outlier:
                 deep_lt = boundary
                 deep_utime = ts
+                via = "граница чекпоинта"
                 scan_complete = True
                 break
             rent = _tonapi_extract_rent(ev, raw_wallet)
@@ -502,6 +522,7 @@ async def _sync_from_tonapi(wallet: str, max_pages: int = 50, from_scratch: bool
         if scan_complete:
             break
         if deep_lt is None:
+            via = "страница без событий с lt"
             break
         before_lt = str(deep_lt)
         pages += 1
@@ -520,7 +541,11 @@ async def _sync_from_tonapi(wallet: str, max_pages: int = 50, from_scratch: bool
     if deep_lt is not None and deep_utime and not had_state:
         await set_sync_state(wallet, str(deep_lt), "", deep_utime)
 
-    _record_sync("tonapi", pages, scan_complete, saved)
+    if not via:
+        via = "лимит страниц"
+    saved_ts_min = min((int(e.get("ts", 0) or 0) for e in new_events), default=0)
+    _record_sync("tonapi", pages, scan_complete, saved, via=via,
+                 page_ts=last_page_ts, saved_ts_min=saved_ts_min)
     return saved, True
 
 
@@ -590,6 +615,8 @@ async def _sync_from_toncenter(wallet: str, max_pages: int = 50, from_scratch: b
     deep_lt = None
     deep_hash = None
     deep_utime = 0
+    via = ""           # чем закончился прогон — для /health
+    last_page_ts: list = []  # ts-диапазон последней прочитанной страницы
 
     while pages < max_pages and not scan_complete:
         if pages > 0:
@@ -605,11 +632,17 @@ async def _sync_from_toncenter(wallet: str, max_pages: int = 50, from_scratch: b
         if items is None:
             logger.error("TON Center недоступен — история синхронизирована не полностью")
             scan_error = "TON Center недоступен"
+            via = "ошибка"
             break
 
         if not items:
+            via = "конец истории (пустая страница)"
             scan_complete = True
             break
+
+        item_ts_vals = [it.get("utime", 0) for it in items if it.get("utime")]
+        if item_ts_vals:
+            last_page_ts = [min(item_ts_vals), max(item_ts_vals)]
 
         found_boundary = False
         page_cursor_lt = None
@@ -658,17 +691,20 @@ async def _sync_from_toncenter(wallet: str, max_pages: int = 50, from_scratch: b
             })
 
         if found_boundary:
+            via = "граница чекпоинта"
             scan_complete = True
             break
 
         # TON Center v2 на «хвосте» истории возвращает курсорную транзакцию самой
         # (lt/hash совпадают с запрошенным) — значит, старше ничего нет
         if cur_lt is not None and page_cursor_lt == cur_lt and page_cursor_hash == cur_hash:
+            via = "хвост истории (курсор не сдвинулся)"
             scan_complete = True
             break
 
         if not page_cursor_lt or not page_cursor_hash:
             scan_error = "история кончилась без явного конца (нет курсора)"
+            via = "ошибка"
             break
 
         cur_lt, cur_hash = page_cursor_lt, page_cursor_hash
@@ -694,7 +730,11 @@ async def _sync_from_toncenter(wallet: str, max_pages: int = 50, from_scratch: b
         logger.info(f"Блокчейн: сохранено {saved} событий аренды")
     if scan_error and LAST_HTTP_ERROR["text"]:
         scan_error = f"{scan_error} ({LAST_HTTP_ERROR['text']})"
-    _record_sync("toncenter", pages, scan_complete, saved, scan_error)
+    if not via:
+        via = "лимит страниц"
+    saved_ts_min = min((int(e.get("ts", 0) or 0) for e in new_events), default=0)
+    _record_sync("toncenter", pages, scan_complete, saved, scan_error,
+                 via=via, page_ts=last_page_ts, saved_ts_min=saved_ts_min)
     return saved
 
 

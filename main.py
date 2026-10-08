@@ -59,7 +59,7 @@ from handlers.dice_tournament import (
     start_tournament_from_menu,
 )
 from tasks.autoposting import setup_autoposting
-from tasks.marketapp_reports import setup_marketapp_jobs, LAST_LINKAGE, LAST_HISTORY_META, LAST_SYNC
+from tasks.marketapp_reports import setup_marketapp_jobs, LAST_LINKAGE, LAST_HISTORY_META, LAST_SYNC, LAST_HTTP_ERROR
 
 load_dotenv()
 setup_logging()
@@ -193,6 +193,16 @@ async def _collect_health_stats() -> dict:
             path: {"age_s": int(time.time() - v["at"]), **v}
             for path, v in LAST_SYNC.items()
         },
+        # Последняя ошибка сетевого слоя: какая именно страница не прошла
+        # (429 / статус / сеть / обрезанный JSON) и когда. Скан-ошибки её
+        # подмешивают в своё поле error, но здесь она видна целиком, даже
+        # когда последний прогон прошёл чисто.
+        "http_error": (
+            None if not LAST_HTTP_ERROR["at"] else {
+                "age_s": int(time.time() - LAST_HTTP_ERROR["at"]),
+                "text": LAST_HTTP_ERROR["text"],
+            }
+        ),
         # Чекпоинт, от которого продолжается скан. hash_len=0 означает, что
         # границу записал tonapi (он пишет пустой hash) — пагинация TON Center
         # от такой границы невозможна, и скан уходит в полный перебор.
