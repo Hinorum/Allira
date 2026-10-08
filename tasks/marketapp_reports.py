@@ -767,16 +767,18 @@ async def collect_rent_events(api_token: str, wallet: str,
     """Читает ленту истории Marketapp и привязывает записи к платежам.
 
     Их лента общая, платформенная (~100 записей на страницу и ~38 страниц
-    в сутки), поэтому окно в 70+ дней — это порядка 2300 страниц. Два
-    режима, состояние каждого хранится в linkage_feed_state:
-      * «догон глубины» — окно не достигнуто, чтение возобновляется с
-        сохранённого курсора deep_cursor: без него каждый прогон стартовал
-        бы с верха, упирался в бюджет и не продвигался вглубь — ровно так
-        привязка зависла на 500 страниц за прогон;
-      * «инкремент» (флаг done) — окно достигнуто, читаем только свежий
-        верх до границы прошлого прогона: десятки страниц вместо тысяч;
-      * отчёт передаёт свой маленький бюджет, чтобы не ждать глубокого
-        чтения ленты.
+    в сутки), а окно блокчейна теперь в год — порядка 14000 страниц.
+    Состояние каждого хранится в linkage_feed_state, каждая категория
+    читается двумя фазами, сначала верх всех категорий, потом догон:
+      * верх ленты — до границы прошлого прогона, чтобы свежие платежи
+        привязывались сразу, не дожидаясь догона глубины;
+      * догон глубины — возобновление с сохранённого курсора deep_cursor:
+        без него каждый прогон стартовал бы с верха, упирался в бюджет
+        и не продвигался вглубь — ровно так привязка зависла на 500
+        страниц за прогон;
+      * флаг done (окно достигнуто) — остаётся только верх, это инкремент;
+      * отчёт передаёт свой маленький бюджет: верх прочитается целиком,
+        глубина — по остатку.
     """
     raw_wallet = userfriendly_to_raw(wallet)
     collected = []
@@ -808,26 +810,51 @@ async def collect_rent_events(api_token: str, wallet: str,
         return 0
 
     # Границы чтения по категориям: top_ts — ts самой новой записи прошлого
-    # прогона (глубже уже прочитано), depth_ts — как глубоко дошли вообще.
+    # прогона (глубже уже прочитано), depth_ts — как глубоко дошли вообще,
+    # deep_cursor — курсор возобновления догона, done — окно достигнуто.
     feed = await get_linkage_feed(wallet)
     window_start = min_ts - 604800  # за 7 дней до самого старого платежа
 
-    for i, category in enumerate(RENT_CATEGORIES):
-        if budget <= 0:
-            stops[category] = "бюджет страниц исчерпан"
-            by_cat[category] = 0
-            continue
+    # Каждая категория читается двумя фазами: (1) свежий верх — до границы
+    # прошлого прогона, чтобы новые платежи привязывались сразу; (2) догон
+    # глубины — с сохранённого курсора, без которого каждый прогон
+    # стартовал бы с верха и не продвигался вглубь (ровно так привязка
+    # зависла на 500 страниц за прогон). Фаза 2 добавляется, только если
+    # окно ещё не добрано и курсор есть. Сначала верх всех категорий,
+    # потом догон: свежие платежи важнее глубины, а пустые категории не
+    # должны съедать бюджет догона.
+    tops: list[tuple[str, str | None]] = []
+    deeps: list[tuple[str, str | None]] = []
+    for category in RENT_CATEGORIES:
+        st = feed.get(category) or {}
+        resume = None if st.get("done") else (st.get("deep_cursor") or None)
+        # Граница «уже прочитано» безопасна, лишь когда глубину продолжит
+        # фаза с курсором (или окно уже добыто): пока возобновления нет,
+        # чтение сверху — это и есть весь догон, останавливаться рано.
+        if not resume or int(st.get("top_ts", 0) or 0):
+            tops.append((category, None))
+        if resume:
+            deeps.append((category, resume))
+    tasks = tops + deeps
+
+    for i, (category, start_cursor) in enumerate(tasks):
         if i > 0:
             await asyncio.sleep(5)
         state = feed.get(category) or {}
+        if start_cursor is not None and state.get("done"):
+            # Окно добрано предыдущей фазой этого же прогона.
+            by_cat.setdefault(category, 0)
+            continue
+        if budget <= 0:
+            stops[category] = "бюджет страниц исчерпан"
+            by_cat.setdefault(category, 0)
+            continue
         prev_top = int(state.get("top_ts", 0) or 0)
-        # Два режима. «Догон глубины» — окно ещё не достигнуто, листаем с
-        # сохранённого курсора: без возобновления каждый прогон начинался бы
-        # с верха, упирался в бюджет и глубина не росла бы вообще (ровно так
-        # привязка зависла на 500 страницах за прогон). «Инкремент» — окно
-        # достигнуто, читаем только свежий верх до границы прошлого прогона.
         incremental = bool(state.get("done"))
-        cursor = None if incremental else (state.get("deep_cursor") or None)
+        saved_deep = None if incremental else (state.get("deep_cursor") or None)
+        has_deep = bool(saved_deep)
+        boundary_ok = incremental or has_deep
+        cursor = start_cursor
         start_from_top = cursor is None
         page_delay = 3.0
         collected_before = len(collected)
@@ -855,7 +882,6 @@ async def collect_rent_events(api_token: str, wallet: str,
                     # но сначала сбрасываем его в состоянии, иначе следующий
                     # прогон уйдёт в тот же тупик.
                     cursor = None
-                    start_from_top = True
                     dirty = True
                     stop_reason = "курсор не подхватился, начнём с верха"
                 break
@@ -869,11 +895,13 @@ async def collect_rent_events(api_token: str, wallet: str,
             newest = max(newest, max(page_ts, default=0))
             if oldest:
                 deepest = min(deepest, oldest) if deepest else oldest
-            # 1) Инкремент: ниже границы прошлого прогона уже всё прочитано
-            #    (сутки перечитываем заново — страховка от нестрогой
-            #    сортировки их ленты). В режиме догонa глубины правило не
-            #    применяется: мы и так начали чтение ниже этой границы.
-            if incremental and prev_top and oldest and oldest <= prev_top - LINKAGE_REREAD_S:
+            # 1) Ниже границы прошлого прогона уже всё прочитано (сутки
+            #    перечитываем заново — страховка от нестрогой сортировки их
+            #    ленты). Работает только для фазы, стартующей сверху, и
+            #    только когда глубину продолжит фаза с курсором или окно
+            #    уже добыто: иначе это единственный способ дойти вглубь.
+            if (start_from_top and boundary_ok and prev_top
+                    and oldest and oldest <= prev_top - LINKAGE_REREAD_S):
                 logger.info(
                     f"marketapp: {category}/history — ниже границы прошлого прогона "
                     f"(oldest={oldest} <= {prev_top - LINKAGE_REREAD_S}), "
@@ -937,7 +965,7 @@ async def collect_rent_events(api_token: str, wallet: str,
             stop_reason = "лимит страниц"
 
         stops[category] = stop_reason
-        by_cat[category] = len(collected) - collected_before
+        by_cat[category] = by_cat.get(category, 0) + (len(collected) - collected_before)
 
         # Состояние пишем и при обрыве по бюджету: прочитанный отрезок
         # непрерывен и покрыт целиком, а без сохранённого курсора глубина
@@ -952,7 +980,11 @@ async def collect_rent_events(api_token: str, wallet: str,
                 if deepest:
                     old_depth = int(new_state.get("depth_ts", 0) or 0)
                     new_state["depth_ts"] = min(old_depth, deepest) if old_depth else deepest
-                new_state["deep_cursor"] = cursor
+                # Курсор двигает только фаза, читающая вглубь: фаза сверху
+                # при живом возобновлении не должна затирать его точкой у
+                # границы — иначе догон начнётся заново с верха.
+                if not start_from_top or not has_deep:
+                    new_state["deep_cursor"] = cursor
             if done:
                 new_state["done"] = True
             feed[category] = new_state
