@@ -91,6 +91,15 @@ LINKAGE_PAGE_DELAY_MAX = 8.0
 # (см. fetch_rent_history).
 MARKETAPP_PAGE_LIMIT = 500
 _history_limit = {"value": MARKETAPP_PAGE_LIMIT}
+# Проба пустой категории: сколько записей истории читать вглубь, прежде чем
+# признать, что платёжей этого кошелька тут нет, и не жечь дальше бюджет
+# догона впустую (у категории с большим потоком чужих записей иное дно —
+# окно блокчейна, но кап добирает и его). Кап считается в страницах под
+# текущий лимит ленты, хранится в состоянии (probe_left) и тратится от
+# прогона к прогону; первая же запись категории снимает его — категория
+# с платежами дальше читается по общим правилам.
+HISTORY_PROBE_ITEMS = 120_000
+HISTORY_PROBE_STOP = "проба пустой категории исчерпана"
 
 MSK = timezone(timedelta(hours=3))
 
@@ -951,9 +960,23 @@ async def collect_rent_events(api_token: str, wallet: str,
         deepest = 0    # самая старая прочитанная ts — глубина покрытия
         done = incremental  # True, когда упёрлись в конец ленты или в окно
         stop_reason = ""
+        # Проба пустой категории: только для догона глубины и только пока
+        # у категории ни одной записи не было (ни раньше, ни в верхней
+        # фазе этого же прогона — она уже посчитана в hits).
+        probe_left = None
+        if start_cursor is not None and not incremental \
+                and int(state.get("hits", 0) or 0) == 0:
+            if "probe_left" in state:
+                probe_left = int(state["probe_left"])
+            else:
+                probe_left = max(
+                    1, HISTORY_PROBE_ITEMS // max(1, _history_limit["value"]))
         for page in range(MAX_HISTORY_PAGES):
             if budget <= 0:
                 stop_reason = "бюджет страниц исчерпан"
+                break
+            if probe_left is not None and probe_left <= 0:
+                stop_reason = HISTORY_PROBE_STOP
                 break
             if page > 0:
                 await asyncio.sleep(page_delay)
@@ -978,6 +1001,8 @@ async def collect_rent_events(api_token: str, wallet: str,
             budget -= 1
             pages_read += 1
             pages_cat += 1
+            if probe_left is not None:
+                probe_left -= 1
             if api_keys is None:
                 api_keys = sorted(items[0].keys())
             page_ts = [int(ev.get("ts", 0) or 0) for ev in items]
@@ -1064,6 +1089,16 @@ async def collect_rent_events(api_token: str, wallet: str,
         # участки прочитанными.
         if pages_cat or dirty:
             new_state = dict(state)
+            delta = len(collected) - collected_before
+            hits = int(new_state.get("hits", 0) or 0)
+            if hits or delta:
+                # Категория давала записи (в этом прогоне или раньше) —
+                # кап пробы снимается навсегда, вглубь читаем по общим
+                # правилам до окна блокчейна или конца ленты.
+                new_state["hits"] = hits + delta
+                new_state.pop("probe_left", None)
+            elif probe_left is not None:
+                new_state["probe_left"] = probe_left
             if start_from_top and newest:
                 new_state["top_ts"] = newest
             if not incremental:
