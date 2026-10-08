@@ -1414,7 +1414,9 @@ def setup_marketapp_jobs(application):
     application.job_queue.run_repeating(
         sync_rent_events_job,
         interval=timedelta(minutes=30),
-        first=45,
+        # Первый запуск позже boot-скана блокчейна (~100с): иначе привязка
+        # стартует по пустой базе после деплоя и зря пропускает цикл.
+        first=180,
         name="marketapp_rent_sync"
     )
 
