@@ -46,10 +46,15 @@ MAX_PAGE_RETRIES = 3
 # Потолок страниц на одну категорию за прогон: лента Marketapp общая,
 # платформенная — чтобы дойти до старта окна блокчейна, нужно ~450 страниц.
 MAX_HISTORY_PAGES = 1000
-# Общий бюджет страниц на весь прогон привязки (≈25 мин при паузе 3 с):
-# держит джобу внутри её интервала. Прогон, остановленный по бюджету,
-# границу «непрочитанного» не двигает — глубина догоняется дальше.
-LINKAGE_RUN_BUDGET = 500
+# Общий бюджет страниц на весь прогон привязки (≈25 мин при паузе 1.5 с —
+# проверка в test_budget): держит джобу внутри её интервала (30 мин).
+# Прогон, остановленный по бюджету, границу «непрочитанного» не двигает —
+# глубина догоняется дальше.
+LINKAGE_RUN_BUDGET = 1000
+# Идёт ли прогон привязки: и джоба, и отчёт пишут состояние чтения ленты
+# (курсор/границы) — параллельные читатели затёрли бы прогресс друг друга
+# и удвоили бы нагрузку на API. Отчёт при занятости привязку пропускает.
+LINKAGE_BUSY = {"running": False}
 # Сколько страниц разрешено читать отчёту, когда привязки ещё нет вовсе:
 # раньше отчёт упирался в полное чтение ленты (~20 мин ожидания).
 LINKAGE_REPORT_BUDGET = 60
@@ -1093,6 +1098,13 @@ async def collect_rent_events(api_token: str, wallet: str,
 
 
 async def sync_rent_events_job(context: ContextTypes.DEFAULT_TYPE):
+    if LINKAGE_BUSY["running"]:
+        # Прошлый прогон ещё идёт (1000 страниц — до ~25 мин): второй
+        # параллельный только удвоит нагрузку и затрёт курсор первого.
+        # Пропускаем — глубина догоняется следующим прогоном.
+        logger.info("marketapp: прогон привязки ещё идёт — пропускаю")
+        return
+    LINKAGE_BUSY["running"] = True
     try:
         bot_data = context.bot_data
         api_token = bot_data.get("MARKETAPP_API_KEY")
@@ -1106,6 +1118,8 @@ async def sync_rent_events_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Ошибка сбора событий аренды: {e}", exc_info=True)
         record_linkage(error=f"{type(e).__name__}: {e}")
+    finally:
+        LINKAGE_BUSY["running"] = False
 
 
 def format_daily_report(current_profit: float, previous_profit: float | None) -> str:
