@@ -71,6 +71,11 @@ OUTLIER_GAP_S = 90 * 86400
 # аренды), поэтому ложная тревога здесь дешевле, чем вечный инкремент по
 # 3 страницы с обрезанной историей.
 COHERENCY_GAP_S = 400 * 86400
+# Лимит одной страницы в сканерах блокчейна: год истории — сотни страниц,
+# каждая лишняя — пауза и запрос. Крупные страницы обоих API иногда приходят
+# обрезанными (тело JSON рвётся) — их дробит защита внутри fetch_*.
+TONAPI_PAGE_LIMIT = 500
+TONCENTER_PAGE_LIMIT = 500
 
 MSK = timezone(timedelta(hours=3))
 
@@ -333,9 +338,9 @@ async def fetch_toncenter_txns(address: str, limit: int = 100, lt: str = None, h
 
 
 @with_retry(max_retries=2, base_delay=3.0)
-async def fetch_tonapi_events(address: str, before_lt: str = None, limit: int = 100,
+async def fetch_tonapi_events(address: str, before_lt: str = None, limit: int = None,
                               api_key: str = None) -> list | None:
-    params = {"limit": limit}
+    params = {"limit": limit or TONAPI_PAGE_LIMIT}
     if before_lt:
         params["before_lt"] = before_lt
     headers = {"User-Agent": "AlliraBot/1.0"}
@@ -350,8 +355,20 @@ async def fetch_tonapi_events(address: str, before_lt: str = None, limit: int = 
             timeout=20.0
         )
 
-    data = await _request_page("tonapi", do)
-    if data is None:
+    # Как у TON Center: крупная страница может прийти обрезанной (тело JSON
+    # рвётся) — тогда пробуем меньшую. Ошибка не про размер (сеть/429/
+    # статус) — дробить бессмысленно, выходим сразу.
+    for split_limit in (params["limit"], max(25, params["limit"] // 4), 10):
+        if params["limit"] != split_limit:
+            params["limit"] = split_limit
+            logger.warning(f"tonapi: страница не влезла — пробую {split_limit} событий")
+        data = await _request_page("tonapi", do)
+        if data is None:
+            if "невалидный JSON" not in LAST_HTTP_ERROR.get("text", ""):
+                return None
+            continue
+        break
+    else:
         return None
 
     events = data.get("events") or []
@@ -559,7 +576,7 @@ async def _sync_from_toncenter(wallet: str, max_pages: int = 50, from_scratch: b
 
         # fetch_toncenter_txns уже ретраит страницу внутри себя — раньше здесь
         # стоял второй такой же цикл, и одна страница могла породить до 9 запросов.
-        items = await fetch_toncenter_txns(wallet, limit=100, lt=cur_lt, hash_val=cur_hash, api_key=api_key)
+        items = await fetch_toncenter_txns(wallet, limit=TONCENTER_PAGE_LIMIT, lt=cur_lt, hash_val=cur_hash, api_key=api_key)
 
         if items is None:
             logger.error("TON Center недоступен — история синхронизирована не полностью")
