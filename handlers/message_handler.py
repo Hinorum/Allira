@@ -1,7 +1,9 @@
+import base64
 import logging
 import re
 import random
 import time
+from cachetools import TTLCache
 from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
@@ -127,6 +129,52 @@ def _build_user_prompt(text: str, message) -> str:
     return f"{quoted}\n\n{text}"
 
 
+# Фото для vision-канала: data-URL уходит в OpenRouter напрямую в payload,
+# поэтому держим потолок — base64 раздувает байты вчетверо.
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+# Повторные реплаи на одно фото не качают файл заново: file_id стабилен.
+_image_cache: TTLCache = TTLCache(maxsize=64, ttl=3600)
+
+
+async def _photo_data_url(context, photo_sizes) -> str | None:
+    """Самое большое фото → data-URL. None, если файл жирнее лимита."""
+    if not photo_sizes:
+        return None
+    chosen = max(photo_sizes, key=lambda p: p.file_size or 0)
+    if (chosen.file_size or 0) > MAX_IMAGE_BYTES:
+        logger.info(f"Фото {chosen.file_id} больше {MAX_IMAGE_BYTES} байт — пропускаем")
+        return None
+    cached = _image_cache.get(chosen.file_id)
+    if cached:
+        return cached
+    try:
+        file = await context.bot.get_file(chosen.file_id)
+        data = await file.download_as_bytearray()
+    except Exception as e:
+        logger.warning(f"Не удалось скачать фото: {e}")
+        return None
+    if len(data) > MAX_IMAGE_BYTES:
+        return None
+    url = "data:image/jpeg;base64," + base64.b64encode(bytes(data)).decode()
+    _image_cache[chosen.file_id] = url
+    return url
+
+
+async def _collect_images(context, message) -> list[str]:
+    """Изображения текущего сообщения и цитируемого реплаем (до 2 штук)."""
+    images: list[str] = []
+    for src in (message, getattr(message, "reply_to_message", None)):
+        if src is None:
+            continue
+        photo = getattr(src, "photo", None)
+        if not photo:
+            continue
+        url = await _photo_data_url(context, photo)
+        if url:
+            images.append(url)
+    return images
+
+
 def _get_history(context: ContextTypes.DEFAULT_TYPE) -> list[dict]:
     history = context.user_data.get(HISTORY_KEY)
     if not isinstance(history, list):
@@ -241,12 +289,19 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
 
     try:
+        # Фото текущего сообщения и цитаты → vision-канал. Модель для
+        # картинок своя: текстовые из FALLBACK отклоняют image_url (400).
+        images = await _collect_images(context, message)
+        if images:
+            model = bot_data.get("VISION_MODEL", model)
+
         response = await get_llm_response(
             user_prompt=user_prompt,
             system_prompt=load_prompt(speaker),
             model=model,
             api_key=bot_data["OPENROUTER_API_KEY"],
-            history=_history_for_prompt(context, speaker)
+            history=_history_for_prompt(context, speaker),
+            images=images or None
         )
 
         _append_history(context, "user", text, speaker)

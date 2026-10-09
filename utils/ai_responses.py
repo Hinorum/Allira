@@ -18,6 +18,13 @@ FALLBACK_MODELS = [
     "nvidia/nemotron-3.5-lightning:free",
 ]
 
+# Цепочка для запросов с изображениями: обычные текстовые модели отклоняют
+# image_url (400), поэтому у неё свой список — только те, что едят картинки.
+VISION_FALLBACK_MODELS = [
+    "google/gemma-4-31b-it:free",
+    "qwen/qwen3.8-27b:free",
+]
+
 _model_failures: dict[str, int] = {}
 _model_last_failure: dict[str, float] = {}
 CIRCUIT_BREAKER_THRESHOLD = 3
@@ -201,13 +208,15 @@ async def get_llm_response(
     model: str,
     api_key: str,
     history: list[dict] | None = None,
+    images: list[str] | None = None,
 ) -> str:
     # Разделитель вынесен в переменную: обратный слэш внутри f-string запрещён
     # на Python 3.11, а на Render зафиксирован именно 3.11.11.
     cache_key = f"{model}:{uuid.uuid5(uuid.NAMESPACE_DNS, _cache_source(user_prompt, system_prompt))}"
 
-    # Кэш только для запросов без истории: с историей каждый запрос уникален.
-    cacheable = not history
+    # Кэш только для запросов без истории и без картинок: ключ строится по
+    # тексту, а с изображениями одинаковый текст даёт разные ответы.
+    cacheable = not history and not images
     if cacheable and cache_key in response_cache:
         logger.debug("Использован кэшированный ответ")
         return response_cache[cache_key]
@@ -227,7 +236,20 @@ async def get_llm_response(
         content = str(turn.get("content") or "").strip()
         if role in ("user", "assistant") and content:
             messages.append({"role": role, "content": content[:2000]})
-    messages.append({"role": "user", "content": user_prompt[:4000]})
+
+    # Мультимодальная часть: текст + картинки (OpenRouter принимает
+    # data-URL в image_url). Без картинок content остаётся строкой —
+    # формат, который ждут все текстовые модели.
+    def _user_content(imgs: list[str] | None):
+        if not imgs:
+            return user_prompt[:4000]
+        parts: list[dict] = [{"type": "text", "text": user_prompt[:4000]}]
+        parts.extend(
+            {"type": "image_url", "image_url": {"url": url}} for url in imgs
+        )
+        return parts
+
+    messages.append({"role": "user", "content": _user_content(images)})
 
     payload = {
         "model": model,
@@ -261,10 +283,17 @@ async def get_llm_response(
             return None
         return strip_reasoning(content)
 
-    async def _try_models(primary: str) -> str | None:
-        models_to_try = [primary] + [m for m in FALLBACK_MODELS if m != primary]
+    async def _try_models(primary: str, imgs: list[str] | None = None) -> str | None:
+        if imgs:
+            # С картинками пробуем только vision-модели: текстовые отвечают
+            # 400 и зря тратят лимит circuit breaker.
+            chain = [primary] + [m for m in VISION_FALLBACK_MODELS if m != primary]
+        else:
+            chain = [primary] + [m for m in FALLBACK_MODELS if m != primary]
 
-        for m in models_to_try:
+        messages[-1]["content"] = _user_content(imgs)
+
+        for m in chain:
             if _is_circuit_open(m):
                 logger.warning(f"Модель {m} заблокирована circuit breaker")
                 continue
@@ -287,38 +316,50 @@ async def get_llm_response(
 
         return None
 
-    try:
+    async def _run(imgs: list[str] | None) -> tuple[str | None, str | None]:
+        """Один проход по цепочке моделей. Возвращает (ответ, сервисная ошибка)."""
+        messages[-1]["content"] = _user_content(imgs)
+        payload["messages"] = messages
         resp = await _call_openrouter(payload, headers, timeout=30.0)
 
         if resp.status_code == 429:
             logger.warning("Превышен лимит API")
-            return ERR_RATE_LIMITED
+            return None, ERR_RATE_LIMITED
 
         if resp.status_code != 200:
             logger.error(f"OpenRouter API error {resp.status_code}: {resp.text[:500]}")
             if resp.status_code in (400, 404, 402):
-                result = await _try_models(model)
-                if result:
-                    if cacheable:
-                        response_cache[cache_key] = result[:2000]
-                    return result
-                return ERR_NO_MODELS
-            return ERR_SERVICE_DOWN
+                result = await _try_models(model, imgs)
+                return (result, None) if result else (None, ERR_NO_MODELS)
+            return None, ERR_SERVICE_DOWN
 
         result = _parse_ok(resp)
         if result:
             _record_success(model)
-            if cacheable:
-                response_cache[cache_key] = result[:2000]
-            return result
+            return result, None
 
-        logger.warning(f"Некорректный ответ, пробуем fallback модели")
-        result = await _try_models(model)
+        logger.warning("Некорректный ответ, пробуем fallback модели")
+        result = await _try_models(model, imgs)
+        if result:
+            return result, None
+        return None, ERR_EMPTY_ANSWER
+
+    try:
+        result, err = await _run(images)
         if result:
             if cacheable:
                 response_cache[cache_key] = result[:2000]
             return result
-        return ERR_EMPTY_ANSWER
+
+        # Деградация: ни одна vision-модель не съела картинку — отвечаем
+        # текстом, только быстрее молчать, чем молчать совсем.
+        if images and err not in (ERR_RATE_LIMITED, ERR_TECHNICAL):
+            logger.info("Картинки не обработались, повторяем без изображений")
+            result, err = await _run(None)
+            if result:
+                return result
+
+        return err or ERR_NO_MODELS
 
     except Exception as e:
         logger.error(f"Ошибка LLM: {e}")

@@ -372,6 +372,7 @@ async def post_init(application: Application):
     application.bot_data.update({
         "DEFAULT_MODEL": config.default_model,
         "LANE_MODEL": config.lane_model,
+        "VISION_MODEL": config.vision_model,
         "FALLBACK_MODEL": config.fallback_model,
         "OPENROUTER_API_KEY": config.openrouter_api_key,
         "NEWS_CHANNEL_ID": config.news_channel_id,

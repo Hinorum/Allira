@@ -9,6 +9,8 @@ class BotConfig:
     default_model: str = "nvidia/nemotron-3-super-120b-a12b:free"
     fallback_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
     lane_model: str = "google/gemma-4-31b-it:free"
+    # Модель для запросов с изображениями: должна принимать image_url.
+    vision_model: str = "google/gemma-4-31b-it:free"
     news_channel_id: str = ""
     port: int = 10000
     marketapp_api_key: str = ""
@@ -34,6 +36,7 @@ class BotConfig:
             default_model=os.getenv("DEFAULT_MODEL", "nvidia/nemotron-3-super-120b-a12b:free"),
             fallback_model=os.getenv("FALLBACK_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free"),
             lane_model=os.getenv("LANE_MODEL", "google/gemma-4-31b-it:free"),
+            vision_model=os.getenv("VISION_MODEL", "google/gemma-4-31b-it:free"),
             news_channel_id=os.getenv("NEWS_CHANNEL_ID", ""),
             admin_chat_id=os.getenv("ADMIN_CHAT_ID", "").strip(),
             admin_user_ids=admin_ids,
