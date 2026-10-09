@@ -354,7 +354,7 @@ async def post_init(application: Application):
         try:
             await application.bot.send_message(
                 config.admin_chat_id,
-                f"Бот @{bot_info.username} запущен (uptime сброслен)"
+                f"Бот @{bot_info.username} запущен"
             )
         except Exception as e:
             logger.warning(f"Не удалось отправить стартовое уведомление: {e}")
