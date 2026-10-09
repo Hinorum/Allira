@@ -29,6 +29,31 @@ STYLE_SUFFIXES = {
     ),
 }
 
+POST_STYLE_SUFFIXES = {
+    "allira": (
+        "\n\nСТИЛЬ ДЛЯ КАНАЛА (ОБЯЗАТЕЛЬНО):\n"
+        "- Пиши как реальный человек: разговорный язык, сленг трейдеров (HODL, FOMO, dip, pump, whale).\n"
+        "- Эмодзи умеренно, не в каждом предложении.\n"
+        "- Будь саркастичной и язвительной, но по делу.\n"
+        "- Делись мыслями о рынке как будто обсуждаешь с другом.\n"
+        "- Длина: 3-6 коротких предложений.\n"
+        "- Вплети цифры и данные из темы естественно в текст, не выделяй их отдельным блоком.\n"
+        "- Не упоминай, что ты ИИ или нейросеть.\n"
+        "- Не пиши служебные инструкции вроде 'Максимум X символов'."
+    ),
+    "lane": (
+        "\n\nСТИЛЬ ДЛЯ КАНАЛА (ОБЯЗАТЕЛЬНО):\n"
+        "- Рассуждай философски о технологиях и будущем.\n"
+        "- Используй метафоры и образы.\n"
+        "- Много пауз (...) и курсивных внутренних мыслей (*курсив*).\n"
+        "- Будь загадочной и мудрой, но понятной.\n"
+        "- Длина: 3-6 коротких предложений.\n"
+        "- Вплети цифры и данные из темы естественно в текст, не выделяй их отдельным блоком.\n"
+        "- Не упоминай, что ты ИИ или нейросеть.\n"
+        "- Не пиши служебные инструкции вроде 'Максимум X символов'."
+    ),
+}
+
 BASE_PROMPTS = {
     "allira": [
         "Ты Аллира — дерзкая крыса крипторынка, шизо-принцесса Web3. Твоя стихия — хаос, сарказм и крипто. Ты вещаешь из бункера с заляпанной клавиатурой. Твоя стая — AlliraCryptoQueen.",
@@ -41,12 +66,19 @@ BASE_PROMPTS = {
 }
 
 
-def load_prompt(speaker: str) -> str:
+def _load_base(speaker: str) -> str:
+    """Базовое описание персонажа — закреплённое на весь жизненный цикл.
+
+    Раньше random.choice вызывался при каждом сообщении: персонаж менялся
+    внутри одного диалога, а кэш ответов (ключ по промпту) промахивался
+    вхолостую. Теперь варианты базы перемешиваются один раз при старте.
+    """
     if speaker not in prompt_cache:
         prompt_cache[speaker] = {
             "custom": None,
             "checked_fs": False,
-            "base": BASE_PROMPTS.get(speaker, [""])
+            "base": BASE_PROMPTS.get(speaker, [""]),
+            "chosen": random.choice(BASE_PROMPTS.get(speaker, [""])),
         }
 
     cache = prompt_cache[speaker]
@@ -65,13 +97,20 @@ def load_prompt(speaker: str) -> str:
         except Exception as e:
             logger.debug(f"Нет кастомного промпта для {speaker}: {e}")
 
-    if cache["custom"]:
-        base = cache["custom"]
-    else:
-        base = random.choice(cache["base"])
+    return cache["custom"] or cache["chosen"]
 
-    suffix = STYLE_SUFFIXES.get(speaker, "")
-    return base + suffix
+
+def load_prompt(speaker: str) -> str:
+    return _load_base(speaker) + STYLE_SUFFIXES.get(speaker, "")
+
+
+def load_post_prompt(speaker: str) -> str:
+    """Промпт для поста в канал: та же база персонажа, но постовый стиль.
+
+    Раньше пост нёс третью копию описания Аллиры/Лэйн — персонаж в канале
+    расходился с персонажем в чате.
+    """
+    return _load_base(speaker) + POST_STYLE_SUFFIXES.get(speaker, "")
 
 
 def preload_all_prompts():

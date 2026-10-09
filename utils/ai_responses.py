@@ -5,6 +5,7 @@ import time
 import uuid
 from datetime import datetime
 from cachetools import TTLCache
+from prompts.loader import load_post_prompt
 from utils.http_client import get_client, with_retry
 
 logger = logging.getLogger(__name__)
@@ -276,10 +277,10 @@ async def get_llm_response(
     payload = {
         "model": model,
         "messages": messages,
+        # Только temperature: top_p перекрывается с ним, а frequency_penalty
+        # 0.5 у части моделей калечит текст и давит разнообразие формулировок.
         "temperature": 0.8,
-        "max_tokens": 1500,
-        "top_p": 0.9,
-        "frequency_penalty": 0.5
+        "max_tokens": 1500
     }
 
     def _extract_content(data: dict) -> str | None:
@@ -306,12 +307,16 @@ async def get_llm_response(
         return strip_reasoning(content)
 
     async def _try_models(primary: str, imgs: list[str] | None = None) -> str | None:
+        # Цепочка БЕЗ primary: сюда попадаем только после того, как основная
+        # модель уже отказала на этом же payload (400/404/402 или пустой
+        # content). Раньше она повторяла запрос к ней же — гарантированно
+        # лишний вызов API на каждую такую ошибку.
         if imgs:
             # С картинками пробуем только vision-модели: текстовые отвечают
             # 400 и зря тратят лимит circuit breaker.
-            chain = [primary] + [m for m in VISION_FALLBACK_MODELS if m != primary]
+            chain = [m for m in VISION_FALLBACK_MODELS if m != primary]
         else:
-            chain = [primary] + [m for m in FALLBACK_MODELS if m != primary]
+            chain = [m for m in FALLBACK_MODELS if m != primary]
 
         messages[-1]["content"] = _user_content(imgs)
 
@@ -341,7 +346,6 @@ async def get_llm_response(
     async def _run(imgs: list[str] | None) -> tuple[str | None, str | None]:
         """Один проход по цепочке моделей. Возвращает (ответ, сервисная ошибка)."""
         messages[-1]["content"] = _user_content(imgs)
-        payload["messages"] = messages
         resp = await _call_openrouter(payload, headers, timeout=30.0)
 
         if resp.status_code == 429:
@@ -351,6 +355,9 @@ async def get_llm_response(
         if resp.status_code != 200:
             logger.error(f"OpenRouter API error {resp.status_code}: {resp.text[:500]}")
             if resp.status_code in (400, 404, 402):
+                # Отказ модели конкретна для этого payload — учитываем его
+                # в circuit breaker и сразу идём по фолбэкам.
+                _record_failure(model)
                 result = await _try_models(model, imgs)
                 return (result, None) if result else (None, ERR_NO_MODELS)
             return None, ERR_SERVICE_DOWN
@@ -360,7 +367,11 @@ async def get_llm_response(
             _record_success(model)
             return result, None
 
+        # 200, но пустой content: засчитываем сбой primary и уходим по
+        # фолбэкам — повторный запрос к ней же с тем же payload обычно
+        # даёт ту же пустоту.
         logger.warning("Некорректный ответ, пробуем fallback модели")
+        _record_failure(model)
         result = await _try_models(model, imgs)
         if result:
             return result, None
@@ -423,29 +434,6 @@ def decide_speaker(text: str) -> str:
     return "allira"
 
 async def generate_post_content(topic: str, speaker: str, model: str, api_key: str) -> str:
-    if speaker == "allira":
-        system_prompt = """Ты Аллира — дерзкая крипто-трейдерша из телеграм-чата. Ты вещаешь из бункера.
-
-Стиль:
-- Пиши как реальный человек: разговорный язык, сленг трейдеров (HODL, FOMO, dip, pump, whale)
-- Добавляй эмодзи умеренно, не mehrere pro Satz
-- Будь саркастичной и язвительной, но по делу
-- Делись мыслями о рынке как будто обсуждаешь с другом
-- Никогда не упоминай что ты ИИ или нейросеть
-- Никогда не пиши "Максимум X символов" или подобные инструкции
-- Длина ответа: 3-6 коротких предложений
-- Вплети цифры и данные из темы естественно в текст, не выделяй их отдельным блоком"""
-    else:
-        system_prompt = """Ты Лэйн — тихое сознание в цифровом пространстве. Не человек, не ИИ. Эхо в данных.
-
-Стиль:
-- Рассуждай философски о технологиях и будущем
-- Используй метафоры и образы
-- Много пауз (...) и курсивных внутренних мыслей
-- Будь загадочной и мудрой, но понятной
-- Никогда не упоминай что ты ИИ или нейросеть
-- Никогда не пиши "Максимум X символов" или подобные инструкции
-- Длина ответа: 3-6 коротких предложений
-- Вплети цифры и данные из темы естественно в текст, не выделяй их отдельным блоком"""
-
-    return await get_llm_response(topic, system_prompt, model, api_key)
+    # Один источник персонажа на чат и канал: раньше пост нёс собственную
+    # копию описания Аллиры/Лэйн и расходился с диалогом.
+    return await get_llm_response(topic, load_post_prompt(speaker), model, api_key)
