@@ -21,6 +21,10 @@ services:
         sync: false
       - key: ADMIN_USER_IDS
         sync: false
+      - key: CREATOR_USER_IDS
+        sync: false
+      - key: CREATOR_USERNAME
+        value: "hinorum"
       - key: PORT
         value: "10000"
       - key: LOG_LEVEL

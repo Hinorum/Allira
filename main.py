@@ -379,10 +379,16 @@ async def post_init(application: Application):
         "MARKETAPP_API_KEY": config.marketapp_api_key,
         "MARKETAPP_WALLET": config.marketapp_wallet,
         "ADMIN_USER_IDS": config.admin_user_ids,
+        "CREATOR_USER_IDS": config.creator_user_ids,
+        "CREATOR_USERNAME": config.creator_username,
     })
     if not config.admin_user_ids:
         logger.warning(
             "ADMIN_USER_IDS не задан — команды /ban и /unban никому не доступны"
+        )
+    if not config.creator_user_ids and not config.creator_username:
+        logger.warning(
+            "CREATOR_USER_IDS и CREATOR_USERNAME не заданы — в ЛС отвечает всем"
         )
 
     # Сразу видно в логах Render, откуда берутся данные отчётов: базу аренды

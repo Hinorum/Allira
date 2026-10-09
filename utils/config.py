@@ -19,6 +19,10 @@ class BotConfig:
     tonapi_api_key: str = ""
     admin_chat_id: str = ""
     admin_user_ids: tuple = ()
+    # ЛС-доступ: бот отвечает в личке только создателю. ID — точное
+    # совпадение, username — запасной вариант, если ID не указан.
+    creator_user_ids: tuple = ()
+    creator_username: str = "hinorum"
     bot_username: str = ""
     bot_id: int = 0
 
@@ -28,6 +32,12 @@ class BotConfig:
         admin_ids = tuple(
             int(part.strip())
             for part in raw_admins.split(",")
+            if part.strip().lstrip("-").isdigit()
+        )
+        raw_creators = os.getenv("CREATOR_USER_IDS", "").replace(";", ",")
+        creator_ids = tuple(
+            int(part.strip())
+            for part in raw_creators.split(",")
             if part.strip().lstrip("-").isdigit()
         )
         return cls(
@@ -40,6 +50,8 @@ class BotConfig:
             news_channel_id=os.getenv("NEWS_CHANNEL_ID", ""),
             admin_chat_id=os.getenv("ADMIN_CHAT_ID", "").strip(),
             admin_user_ids=admin_ids,
+            creator_user_ids=creator_ids,
+            creator_username=os.getenv("CREATOR_USERNAME", "hinorum").strip().lstrip("@"),
             port=int(os.getenv("PORT", "10000")),
             marketapp_api_key=os.getenv("MARKETAPP_API_KEY", "").strip(),
             marketapp_wallet=os.getenv("MARKETAPP_WALLET", "").strip(),

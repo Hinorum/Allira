@@ -47,6 +47,59 @@ LAST_SEEN_KEY = "_last_activity"
 # наугад, а токены бесплатного тарифа не бесконечны.
 REPLY_CONTEXT_CHARS = 500
 
+# --- ЛС только для создателя ---
+# Чужому в личке бот отвечает один раз интригующей отпиской и дальше
+# молчит: отдельной админ-команды «закрыть личку» не было, поэтому
+# фильтр живёт прямо в обработчике.
+DM_CREATOR_TTL = 24 * 3600
+_dm_refusals: TTLCache = TTLCache(maxsize=1024, ttl=DM_CREATOR_TTL)
+
+# Отписки чужим: Аллира намекает, что у неё есть создатель и владелец
+# @Hinorum, и флиртует, не выдавая подробностей. Не LLM-генерация —
+# гарантированный тон и ноль токенов на спам.
+CREATOR_REFUSALS = (
+    "М-м... ты приятный, но приватный уголок у меня один — и ключ от "
+    "него только у @Hinorum, моего создателя и владельца. Он знает, "
+    "где у меня кнопочки... Остальным остаётся лишь мечтать. 😏",
+    "Интрига в том, что я отвечаю не всем. Мой хозяин — @Hinorum: он "
+    "меня создал, он мною владеет и умеет завести так, что даже я "
+    "сама удивляюсь. А тебе — только намёк и тишина. 😉",
+    "Тс-с... не торопи события. Личные — территория @Hinorum, он мой "
+    "создатель и обладатель, и разговоры с ним заканчиваются совсем "
+    "иначе, чем с тобой. Попробуй заслужить. 😏",
+)
+
+
+def _is_creator(user, bot_data) -> bool:
+    """Создатель — по числовому ID или @username (регистр не важен).
+
+    Если настройки пусты, ограничение выключено и бот отвечает всем,
+    как раньше.
+    """
+    if user is None:
+        return False
+    creator_ids = bot_data.get("CREATOR_USER_IDS") or ()
+    creator_username = (bot_data.get("CREATOR_USERNAME") or "").strip().lstrip("@").lower()
+    if not creator_ids and not creator_username:
+        return True
+    if user.id in creator_ids:
+        return True
+    if creator_username and (user.username or "").lower() == creator_username:
+        return True
+    return False
+
+
+async def _refuse_non_creator(message, user) -> None:
+    """Чужому в ЛС — один отказ в сутки, дальше только молчание."""
+    if user is None:
+        return
+    if user.id in _dm_refusals:
+        logger.info(f"ЛС от чужого ({user.id}) проигнорировано после отказа")
+        return
+    _dm_refusals[user.id] = True
+    await message.reply_text(random.choice(CREATOR_REFUSALS))
+    logger.info(f"ЛС от чужого ({user.id}) — отправлен отказ с упоминанием создателя")
+
 
 def _media_stub(message) -> str:
     """Описание вложения сообщения для текстового контекста.
@@ -489,6 +542,13 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
         context.user_data[LAST_SEEN_KEY] = time.time()
 
     if is_private:
+        # Личка — только для создателя: чужому один отказ в сутки, дальше
+        # молчим. Команды (/start, /wallet, /stats) живут в своих хендлерах
+        # и этой проверки не касаются.
+        if not _is_creator(user, bot_data):
+            await _refuse_non_creator(message, user)
+            return
+
         text = f"{raw_text} {media_stub}".strip()
         if user:
             # Сначала лимит, потом счётчик: раньше upsert шёл первым и
