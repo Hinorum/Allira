@@ -3,6 +3,7 @@ import logging
 import re
 import time
 import uuid
+from datetime import datetime
 from cachetools import TTLCache
 from utils.http_client import get_client, with_retry
 
@@ -138,6 +139,24 @@ def strip_reasoning(text: str) -> str:
 
 response_cache = TTLCache(maxsize=100, ttl=300)
 
+
+def _current_datetime_line() -> str:
+    """Строка «сегодня» для промпта: модель не знает текущую дату без подсказки.
+
+    На Render TZ=Europe/Moscow, но берём часовой пояс явно через zoneinfo,
+    чтобы локальные тесты и прод говорили об одном и том же.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("Europe/Moscow"))
+        tz = "МСК"
+    except Exception:
+        now = datetime.now()
+        tz = "время сервера"
+    weekdays = ("понедельник", "вторник", "среда", "четверг",
+                "пятница", "суббота", "воскресенье")
+    return f"Сегодня {weekdays[now.weekday()]}, {now.strftime('%d.%m.%Y %H:%M')} ({tz})"
+
 # Служебные ответы-заглушки. Раньше их ловили сниффингом префиксов прямо
 # в main.py ("response.startswith('Технические')...") — любая переформулировка
 # ломала проверку. Теперь это единый источник правды, который меняет только
@@ -230,7 +249,10 @@ async def get_llm_response(
 
     # История диалога идёт перед новым сообщением. Порядок ролей важен для
     # всех провайдеров, поэтому system всегда первый, а не по времени.
-    messages = [{"role": "system", "content": system_prompt}]
+    # Дата добавляется ПОСЛЕ вычисления cache_key: иначе ключ менялся бы
+    # каждую минуту и кэш перестал бы работать вовсе.
+    system_content = f"{system_prompt}\n\n{_current_datetime_line()}"
+    messages = [{"role": "system", "content": system_content}]
     for turn in (history or []):
         role = turn.get("role")
         content = str(turn.get("content") or "").strip()
