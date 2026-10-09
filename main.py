@@ -13,6 +13,7 @@ from telegram import (
     BotCommand,
     BotCommandScopeChat,
 )
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -498,6 +499,11 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error(f"Inline answer error: {e}")
 
 
+# Дедупликация алертов: в момент деплоя одна и та же ошибка прилетает
+# пачкой (PTB ретраит поллинг), и админ получал четыре одинаковых сообщения.
+_alert_cache: TTLCache = TTLCache(maxsize=64, ttl=600)
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Ловит необработанные исключения: пишет в лог и сообщает админу.
 
@@ -505,6 +511,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     поэтому поломки приходилось диагностировать вслепую.
     """
     error = context.error
+
+    # Conflict = второй поллер на том же токене. При деплое на Render это
+    # штатно: старый инстанс ещё держит getUpdates, пока новый поднимается.
+    # Алертить им админа бессмысленно — он самоизлечивается за секунды.
+    if isinstance(error, Conflict):
+        logger.warning(f"Конфликт поллинга (другой инстанс): {error}")
+        return
+
     logger.error("Необработанная ошибка при обработке апдейта", exc_info=error)
 
     chat = getattr(update, "effective_chat", None)
@@ -513,8 +527,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     if chat is not None:
         where = f"чат {getattr(chat, 'id', '?')}"
     who = f"от {user.id}" if user else ""
+    alert_key = f"{type(error).__name__}:{str(error)[:200]}"
     try:
-        if config.admin_chat_id:
+        if config.admin_chat_id and alert_key not in _alert_cache:
+            _alert_cache[alert_key] = True
             await context.bot.send_message(
                 config.admin_chat_id,
                 f"Ошибка бота ({where}, {who}):\n{type(error).__name__}: {error}"[:1000]
