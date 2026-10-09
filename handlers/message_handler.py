@@ -170,10 +170,18 @@ def _history_for_prompt(context: ContextTypes.DEFAULT_TYPE, speaker: str) -> lis
 
 
 async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, is_private: bool = False):
-    if not update.message or not update.message.text:
+    if not update.message:
         return
 
     message = update.message
+    # Подпись к медиа равноправна с текстом: юзер спрашивает про фото
+    # словами «что на картинке» — они лежат в caption.
+    raw_text = ((getattr(message, "text", None) or getattr(message, "caption", None) or "")).strip()
+    media_stub = _media_stub(message)
+    if not raw_text and not media_stub:
+        # служебные сообщения без текста и вложений
+        return
+
     bot_data = context.bot_data
     bot_username = bot_data.get("bot_username", "")
     user = message.from_user
@@ -187,7 +195,7 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
         context.user_data[LAST_SEEN_KEY] = time.time()
 
     if is_private:
-        text = (message.text or "").strip()
+        text = f"{raw_text} {media_stub}".strip()
         if user:
             # Сначала лимит, потом счётчик: раньше upsert шёл первым и
             # отклонённые попытки попадали в message_count как активность.
@@ -197,20 +205,20 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
             await upsert_user(user.id, user.username, user.first_name)
         logger.info(f"Личное сообщение от {user.username} (len={len(text)})")
     else:
-        is_mention = f"@{bot_username}" in message.text if bot_username else False
+        is_mention = f"@{bot_username}" in raw_text if bot_username else False
         # Реплай ЛЮБОГО сообщения — это вызов бота: юзер цитирует пост и
         # ждёт ответа с учётом его содержимого. Раньше считался только
         # реплай на само сообщение бота.
         is_reply = getattr(message, "reply_to_message", None) is not None
 
         trigger_words = ["аллира", "лейн", "allira", "lane"]
-        has_trigger = any(re.search(rf'\b{word}\b', message.text.lower()) for word in trigger_words)
+        has_trigger = any(re.search(rf'\b{word}\b', raw_text.lower()) for word in trigger_words)
 
         if not (is_mention or is_reply or has_trigger):
             return
 
         if not (is_mention or is_reply) and random.random() > RESPONSE_CHANCE:
-            logger.info(f"Пропущено (шанс {RESPONSE_CHANCE}): {len(message.text)} символов")
+            logger.info(f"Пропущено (шанс {RESPONSE_CHANCE}): {len(raw_text)} символов")
             return
 
         if user:
@@ -219,8 +227,9 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
                 return
             await upsert_user(user.id, user.username, user.first_name)
 
-        clean_text = re.sub(re.escape(f"@{bot_username}"), "", message.text, flags=re.IGNORECASE).strip()
-        text = clean_text if clean_text else "Привет!"
+        clean_text = re.sub(re.escape(f"@{bot_username}"), "", raw_text, flags=re.IGNORECASE).strip()
+        # Медиа без подписи: до vision-фазы бот про него знает только тип
+        text = f"{clean_text} {media_stub}".strip() or "Привет!"
 
     speaker = decide_speaker(text)
     model = bot_data["LANE_MODEL"] if speaker == "lane" else bot_data["DEFAULT_MODEL"]

@@ -590,19 +590,24 @@ def build_application() -> Application:
 
     application.add_error_handler(error_handler)
 
+    # Фильтр контента: текст, подписи к медиа и сами вложения (фото, гифки,
+    # стикеры, файлы). COMMAND отсекает только текстовые команды — у подписей
+    # свои caption_entities, но команды в подписи никто не шлёт.
+    content = (filters.TEXT | filters.CAPTION | filters.ATTACHMENT) & ~filters.COMMAND
+
     if config.news_channel_id:
         application.add_handler(MessageHandler(
-            filters.TEXT & filters.Chat(chat_id=config.news_channel_id) & ~filters.COMMAND,
+            content & filters.Chat(chat_id=config.news_channel_id),
             handle_message
         ))
 
     application.add_handler(MessageHandler(
-        filters.TEXT & filters.ChatType.GROUPS & ~filters.COMMAND,
+        content & filters.ChatType.GROUPS,
         handle_message
     ))
 
     application.add_handler(MessageHandler(
-        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
+        content & filters.ChatType.PRIVATE,
         handle_private_message
     ))
 
