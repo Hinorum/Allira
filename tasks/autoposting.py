@@ -4,6 +4,7 @@ import re
 import urllib.parse
 import time
 import os
+from collections import deque
 from io import BytesIO
 from datetime import datetime
 from cachetools import TTLCache
@@ -20,6 +21,38 @@ POLLINATIONS_URL = "https://image.pollinations.ai/prompt"
 
 _coingecko_cache = TTLCache(maxsize=5, ttl=600)
 last_request_time = 0
+
+# Углы (форматы) поста: раньше каждый цикл был «вставь цифры в 3-6
+# предложений» — один и тот же формат из цикла в цикл. Память на 4 поста
+# (~2 суток при интервале 12-14ч) не даёт повторять последние два угла.
+POST_ANGLES = {
+    "hot_take": "Формат: горячее мнение (hot take) — резкая оценка ситуации одним тезисом в начале.",
+    "question": "Формат: закончи пост интригующим вопросом к аудитории.",
+    "analysis": "Формат: мини-разбор — 2-3 причины, почему рынок движется именно так.",
+    "scenario": "Формат: «а что если» — короткий сценарий на ближайшие дни, без обещаний и финансовых советов.",
+    "stat_of_day": "Формат: цифра дня — начни с одной яркой цифры из данных и коротко прокомментируй её.",
+    "myth": "Формат: развенчание мифа — типичное заблуждение трейдеров и его опровержение.",
+}
+_recent_angles: deque[str] = deque(maxlen=4)
+
+# Данные CoinGecko форматируются с <b>/<i> для HTML-подачи, но в промпт LLM
+# они уходят обычным текстом: иначе модель лепит теги в ответ, а после
+# escape_html в канале подписчики видят осмысленные <b> как текст.
+_MARKUP_RE = re.compile(r"</?(?:b|i|em|strong|u|code|s)>")
+
+
+def strip_markup(text: str) -> str:
+    """Снимает известные HTML-теги, оставляя текст и цифры."""
+    return _MARKUP_RE.sub("", text)
+
+
+def pick_angle() -> str:
+    """Ключ угла поста, не повторяющий последние два — для разнообразия."""
+    recent = list(_recent_angles)[-2:]
+    candidates = [k for k in POST_ANGLES if k not in recent]
+    angle = random.choice(candidates or list(POST_ANGLES))
+    _recent_angles.append(angle)
+    return angle
 
 
 def get_smart_interval() -> int:
@@ -93,9 +126,16 @@ async def _fetch_coingecko(url: str, params: dict):
     )
 
 
-async def get_crypto_data():
-    global last_request_time
+_endpoint_order = 0
 
+
+def _rotated_endpoints() -> list[dict]:
+    """Эндпоинты в круговой очерёдности: каждый пост начинается со следующего.
+
+    Раньше здесь был random.choice — один и тот же «топ-5» мог выпадать
+    несколько циклов подряд, а тренды и глобальные данные простаивали.
+    """
+    global _endpoint_order
     endpoints = [
         {
             "url": f"{COINGECKO_URL}/coins/markets",
@@ -117,44 +157,67 @@ async def get_crypto_data():
             "params": {}
         }
     ]
+    start = _endpoint_order % len(endpoints)
+    _endpoint_order += 1
+    return endpoints[start:] + endpoints[:start]
 
-    endpoint = random.choice(endpoints)
 
-    # Кэш-ключ — сам эндпоинт. Раньше все три ответа лежали под одним ключом:
-    # пост с «топом монет» мог получить закэшированные «тренды» и наоборот.
-    if endpoint["url"] in _coingecko_cache:
-        return _coingecko_cache[endpoint["url"]]
+async def get_crypto_data():
+    global last_request_time
 
-    # Между запросами выдерживаем паузу, НО не спим: задача автопостинга
-    # и так висит в очереди, а ожидание только откладывало отправку поста.
-    if time.time() - last_request_time < 3.0:
-        logger.info("CoinGecko: вызов слишком частый, беру запасной текст")
-        return get_fallback_crypto_data()
-    last_request_time = time.time()
+    errors: list[str] = []
+    # Пауза считается один раз на вызов, а не на каждый эндпоинт: внутри
+    # одного «дай мне данные» попытки идут подряд — это одна операция,
+    # а не всплеск запросов. Иначе первая же 429 блокировала бы
+    # оставшиеся эндпоинты и мы снова валились в заглушку.
+    rate_limited = time.time() - last_request_time < 3.0
 
-    try:
-        response = await _fetch_coingecko(endpoint["url"], endpoint["params"])
+    # Проходим по всем эндпоинтам, пока один не даст данные: раньше
+    # ошибка или 429 первого же выбора random.choice уводили в статичную
+    # заглушку без единой цифры.
+    for endpoint in _rotated_endpoints():
+        url = endpoint["url"]
 
-        if response.status_code == 429:
-            logger.warning("CoinGecko rate limit")
-            return get_fallback_crypto_data()
+        # Кэш-ключ — сам эндпоинт. Раньше все три ответа лежали под одним
+        # ключом: пост с «топом монет» мог получить закэшированные «тренды».
+        if url in _coingecko_cache:
+            return _coingecko_cache[url]
 
-        response.raise_for_status()
-        data = response.json()
+        if rate_limited:
+            logger.info("CoinGecko: вызов слишком частый, беру следующий эндпоинт")
+            continue
 
-        if endpoint["url"].endswith("markets"):
-            result = format_market_data(data)
-        elif endpoint["url"].endswith("trending"):
-            result = format_trending_data(data)
-        else:
-            result = format_global_data(data)
+        last_request_time = time.time()
+        try:
+            response = await _fetch_coingecko(url, endpoint["params"])
 
-        _coingecko_cache[endpoint["url"]] = result
-        return result
+            if response.status_code == 429:
+                logger.warning("CoinGecko rate limit")
+                errors.append(f"{url} (429)")
+                continue
 
-    except Exception as e:
-        logger.error(f"CoinGecko error: {e}")
-        return get_fallback_crypto_data()
+            response.raise_for_status()
+            data = response.json()
+
+            if url.endswith("markets"):
+                result = format_market_data(data)
+            elif url.endswith("trending"):
+                result = format_trending_data(data)
+            else:
+                result = format_global_data(data)
+
+            _coingecko_cache[url] = result
+            return result
+
+        except Exception as e:
+            logger.error(f"CoinGecko error: {e}")
+            errors.append(f"{url} ({e})")
+
+    if errors:
+        logger.warning(f"CoinGecko недоступен, все эндпоинты исчерпаны: {errors}")
+    elif rate_limited:
+        logger.info("CoinGecko: данные не запрошены (пауза), отдаю запасной текст")
+    return get_fallback_crypto_data()
 
 
 async def generate_image(post_text: str) -> bytes | None:
@@ -217,11 +280,15 @@ async def do_autoposting(context: ContextTypes.DEFAULT_TYPE):
 
         logger.info("Начинаю автопостинг...")
 
-        crypto_text = await get_crypto_data()
+        # Угол поста и чистка HTML: теги CoinGecko нужны для полевой подачи
+        # в канал, но в промпт модели уходят обычным текстом.
+        crypto_text = strip_markup(await get_crypto_data())
+        angle = POST_ANGLES[pick_angle()]
+        topic = f"{angle}\n\nДанные CoinGecko:\n{crypto_text}"
 
         speaker = random.choice(["allira", "lane"])
         post_content = await generate_post_content(
-            crypto_text,
+            topic,
             speaker,
             bot_data["DEFAULT_MODEL"],
             bot_data["OPENROUTER_API_KEY"]
