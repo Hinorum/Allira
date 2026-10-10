@@ -3,7 +3,6 @@ import random
 import re
 import urllib.parse
 import time
-import os
 from collections import deque
 from io import BytesIO
 from datetime import datetime
@@ -220,7 +219,17 @@ async def get_crypto_data():
     return get_fallback_crypto_data()
 
 
-async def generate_image(post_text: str) -> bytes | None:
+def sanitize_image_prompt(text: str) -> str:
+    """Оставляет в промпте картинки латиницу, кириллицу, цифры и разделители.
+
+    Раньше regex вырезал всё не-латинское: цифры ("bitcoin to 100k" →
+    "bitcoin to k"), а ответ модели по-русски превращался в пустоту и
+    уходил в случайный фолбэк-стиль.
+    """
+    return re.sub(r"[^a-zA-ZА-Яа-яЁё0-9\s,-]", "", text).strip()
+
+
+async def generate_image(post_text: str, model: str, api_key: str) -> bytes | None:
     from utils.ai_responses import get_llm_response
 
     fallback_styles = [
@@ -234,6 +243,15 @@ async def generate_image(post_text: str) -> bytes | None:
         "northern lights dance over snowy mountains, cosmic energy, awe",
         "wind blowing through tall grass field, golden light, natural movement",
         "lighthouse beam cutting through dense fog, guiding light, determination",
+        # Крипто-образы: раньше весь пул был «пейзаж без смысла», картинка
+        # не отсылала к теме поста.
+        "busy trading floor at night, glowing candlestick charts on monitors, moody neon",
+        "gold coins cascading through dark space, dramatic rim light, macro detail",
+        "cyberpunk street market at dusk, holographic price tickers above the crowd",
+        "lone trader silhouette before a wall of monitors, blue glow, contemplative",
+        "stock chart carved into mountain landscape, sunrise over peaks, epic scale",
+        "hands exchanging a glowing token in rain, neon reflections, street photo",
+        "desert highway sign with arrow pointing up, endless blue sky, optimism",
     ]
 
     try:
@@ -243,10 +261,11 @@ async def generate_image(post_text: str) -> bytes | None:
                         f"part of the scene, not the main focus. Translate the emotion into a visual scene.\n\nText: {post_text[:500]}",
             system_prompt="You are an image prompt generator. Reply with ONLY the English prompt, no other text. "
                           "Focus on mood, energy, movement. Crypto can be present but subtle, not dominant.",
-            model="nvidia/nemotron-3.5-lightning:free",
-            api_key=os.getenv("OPENROUTER_API_KEY", "")
+            model=model,
+            api_key=api_key
         )
-        prompt_response = re.sub(r'[^a-zA-Z\s,-]', '', prompt_response).strip()
+        # Латиница, кириллица и цифры — см. sanitize_image_prompt.
+        prompt_response = sanitize_image_prompt(prompt_response)
         if len(prompt_response.split()) < 3:
             prompt_response = random.choice(fallback_styles)
     except Exception:
@@ -307,7 +326,11 @@ async def do_autoposting(context: ContextTypes.DEFAULT_TYPE):
             safe_text = text[:190] + "..."
             final_caption = f"{escape_html(safe_text)}\n\n#CryptoNews #AlliraBot"
 
-        image_bytes = await generate_image(post_content)
+        image_bytes = await generate_image(
+            post_content,
+            bot_data.get("IMAGE_PROMPT_MODEL", bot_data["DEFAULT_MODEL"]),
+            bot_data["OPENROUTER_API_KEY"],
+        )
 
         if image_bytes:
             photo_file = BytesIO(image_bytes)

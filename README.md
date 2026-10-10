@@ -68,6 +68,7 @@ cp .env.example .env
 | `FALLBACK_MODEL` | нет | Резервная модель |
 | `LANE_MODEL` | нет | Модель для Лэйна |
 | `VISION_MODEL` | нет | Модель для запросов с картинками (по умолчанию `google/gemma-4-31b-it:free`) |
+| `IMAGE_PROMPT_MODEL` | нет | Модель промпта картинки автопоста (по умолчанию `nvidia/nemotron-3.5-lightning:free`) |
 | `CREATOR_USER_IDS` | нет | Числовые ID создателя через запятую — в ЛС отвечает только ему |
 | `CREATOR_USERNAME` | нет | `@username` создателя как запасной ключ, по умолчанию `hinorum` |
 | `PORT` | нет | Порт ручки живости, по умолчанию `10000` |
