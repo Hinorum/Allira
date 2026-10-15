@@ -561,10 +561,16 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
         logger.info(f"Личное сообщение от {user.username} (len={len(text)})")
     else:
         is_mention = f"@{bot_username}" in raw_text if bot_username else False
-        # Реплай ЛЮБОГО сообщения — это вызов бота: юзер цитирует пост и
-        # ждёт ответа с учётом его содержимого. Раньше считался только
-        # реплай на само сообщение бота.
-        is_reply = getattr(message, "reply_to_message", None) is not None
+        # Реплай считается обращением к боту только если юзер отвечает на
+        # сообщение самого бота. Реплай на ЛЮБОЕ чужое сообщение (= любой
+        # диалог между двумя участниками) вынуждал бота лезть во все
+        # разговоры в чате.
+        replied = getattr(message, "reply_to_message", None)
+        is_reply = (
+            replied is not None
+            and replied.from_user is not None
+            and replied.from_user.id == context.bot.id
+        )
 
         trigger_words = ["аллира", "лейн", "allira", "lane"]
         has_trigger = any(re.search(rf'\b{word}\b', raw_text.lower()) for word in trigger_words)
