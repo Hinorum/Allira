@@ -106,7 +106,23 @@ async def sync_jetton_transfers(wallet, api_key: str) -> int:
     переводов всех Jetton'ов на кошельке. Каждый перевод — отдельная
     запись в crypto_transactions с source='jetton-sync' и уникальным
     external_id (дедупликация встроена в add_transaction).
+
+    Классификация (умная):
+      * обе стороны перевода — мои кошельки → TRANSFER_IN/OUT (не доход)
+      * в одном событии есть и входящий, и исходящий JettonTransfer →
+        оба SWAP (обмен через DEX типа STON.fi)
+      * входящий без пары и не от своего → AIRDROP (доход по НК)
+      * исходящий без пары и не своему → SWAP_OUT (расход по НК)
     """
+    from utils.crypto_db import list_wallets
+
+    # Свои адреса для детекции «перевод себе» — в одном user_data может
+    # быть несколько TON-кошельков.
+    my_addresses: set[str] = {
+        wallet.address.lower(),
+        *(w.address.lower() for w in list_wallets(wallet.owner_id, chain=Chain.TON)),
+    }
+
     client = await get_client()
     headers = {"User-Agent": "AlliraBot/1.0"}
     if api_key:
@@ -153,10 +169,29 @@ async def sync_jetton_transfers(wallet, api_key: str) -> int:
             if ts and last_ts and ts <= last_ts:
                 stop = True
                 break
+
             actions = ev.get("actions") or []
+            # Классификация уровня события:
+            # собираем только JettonTransfer-действия этого аккаунта.
+            jet_actions: list[tuple[str, dict]] = []  # ("in"|"out", action)
             for action in actions:
                 if action.get("type") != "JettonTransfer":
                     continue
+                jt = action.get("JettonTransfer", {}) or {}
+                sender = (jt.get("sender") or {}).get("address", "").lower()
+                recipient = (jt.get("recipient") or {}).get("address", "").lower()
+                if recipient in my_addresses:
+                    jet_actions.append(("in", action))
+                elif sender in my_addresses:
+                    jet_actions.append(("out", action))
+                # иначе: транзакция касается третьих лиц (skip)
+
+            # Если в событии есть и входящий, и исходящий — это обмен.
+            has_in = any(d == "in" for d, _ in jet_actions)
+            has_out = any(d == "out" for d, _ in jet_actions)
+            is_swap = has_in and has_out
+
+            for direction, action in jet_actions:
                 jt = action.get("JettonTransfer", {}) or {}
                 jetton = jt.get("jetton") or {}
                 symbol = (jetton.get("symbol") or "").upper()
@@ -173,20 +208,20 @@ async def sync_jetton_transfers(wallet, api_key: str) -> int:
                 if amount_int == 0:
                     continue
 
-                sender = (jt.get("sender") or {}).get("address", "")
-                recipient = (jt.get("recipient") or {}).get("address", "")
-                wallet_norm = wallet.address.lower()
-                direction: str
-                tx_type: str
-                if recipient and recipient.lower() == wallet_norm:
-                    direction = "in"
-                    tx_type = TxType.AIRDROP  # дефолт — аирдроп; пользователь
-                                              # может скорректировать вручную
-                elif sender and sender.lower() == wallet_norm:
-                    direction = "out"
-                    tx_type = TxType.SWAP_OUT  # пользователь уточнит
+                sender = (jt.get("sender") or {}).get("address", "").lower()
+                recipient = (jt.get("recipient") or {}).get("address", "").lower()
+
+                # Умная классификация:
+                if direction == "in" and sender in my_addresses:
+                    tx_type = TxType.TRANSFER_IN
+                elif direction == "out" and recipient in my_addresses:
+                    tx_type = TxType.TRANSFER_OUT
+                elif is_swap:
+                    tx_type = TxType.SWAP_OUT if direction == "out" else TxType.AIRDROP
+                elif direction == "in":
+                    tx_type = TxType.AIRDROP
                 else:
-                    continue
+                    tx_type = TxType.SWAP_OUT
 
                 # Получить котировку для авто-цены (если возможно).
                 fiat = ""
@@ -198,7 +233,7 @@ async def sync_jetton_transfers(wallet, api_key: str) -> int:
                 except Exception:
                     pass
 
-                ext_id = f"{EXTERNAL_PREFIX}:{ev.get('event_id', '')}:{symbol}"
+                ext_id = f"{EXTERNAL_PREFIX}:{ev.get('event_id', '')}:{symbol}:{direction}"
                 try:
                     ensure_asset(
                         symbol=symbol,
@@ -217,7 +252,8 @@ async def sync_jetton_transfers(wallet, api_key: str) -> int:
                         tx_type=tx_type,
                         amount=str(amount_int),
                         fiat_value_rub=fiat or None,
-                        note=f"auto jetton-sync; op_hash={ev.get('event_id', '')[:20]}",
+                        note=(f"auto jetton-sync; "
+                              f"op_hash={ev.get('event_id', '')[:20]}"),
                         source="jetton-sync",
                         external_id=ext_id,
                     )
