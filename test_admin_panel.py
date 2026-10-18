@@ -213,6 +213,46 @@ def main() -> int:
     check(web_panel.handle_get(h) and h.status == 401,
           "без ADMIN_PANEL_TOKEN панель закрыта")
 
+    # ----------------------------------------------------- admin_menu
+    print("5. Telegram-админ-меню: рендер")
+    from handlers import admin_menu
+
+    text = admin_menu.admin_status_text(None, StubConfig(), time.time() - 3600)
+    check("Аптайм" in text and "БД" in text,
+          "статус содержит аптайм и размер БД", text[:120])
+    check("CRYPTO_OWNER_ID" in text or "Не заданы" in text
+          or "Операций" in text, "статус содержит крипто-сводку", text[:200])
+
+    wtext, markup = admin_menu._format_wallets(owner)
+    check("Кошельки" in wtext and markup is not None
+          and any("wallet_toggle" in b.callback_data
+                  for row in markup.inline_keyboard for b in row),
+          "список кошельков с кнопками toggle", wtext[:150])
+
+    txtext = admin_menu._format_tx(owner)
+    check("Последние операции" in txtext and "BTC" in txtext,
+          "последние операции отображаются", txtext[:150])
+
+    taxtext = admin_menu._format_tax(owner)
+    check("7700000000" in taxtext and "FIFO" in taxtext,
+          "настройки ФНС с сохранённым ИНН", taxtext[:150])
+
+    logs_text = admin_menu._format_logs()
+    check("лог" in logs_text.lower(), "логи форматируются", logs_text[:80])
+
+    recon = admin_menu._format_reconcile({
+        "year": 2025, "ok": False, "total_dr_rub": "1000",
+        "total_cr_rub": "900",
+        "issues": [{"kind": "pairing", "message": "непарная нога"}],
+    })
+    check("Расхождений: 1" in recon and "pairing" in recon,
+          "сводка сверки с расхождениями", recon[:150])
+
+    menu = admin_menu._main_menu()
+    datas = [b.callback_data for row in menu.inline_keyboard for b in row]
+    check(all(d.startswith("adm:") for d in datas) and len(datas) == 8,
+          "главное меню: 8 кнопок с префиксом adm:", str(datas))
+
     # ------------------------------------------------------------- итог
     if FAILURES:
         print(f"\n❌ ПРОВАЛЕНО: {len(FAILURES)} — {FAILURES}")

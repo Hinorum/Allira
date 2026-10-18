@@ -72,6 +72,7 @@ from handlers.crypto_tax import (
 )
 from handlers.cex_command import cex_status_command, cex_sync_command
 from handlers.reconcile_command import reconcile_command, reconcile_xlsx_command
+from handlers.admin_menu import admin_command, admin_menu_callback
 from utils import bot_admin, web_panel
 from utils.log_buffer import setup_log_buffer
 from tasks.autoposting import setup_autoposting
@@ -337,6 +338,7 @@ BOT_COMMANDS: list[tuple[str, str]] = [
     ("cex_sync", "Синк сделок с бирж"),
     ("reconcile", "Сверка дебет-кредит + балансы"),
     ("reconcile_xlsx", "XLSX-выгрузка сверки"),
+    ("admin", "Сервис управления (владелец)"),
 ]
 
 ADMIN_COMMANDS: list[tuple[str, str]] = [
@@ -455,6 +457,8 @@ async def post_init(application: Application):
         # Крипто-бухгалтерия
         "CRYPTO_OWNER_ID": config.crypto_owner_id,
         "BOT_CONFIG": config,
+        # Для статуса в админ-меню и веб-панели
+        "BOT_START_TIME": BOT_START_TIME,
     })
     if not config.admin_user_ids:
         logger.warning(
@@ -697,6 +701,12 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("cex_sync", cex_sync_command))
     application.add_handler(CommandHandler("reconcile", reconcile_command))
     application.add_handler(CommandHandler("reconcile_xlsx", reconcile_xlsx_command))
+
+    # Сервис управления (Telegram-интерфейс; веб-панель — /admin на порту).
+    application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CallbackQueryHandler(
+        admin_menu_callback, pattern="^adm:"
+    ))
 
     application.add_handler(CallbackQueryHandler(
         show_help_callback, pattern="^show_help$"
