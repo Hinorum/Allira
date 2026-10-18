@@ -34,6 +34,12 @@ class BotConfig:
     cost_basis_method: str = "fifo"
     crypto_owner_id: int = 0
     cbr_api_url: str = "https://www.cbr-xml-daily.ru"
+    # CEX API (read-only ключи — безопасны для бота).
+    bybit_api_key: str = ""
+    bybit_api_secret: str = ""
+    okx_api_key: str = ""
+    okx_api_secret: str = ""
+    okx_passphrase: str = ""
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -78,4 +84,9 @@ class BotConfig:
             cost_basis_method=os.getenv("COST_BASIS_METHOD", "fifo").strip().lower(),
             crypto_owner_id=crypto_owner_id,
             cbr_api_url=os.getenv("CBR_API_URL", "https://www.cbr-xml-daily.ru").strip().rstrip("/"),
+            bybit_api_key=os.getenv("BYBIT_API_KEY", "").strip(),
+            bybit_api_secret=os.getenv("BYBIT_API_SECRET", "").strip(),
+            okx_api_key=os.getenv("OKX_API_KEY", "").strip(),
+            okx_api_secret=os.getenv("OKX_API_SECRET", "").strip(),
+            okx_passphrase=os.getenv("OKX_PASSPHRASE", "").strip(),
         )
