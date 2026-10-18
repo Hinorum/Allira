@@ -6,3 +6,7 @@ __pycache__/
 *.db
 *.db-wal
 *.db-shm
+# Тестовые артефакты (генерируются test_*.py)
+test_*.pdf
+test_*.xlsx
+test_*.csv

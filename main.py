@@ -59,8 +59,20 @@ from handlers.dice_tournament import (
     set_tournament_mode,
     start_tournament_from_menu,
 )
+from handlers.crypto_ledger import (
+    wallet_add_command, wallet_list_command, wallet_del_command,
+    addtx_command, airdrop_command,
+    tx_list_command, tx_del_command,
+    balance_command, pnl_command, rate_command, import_command,
+)
+from handlers.crypto_tax import (
+    tax_setup_command, tax_setup_status_command,
+    tax_command, tax_export_callback,
+    tax_pdf_command, tax_xlsx_command, tax_csv_command,
+)
 from tasks.autoposting import setup_autoposting
 from tasks.marketapp_reports import setup_marketapp_jobs, LAST_LINKAGE, LAST_HISTORY_META, LAST_SYNC, LAST_HTTP_ERROR
+from tasks.crypto_sync import setup_crypto_sync_jobs
 
 load_dotenv()
 setup_logging()
@@ -276,6 +288,23 @@ BOT_COMMANDS: list[tuple[str, str]] = [
     ("clear", "Забыть контекст разговора"),
     ("start_tournament", "Запустить турнир на кубиках"),
     ("stop_tournament", "Остановить турнир"),
+    # Крипто-бухгалтерия
+    ("wallet_add", "Добавить кошелёк"),
+    ("wallet_list", "Список кошельков + баланс"),
+    ("wallet_del", "Архивировать кошелёк"),
+    ("addtx", "Записать операцию с криптой"),
+    ("airdrop", "Быстрый ввод аирдропа"),
+    ("tx_list", "История операций"),
+    ("tx_del", "Удалить операцию"),
+    ("balance", "Портфель с текущей ценой"),
+    ("pnl", "Прибыль/убыток за год"),
+    ("rate", "Текущий курс актива в RUB"),
+    ("import", "Импорт CSV (реплай на файл)"),
+    ("tax", "Сводка 3-НДФЛ за год"),
+    ("tax_setup", "Настроить ИНН/ФИО/статус"),
+    ("tax_pdf", "PDF-отчёт для ФНС"),
+    ("tax_xlsx", "Детальная XLSX"),
+    ("tax_csv", "CSV доходов/реализаций"),
 ]
 
 ADMIN_COMMANDS: list[tuple[str, str]] = [
@@ -383,6 +412,9 @@ async def post_init(application: Application):
         "ADMIN_USER_IDS": config.admin_user_ids,
         "CREATOR_USER_IDS": config.creator_user_ids,
         "CREATOR_USERNAME": config.creator_username,
+        # Крипто-бухгалтерия
+        "CRYPTO_OWNER_ID": config.crypto_owner_id,
+        "BOT_CONFIG": config,
     })
     if not config.admin_user_ids:
         logger.warning(
@@ -427,6 +459,10 @@ async def post_init(application: Application):
     if config.marketapp_api_key and config.marketapp_wallet:
         setup_marketapp_jobs(application)
         logger.info("Marketapp отчеты настроены")
+
+    if config.crypto_owner_id:
+        setup_crypto_sync_jobs(application)
+        logger.info(f"Крипто-скан настроен для owner_id={config.crypto_owner_id}")
 
 
 async def post_shutdown(application: Application):
@@ -591,6 +627,25 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("ban", ban_command))
     application.add_handler(CommandHandler("unban", unban_command))
 
+    # Крипто-бухгалтерия
+    application.add_handler(CommandHandler("wallet_add", wallet_add_command))
+    application.add_handler(CommandHandler("wallet_list", wallet_list_command))
+    application.add_handler(CommandHandler("wallet_del", wallet_del_command))
+    application.add_handler(CommandHandler("addtx", addtx_command))
+    application.add_handler(CommandHandler("airdrop", airdrop_command))
+    application.add_handler(CommandHandler("tx_list", tx_list_command))
+    application.add_handler(CommandHandler("tx_del", tx_del_command))
+    application.add_handler(CommandHandler("balance", balance_command))
+    application.add_handler(CommandHandler("pnl", pnl_command))
+    application.add_handler(CommandHandler("rate", rate_command))
+    application.add_handler(CommandHandler("import", import_command))
+    application.add_handler(CommandHandler("tax", tax_command))
+    application.add_handler(CommandHandler("tax_setup", tax_setup_command))
+    application.add_handler(CommandHandler("tax_setup_status", tax_setup_status_command))
+    application.add_handler(CommandHandler("tax_pdf", tax_pdf_command))
+    application.add_handler(CommandHandler("tax_xlsx", tax_xlsx_command))
+    application.add_handler(CommandHandler("tax_csv", tax_csv_command))
+
     application.add_handler(CallbackQueryHandler(
         show_help_callback, pattern="^show_help$"
     ))
@@ -608,6 +663,9 @@ def build_application() -> Application:
     ))
     application.add_handler(CallbackQueryHandler(
         set_tournament_mode, pattern="^set_tournament_mode:"
+    ))
+    application.add_handler(CallbackQueryHandler(
+        tax_export_callback, pattern="^tax(pdf|xlsx|csvi|csvs):"
     ))
 
     application.add_handler(InlineQueryHandler(handle_inline_query))

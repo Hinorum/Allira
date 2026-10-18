@@ -211,6 +211,140 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_rent_events_wallet ON marketapp_rent_events(wallet);
         """)
 
+        # === Крипто-бухгалтерия (3-НДФЛ, НК РФ ред. 418-ФЗ) ===
+        # Каталог активов: единое место для символа, decimals, идентификатора в
+        # CoinGecko и TON-контракта для Jetton. fiat_symbol — к какой фиатной
+        # валюте приводим прайс по умолчанию (для РФ — RUB).
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS crypto_assets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                chain TEXT NOT NULL DEFAULT 'sqlite',
+                decimals INTEGER NOT NULL DEFAULT 9,
+                coingecko_id TEXT,
+                contract TEXT,
+                kind TEXT NOT NULL DEFAULT 'coin',
+                fiat_symbol TEXT NOT NULL DEFAULT 'RUB',
+                is_active INTEGER DEFAULT 1,
+                notes TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            -- Кошельки, по которым ведём учёт. address — нормализованный raw
+            -- (для TON 0:hex, для EVM 0x…). Несколько кошельков на одного
+            -- владельца: типичная история «холодный + биржа».
+            CREATE TABLE IF NOT EXISTS crypto_wallets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id INTEGER NOT NULL,
+                label TEXT DEFAULT '',
+                chain TEXT NOT NULL,
+                address TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'own',
+                is_active INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (chain, address)
+            );
+
+            -- Все операции по крипте. type — закрытый справочник (см.
+            -- utils/crypto_db.TxType): income/disposal важны для налоговой,
+            -- остальные — справочно. amount хранится в МИНИМАЛЬНЫХ единицах
+            -- (нано/satoshi), отображаемое количество — amount / 10^decimals.
+            CREATE TABLE IF NOT EXISTS crypto_transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id INTEGER NOT NULL,
+                ts INTEGER NOT NULL,
+                wallet_id INTEGER,
+                asset_id INTEGER NOT NULL,
+                tx_type TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                amount_raw TEXT NOT NULL,
+                -- Фиатная стоимость всей операции на дату ts в RUB (для РФ).
+                -- Для прихода это и есть «доход» по ст. 214 НК; для расхода
+                -- используется в формуле «доход минус расход».
+                fiat_value_rub TEXT,
+                -- Себестоимость (документально подтверждённые расходы на
+                -- приобретение) в RUB. Заполняется при списании через FIFO.
+                cost_basis_rub TEXT,
+                -- Произвольный комментарий / источник (хэш tx, ссылка на
+                -- биржу, ID ордера).
+                note TEXT DEFAULT '',
+                source TEXT DEFAULT 'manual',
+                external_id TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (asset_id) REFERENCES crypto_assets(id),
+                FOREIGN KEY (wallet_id) REFERENCES crypto_wallets(id) ON DELETE SET NULL
+            );
+
+            -- FIFO-лоты: сколько единиц актива числятся на балансе с какой
+            -- себестоимостью и датой прихода. Реализация выбытия идёт по
+            -- этим лотам; после реализации лот гасится, баланс пересчитывается.
+            CREATE TABLE IF NOT EXISTS tax_lots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id INTEGER NOT NULL,
+                asset_id INTEGER NOT NULL,
+                acquired_ts INTEGER NOT NULL,
+                acquired_tx_id INTEGER NOT NULL,
+                qty_remaining TEXT NOT NULL,
+                cost_per_unit_rub TEXT NOT NULL,
+                source TEXT DEFAULT 'manual',
+                FOREIGN KEY (asset_id) REFERENCES crypto_assets(id),
+                FOREIGN KEY (acquired_tx_id) REFERENCES crypto_transactions(id) ON DELETE CASCADE
+            );
+
+            -- Исторические курсы в RUB: на дату операции и в текущий момент.
+            -- Источник — CoinGecko (для крипты) + ЦБ РФ (для USD→RUB).
+            -- Без ключа работает, но RUB-курс будет рассчитан через USD.
+            CREATE TABLE IF NOT EXISTS fiat_rates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                base_symbol TEXT NOT NULL,
+                quote_symbol TEXT NOT NULL,
+                rate TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'coingecko',
+                fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (date, base_symbol, quote_symbol)
+            );
+
+            -- Настройки плательщика для отчёта 3-НДФЛ.
+            CREATE TABLE IF NOT EXISTS tax_settings (
+                owner_id INTEGER PRIMARY KEY,
+                taxpayer_inn TEXT DEFAULT '',
+                taxpayer_name TEXT DEFAULT '',
+                tax_status TEXT NOT NULL DEFAULT 'resident',
+                cost_basis TEXT NOT NULL DEFAULT 'fifo',
+                reporting_currency TEXT NOT NULL DEFAULT 'RUB',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            -- Кэш последних сгенерированных отчётов (по сути — снапшоты
+            -- FIFO-расчёта, чтобы /tax повторно не пересчитывал десятки
+            -- тысяч лотов).
+            CREATE TABLE IF NOT EXISTS tax_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id INTEGER NOT NULL,
+                year INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (owner_id, year)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_crypto_tx_owner_ts
+                ON crypto_transactions(owner_id, ts);
+            CREATE INDEX IF NOT EXISTS idx_crypto_tx_asset
+                ON crypto_transactions(asset_id, ts);
+            CREATE INDEX IF NOT EXISTS idx_crypto_tx_type
+                ON crypto_transactions(tx_type);
+            CREATE INDEX IF NOT EXISTS idx_crypto_tx_external
+                ON crypto_transactions(source, external_id);
+            CREATE INDEX IF NOT EXISTS idx_tax_lots_owner_asset
+                ON tax_lots(owner_id, asset_id, acquired_ts);
+            CREATE INDEX IF NOT EXISTS idx_fiat_rates_lookup
+                ON fiat_rates(base_symbol, quote_symbol, date);
+            CREATE INDEX IF NOT EXISTS idx_crypto_wallets_owner
+                ON crypto_wallets(owner_id);
+        """)
+
         cols = [row["name"] for row in conn.execute("PRAGMA table_info(marketapp_rent_events)")]
         if "wallet" not in cols:
             conn.execute("ALTER TABLE marketapp_rent_events ADD COLUMN wallet TEXT DEFAULT ''")

@@ -28,6 +28,12 @@ class BotConfig:
     creator_username: str = "hinorum"
     bot_username: str = ""
     bot_id: int = 0
+    # Крипто-бухгалтерия
+    taxpayer_inn: str = ""
+    tax_status: str = "resident"
+    cost_basis_method: str = "fifo"
+    crypto_owner_id: int = 0
+    cbr_api_url: str = "https://www.cbr-xml-daily.ru"
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -43,6 +49,12 @@ class BotConfig:
             for part in raw_creators.split(",")
             if part.strip().lstrip("-").isdigit()
         )
+        crypto_owner_raw = os.getenv("CRYPTO_OWNER_ID", "").strip()
+        crypto_owner_id = (
+            int(crypto_owner_raw) if crypto_owner_raw.lstrip("-").isdigit() else 0
+        )
+        if not crypto_owner_id and creator_ids:
+            crypto_owner_id = creator_ids[0]
         return cls(
             bot_token=os.getenv("BOT_TOKEN", ""),
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY", ""),
@@ -61,4 +73,9 @@ class BotConfig:
             marketapp_wallet=os.getenv("MARKETAPP_WALLET", "").strip(),
             toncenter_api_key=os.getenv("TONCENTER_API_KEY", "").strip(),
             tonapi_api_key=os.getenv("TONAPI_API_KEY", "").strip(),
+            taxpayer_inn=os.getenv("TAXPAYER_INN", "").strip(),
+            tax_status=os.getenv("TAX_STATUS", "resident").strip().lower(),
+            cost_basis_method=os.getenv("COST_BASIS_METHOD", "fifo").strip().lower(),
+            crypto_owner_id=crypto_owner_id,
+            cbr_api_url=os.getenv("CBR_API_URL", "https://www.cbr-xml-daily.ru").strip().rstrip("/"),
         )
