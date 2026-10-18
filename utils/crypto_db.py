@@ -605,15 +605,20 @@ def set_tax_settings(owner_id: int, **fields) -> None:
     safe = {k: v for k, v in fields.items() if k in allowed and v is not None}
     if not safe:
         return
-    placeholders = ", ".join(f"{k}=?" for k in safe)
-    args = list(safe.values()) + [owner_id]
+    cols = ", ".join(safe.keys())
+    placeholders = ", ".join("?" for _ in safe)
+    # Значения должны быть и в INSERT, и в DO UPDATE: при первом INSERT
+    # конфликта нет, и SQLite берёт только VALUES — «спрятанные» в
+    # DO UPDATE значения при создании строки молча терялись бы.
+    updates = ", ".join(f"{k}=excluded.{k}" for k in safe)
     with get_db() as conn:
         conn.execute(
             f"""
-            INSERT INTO tax_settings (owner_id) VALUES (?)
-            ON CONFLICT(owner_id) DO UPDATE SET {placeholders}, updated_at=CURRENT_TIMESTAMP
+            INSERT INTO tax_settings (owner_id, {cols})
+            VALUES (?, {placeholders})
+            ON CONFLICT(owner_id) DO UPDATE SET {updates}, updated_at=CURRENT_TIMESTAMP
             """,
-            [owner_id, *args],
+            [owner_id, *safe.values()],
         )
 
 

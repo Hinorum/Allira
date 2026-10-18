@@ -23,10 +23,10 @@ import time
 from datetime import datetime
 from typing import Optional
 
-from utils.crypto_db import (Chain, CryptoError, add_transaction, add_wallet,
+from utils.crypto_db import (CryptoError, add_transaction, add_wallet,
                              delete_transaction, get_tax_settings,
-                             list_transactions, list_wallets, set_tax_settings,
-                             humanize_amount, get_asset, ensure_asset)
+                             list_wallets, set_tax_settings,
+                             humanize_amount)
 from utils.database import get_db
 from utils.reconciliation import compute_balances, reconcile
 

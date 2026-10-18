@@ -40,6 +40,8 @@ class BotConfig:
     okx_api_key: str = ""
     okx_api_secret: str = ""
     okx_passphrase: str = ""
+    # Токен веб-панели управления (/admin). Пусто — панель отключена.
+    admin_panel_token: str = ""
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -89,4 +91,5 @@ class BotConfig:
             okx_api_key=os.getenv("OKX_API_KEY", "").strip(),
             okx_api_secret=os.getenv("OKX_API_SECRET", "").strip(),
             okx_passphrase=os.getenv("OKX_PASSPHRASE", "").strip(),
+            admin_panel_token=os.getenv("ADMIN_PANEL_TOKEN", "").strip(),
         )

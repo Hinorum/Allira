@@ -72,6 +72,8 @@ from handlers.crypto_tax import (
 )
 from handlers.cex_command import cex_status_command, cex_sync_command
 from handlers.reconcile_command import reconcile_command, reconcile_xlsx_command
+from utils import bot_admin, web_panel
+from utils.log_buffer import setup_log_buffer
 from tasks.autoposting import setup_autoposting
 from tasks.marketapp_reports import setup_marketapp_jobs, LAST_LINKAGE, LAST_HISTORY_META, LAST_SYNC, LAST_HTTP_ERROR
 from tasks.crypto_sync import setup_crypto_sync_jobs
@@ -140,10 +142,32 @@ class HealthHandler(BaseHTTPRequestHandler):
                 logging.getLogger(__name__).warning(f"/health: {e}")
                 body = json.dumps({"status": "ok"})
             self._respond(200, body, "application/json")
-        elif path == "/":
+            return
+        if path == "/":
             self._respond(200, "Allira Bot is running!")
-        else:
-            self._respond(404, "not found")
+            return
+        # Веб-панель управления (/admin, /admin/api/*) — расширяем
+        # health-сервер, чтобы не поднимать второй порт.
+        try:
+            from utils import web_panel
+            if web_panel.handle_get(self):
+                return
+        except Exception as e:
+            logging.getLogger(__name__).error(f"web panel GET: {e}", exc_info=True)
+            self._respond(500, "panel error")
+            return
+        self._respond(404, "not found")
+
+    def do_POST(self):
+        try:
+            from utils import web_panel
+            if web_panel.handle_post(self):
+                return
+        except Exception as e:
+            logging.getLogger(__name__).error(f"web panel POST: {e}", exc_info=True)
+            self._respond(500, "panel error")
+            return
+        self._respond(404, "not found")
 
     def log_message(self, fmt, *args):
         # Иначе каждый пинг UptimeRobot сыплет в лог отдельной строкой.
@@ -356,6 +380,14 @@ async def setup_bot_commands(bot) -> None:
 async def post_init(application: Application):
     logger.info("Инициализация бота...")
 
+    # Сервис управления: главный loop для запуска корутин из потоков
+    # веб-панели + кольцевой буфер последних логов.
+    bot_admin.MAIN_LOOP = asyncio.get_running_loop()
+    setup_log_buffer()
+    web_panel.configure(
+        config, application, BOT_START_TIME, config.admin_panel_token
+    )
+
     init_db()
     preload_all_prompts()
 
@@ -473,6 +505,12 @@ async def post_init(application: Application):
         setup_cex_sync_jobs(application)
         setup_reconcile_jobs(application)
         logger.info(f"Крипто-скан настроен для owner_id={config.crypto_owner_id}")
+
+    logger.info(
+        "Веб-панель управления: %s (/admin)",
+        f"включена, порт {config.port}" if config.admin_panel_token
+        else "выключена (нет ADMIN_PANEL_TOKEN)",
+    )
 
 
 async def post_shutdown(application: Application):
