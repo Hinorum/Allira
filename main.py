@@ -62,7 +62,7 @@ from handlers.dice_tournament import (
 from handlers.crypto_ledger import (
     wallet_add_command, wallet_list_command, wallet_del_command,
     addtx_command, airdrop_command,
-    tx_list_command, tx_del_command,
+    tx_list_command, tx_del_command, tx_action_callback,
     balance_command, pnl_command, rate_command, import_command,
 )
 from handlers.crypto_tax import (
@@ -673,6 +673,9 @@ def build_application() -> Application:
     ))
     application.add_handler(CallbackQueryHandler(
         tax_export_callback, pattern="^tax(pdf|xlsx|csvi|csvs):"
+    ))
+    application.add_handler(CallbackQueryHandler(
+        tx_action_callback, pattern="^tx(set|del):"
     ))
 
     application.add_handler(InlineQueryHandler(handle_inline_query))

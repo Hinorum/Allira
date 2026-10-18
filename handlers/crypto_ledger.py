@@ -31,7 +31,7 @@ import time
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
-from telegram import InputFile, Update
+from telegram import InputFile, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from utils.common import escape_html
@@ -340,7 +340,7 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def tx_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """`/tx_list [year] [asset] [type]` — последние операции."""
+    """`/tx_list [year] [asset] [type]` — последние операции + кнопки смены типа."""
     if not await _is_owner_chat(update, context):
         return
     args = context.args or []
@@ -368,8 +368,6 @@ async def tx_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     def asset_of(tx: Tx) -> Asset:
         if tx.asset_id in asset_cache:
             return asset_cache[tx.asset_id]
-        asset_cache[tx.asset_id] = ensure_asset(getattr(_db(), "_", ""))
-        # ensure_asset по пустому символу упадёт — достаём через прямой SQL.
         with get_db() as conn:
             row = conn.execute(
                 "SELECT * FROM crypto_assets WHERE id = ?", (tx.asset_id,)
@@ -379,8 +377,15 @@ async def tx_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         asset_cache[tx.asset_id] = a
         return a
 
+    # Ограничиваем количество операций с inline-кнопками: 10 строк × 3 кнопки
+    # = 30 callback_data в одной клавиатуре — потолок Telegram. Остальное
+    # выводим текстом без кнопок (для исправления — отдельный /tx_fix).
+    buttonable = txs[:10]
+    rest = txs[10:]
+
     lines = ["<b>Операции:</b>\n"]
-    for tx in txs:
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    for tx in buttonable:
         a = asset_of(tx)
         amt = humanize_amount(tx.amount_raw, a.decimals)
         date = datetime.fromtimestamp(tx.ts).strftime("%d.%m.%Y")
@@ -394,11 +399,138 @@ async def tx_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             info += f"\n  <i>{escape_html(tx.note[:120])}</i>"
         lines.append(info)
 
+        # Кнопки: 3 самых вероятных альтернативы типа + «Удалить».
+        # Список альтернатив зависит от текущего направления:
+        if tx.direction == "in":
+            alts = [TxType.AIRDROP, TxType.MINING, TxType.STAKING,
+                    TxType.GIFT_IN, TxType.REFUND]
+        else:
+            alts = [TxType.SELL, TxType.SWAP_OUT, TxType.SPEND,
+                    TxType.GIFT_OUT, TxType.SELL_NFT]
+        alts = [t for t in alts if t != tx.tx_type][:3]
+        row_buttons: list[InlineKeyboardButton] = []
+        for alt in alts:
+            short = {
+                TxType.AIRDROP: "Аирдроп",
+                TxType.MINING: "Майнинг",
+                TxType.STAKING: "Стейкинг",
+                TxType.GIFT_IN: "Подарок вход",
+                TxType.REFUND: "Возврат",
+                TxType.SELL: "Продажа",
+                TxType.SWAP_OUT: "Обмен",
+                TxType.SPEND: "Оплата",
+                TxType.GIFT_OUT: "Подарок исх",
+                TxType.SELL_NFT: "Продажа NFT",
+            }.get(alt, alt)
+            row_buttons.append(InlineKeyboardButton(
+                text=short,
+                callback_data=f"txset:{tx.id}:{alt}",
+            ))
+        row_buttons.append(InlineKeyboardButton(
+            text="🗑 Удалить",
+            callback_data=f"txdel:{tx.id}",
+        ))
+        keyboard_rows.append(row_buttons)
+
+    if rest:
+        lines.append(f"\n<i>…и ещё {len(rest)} (без кнопок — уточни фильтр)</i>")
+
     text = "\n".join(lines)
     if len(text) > 3500:
-        # Слишком длинно для одного сообщения — отрежем хвост.
-        text = text[:3500] + "\n<i>…есть ещё — увеличь фильтр (year, asset, type)</i>"
-    await update.message.reply_text(text, parse_mode="HTML")
+        text = text[:3500] + "\n<i>…обрезано</i>"
+
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None,
+    )
+
+
+# Колбэки от кнопок «сменить тип» / «удалить».
+async def tx_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка inline-кнопок под /tx_list."""
+    query = update.callback_query
+    await query.answer()
+    if not query.data or ":" not in query.data:
+        return
+    kind, tx_id_raw, *rest = query.data.split(":", 2)
+    try:
+        tx_id = int(tx_id_raw)
+    except ValueError:
+        return
+
+    owner = int(context.bot_data.get("CRYPTO_OWNER_ID") or 0)
+    if not owner:
+        return
+
+    if kind == "txset":
+        new_type = rest[0] if rest else ""
+        if new_type not in TxType.all():
+            await query.answer(f"Неизвестный тип: {new_type}", show_alert=False)
+            return
+        from utils.database import get_db as _db
+        with _db() as conn:
+            cur = conn.execute(
+                "UPDATE crypto_transactions SET tx_type=?, direction=? "
+                "WHERE id=? AND owner_id=?",
+                (new_type,
+                 "in" if new_type in TxType.income_types() else "out",
+                 tx_id, owner),
+            )
+        if cur.rowcount:
+            await query.answer(f"→ {TxType.label(new_type)}", show_alert=False)
+            # Обновим строку текста сообщения, чтобы кнопка отражала текущее.
+            try:
+                old_text = query.message.text or ""
+                # Меняем «<тип>» в строке этого #id на новый.
+                import re as _re
+                pattern = _re.compile(
+                    rf"(#\b{tx_id}\b [↗↘] )(\S+(?:\s\S+)*?)( \*\*)",
+                )
+                new_text = pattern.sub(
+                    rf"\g<1>{TxType.label(new_type)}\g<3>",
+                    old_text, count=1,
+                )
+                if new_text != old_text:
+                    await query.edit_message_text(
+                        new_text, parse_mode="HTML",
+                        reply_markup=query.message.reply_markup,
+                    )
+            except Exception:
+                pass  # не критично
+        else:
+            await query.answer("Не найдено.", show_alert=True)
+
+    elif kind == "txdel":
+        from utils.crypto_db import delete_transaction
+        if delete_transaction(tx_id, owner):
+            await query.answer("Удалено.", show_alert=False)
+            try:
+                # Удалим строку из текста.
+                import re as _re
+                old_text = query.message.text or ""
+                lines = old_text.split("\n")
+                new_lines = [l for l in lines
+                             if not _re.match(rf"<b>#{tx_id}\b", l)]
+                # Также уберём строку-кнопку.
+                if query.message.reply_markup:
+                    new_markup_rows = []
+                    for r in query.message.reply_markup.inline_keyboard:
+                        if any(":" in b.callback_data and b.callback_data.split(":", 1)[1].split(":", 1)[0] == str(tx_id)
+                               for b in r):
+                            continue
+                        new_markup_rows.append(r)
+                    new_markup = InlineKeyboardMarkup(new_markup_rows) if new_markup_rows else None
+                else:
+                    new_markup = None
+                await query.edit_message_text(
+                    "\n".join(new_lines), parse_mode="HTML",
+                    reply_markup=new_markup,
+                )
+            except Exception:
+                pass
+        else:
+            await query.answer("Не найдено.", show_alert=True)
 
 
 def _db():
