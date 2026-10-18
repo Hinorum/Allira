@@ -71,10 +71,12 @@ from handlers.crypto_tax import (
     tax_pdf_command, tax_xlsx_command, tax_csv_command,
 )
 from handlers.cex_command import cex_status_command, cex_sync_command
+from handlers.reconcile_command import reconcile_command, reconcile_xlsx_command
 from tasks.autoposting import setup_autoposting
 from tasks.marketapp_reports import setup_marketapp_jobs, LAST_LINKAGE, LAST_HISTORY_META, LAST_SYNC, LAST_HTTP_ERROR
 from tasks.crypto_sync import setup_crypto_sync_jobs
 from tasks.cex_sync import setup_cex_sync_jobs
+from tasks.reconcile_sync import setup_reconcile_jobs
 
 load_dotenv()
 setup_logging()
@@ -309,6 +311,8 @@ BOT_COMMANDS: list[tuple[str, str]] = [
     ("tax_csv", "CSV доходов/реализаций"),
     ("cex_status", "Статус подключения к биржам"),
     ("cex_sync", "Синк сделок с бирж"),
+    ("reconcile", "Сверка дебет-кредит + балансы"),
+    ("reconcile_xlsx", "XLSX-выгрузка сверки"),
 ]
 
 ADMIN_COMMANDS: list[tuple[str, str]] = [
@@ -467,6 +471,7 @@ async def post_init(application: Application):
     if config.crypto_owner_id:
         setup_crypto_sync_jobs(application)
         setup_cex_sync_jobs(application)
+        setup_reconcile_jobs(application)
         logger.info(f"Крипто-скан настроен для owner_id={config.crypto_owner_id}")
 
 
@@ -652,6 +657,8 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("tax_csv", tax_csv_command))
     application.add_handler(CommandHandler("cex_status", cex_status_command))
     application.add_handler(CommandHandler("cex_sync", cex_sync_command))
+    application.add_handler(CommandHandler("reconcile", reconcile_command))
+    application.add_handler(CommandHandler("reconcile_xlsx", reconcile_xlsx_command))
 
     application.add_handler(CallbackQueryHandler(
         show_help_callback, pattern="^show_help$"

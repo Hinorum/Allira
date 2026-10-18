@@ -63,6 +63,16 @@ class TxType:
     TRANSFER_IN = "transfer_in"
     TRANSFER_OUT = "transfer_out"
 
+    # Торговые/конвертационные операции — двойная запись «дебет-кредит».
+    # BUY — покупка актива (приход с себестоимостью, НЕ доход для НДФЛ).
+    # TRADE_IN — приход quote-валюты от продажи/обмена (выручка, но не
+    #            самостоятельный доход: налог уже по парной стороне сделки).
+    # TRADE_OUT — списание quote-валюты при покупке/обмене (конвертация,
+    #            не расход в смысле ст. 220 НК, но участвует в балансе).
+    BUY = "buy"
+    TRADE_IN = "trade_in"
+    TRADE_OUT = "trade_out"
+
     @classmethod
     def income_types(cls) -> set[str]:
         return {
@@ -82,8 +92,36 @@ class TxType:
         return {cls.TRANSFER_IN, cls.TRANSFER_OUT}
 
     @classmethod
+    def trade_types(cls) -> set[str]:
+        return {cls.BUY, cls.TRADE_IN, cls.TRADE_OUT}
+
+    @classmethod
     def all(cls) -> list[str]:
-        return sorted(cls.income_types() | cls.disposal_types() | cls.transfer_types())
+        return sorted(cls.income_types() | cls.disposal_types()
+                      | cls.transfer_types() | cls.trade_types())
+
+    @classmethod
+    def lot_in_types(cls) -> set[str]:
+        """Типы, открывающие FIFO-лот (много/списание с баланса)."""
+        return cls.income_types() | {cls.TRANSFER_IN, cls.BUY, cls.TRADE_IN}
+
+    @classmethod
+    def lot_out_types(cls) -> set[str]:
+        """Типы, списывающие FIFO-лот (списание с баланса).
+
+        TRANSFER_OUT сюда не входит намеренно: запись вводится вручную у
+        обеих сторон, net-effect нулевой (см. tax_calc._walk_fifo).
+        """
+        return cls.disposal_types() | {cls.TRADE_OUT}
+
+    @classmethod
+    def taxable_income_types(cls) -> set[str]:
+        """Доходы, образующие базу НДФЛ (ст. 214 НК РФ).
+
+        Конвертации (TRADE_IN) и внутренние переводы сюда НЕ входят:
+        выручка от продажи облагается по парной стороне сделки (SELL и т.п.).
+        """
+        return cls.income_types()
 
     @classmethod
     def label(cls, t: str) -> str:
@@ -104,6 +142,9 @@ class TxType:
             cls.DISPOSAL_OTHER: "Прочее списание",
             cls.TRANSFER_IN: "Перевод между своими",
             cls.TRANSFER_OUT: "Перевод между своими",
+            cls.BUY: "Покупка",
+            cls.TRADE_IN: "Приход по сделке",
+            cls.TRADE_OUT: "Списание по сделке",
         }
         return labels.get(t, t)
 
@@ -409,7 +450,7 @@ def add_transaction(
 
     amount_raw = _normalize_amount(asset.decimals, amount)
 
-    if tx_type in TxType.income_types() or tx_type == TxType.TRANSFER_IN:
+    if tx_type in TxType.lot_in_types():
         direction = "in"
     else:
         direction = "out"

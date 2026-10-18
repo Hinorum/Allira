@@ -242,7 +242,7 @@ def _walk_fifo(
         cost_basis = _to_decimal(row["cost_basis_rub"]) if row["cost_basis_rub"] else Decimal(0)
         fiat_value = _to_decimal(row["fiat_value_rub"]) if row["fiat_value_rub"] else Decimal(0)
 
-        if tx_type in TxType.income_types() or tx_type == TxType.TRANSFER_IN:
+        if tx_type in TxType.lot_in_types():
             # Себестоимость прихода (за 1 единицу актива):
             cost_total = cost_basis if cost_basis > 0 else fiat_value
             qty_human = amount / scale
@@ -258,7 +258,7 @@ def _walk_fifo(
                 source=row["source"] or "manual",
             ))
 
-        elif tx_type in TxType.disposal_types():
+        elif tx_type in TxType.lot_out_types():
             lots = active.get(asset_id, [])
             to_consume = amount
             i = 0
@@ -365,7 +365,7 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
         amount_human = amount_raw / scale
         tx_year = tx.ts >= year_start_ts
 
-        if tx.tx_type in TxType.income_types() or tx.tx_type == TxType.TRANSFER_IN:
+        if tx.tx_type in TxType.lot_in_types():
             # Лот открываем всегда — даже без котировки. Иначе FIFO
             # «потеряет» этот приход и при продаже даст нулевую себестоимость.
             cost_total = _to_decimal(tx.cost_basis_rub) if tx.cost_basis_rub else Decimal(0)
@@ -383,8 +383,10 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
                 source=tx.source or "manual",
             ))
 
-            if tx_year and tx.tx_type != TxType.TRANSFER_IN:
-                # Доход для 3-НДФЛ (transfer_in — внутреннее перемещение).
+            if tx_year and tx.tx_type in TxType.taxable_income_types():
+                # Доход для 3-НДФЛ. Внутренние переводы, покупки (BUY) и
+                # конвертации (TRADE_IN) здесь НЕ считаются доходом: выручка
+                # отражена на парной стороне сделки (SELL/SWAP_OUT).
                 income = _resolve_fiat(tx)
                 if income is None and cost_total > 0:
                     # На входе была задана стоимость — используем её.
@@ -410,13 +412,13 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
                     note=tx.note,
                 ))
 
-        elif tx.tx_type in TxType.disposal_types():
+        elif tx.tx_type in TxType.lot_out_types():
             # FIFO-себестоимость ДО открытия новых лотов (это текущая операция).
             cost, shortfall = _fifo_cost_inplace(
                 active.get(tx.asset_id, []), amount_raw, scale
             )
 
-            if tx_year:
+            if tx_year and tx.tx_type in TxType.disposal_types():
                 proceeds = _resolve_fiat(tx)
                 if proceeds is None:
                     market = await get_asset_price_rub(symbol, tx.ts)

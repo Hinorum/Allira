@@ -17,9 +17,6 @@ from telegram.ext import ContextTypes
 from utils.cex_api import (get_cex_watermark, set_cex_watermark,
                            sync_bybit_trades, sync_okx_trades)
 from utils.common import escape_html
-from utils.crypto_db import add_transaction, CryptoError
-from utils.database import get_db
-from utils.price_oracle import get_usd_rub_rate
 
 logger = logging.getLogger(__name__)
 
@@ -174,54 +171,10 @@ async def _cex_sync_task(bot, chat_id: int, cfg) -> None:
 
 
 async def _persist_rows(owner_id: int, rows: list, exchange: str) -> tuple[int, int]:
-    """Записать ParsedRow через add_transaction (с защитой от дублей).
+    """Записать ParsedRow с двойной записью «дебет-кредит».
 
+    Логика единая с фоновой джобой (tasks.cex_sync.persist_cex_rows).
     Возвращает (saved, duplicates_skipped).
     """
-    saved = 0
-    dups = 0
-    for row in rows:
-        # Подтянуть курс USDT→RUB для автозаполнения cost_basis (buy)
-        # и fiat_value (sell). Если не получится — запишем без цены,
-        # потом /addtx подтянет при первом запуске /tax.
-        try:
-            usd_rub = await get_usd_rub_rate(
-                time.strftime("%Y-%m-%d", time.gmtime(row.ts))
-            )
-        except Exception:
-            usd_rub = None
-
-        cost_basis = ""
-        fiat_value = ""
-        # amount в quote-валюте = qty * price
-        try:
-            qty_f = float(row.amount)
-        except (TypeError, ValueError):
-            qty_f = 0.0
-        # Нам нужен price для quote, но ParsedRow его не хранит — дописываем
-        # в note и оставляем пустые cost/fiat. Дальше /tax подтянет по рынку.
-        # (Реальная цена в quote-валюте потребует расширения ParsedRow —
-        # оставлено на следующую итерацию.)
-        try:
-            add_transaction(
-                owner_id=owner_id,
-                ts=row.ts,
-                asset_symbol=row.asset,
-                tx_type=row.tx_type,
-                amount=row.amount,
-                fiat_value_rub=fiat_value or None,
-                cost_basis_rub=cost_basis or None,
-                note=row.note,
-                source=exchange,
-                external_id=row.external_id,
-            )
-            saved += 1
-        except CryptoError as e:
-            if "дубл" in str(e).lower():
-                dups += 1
-            else:
-                logger.info(f"cex persist skip: {e}")
-                dups += 1
-        except Exception as e:
-            logger.error(f"cex persist fail: {e}", exc_info=True)
-    return saved, dups
+    from tasks.cex_sync import persist_cex_rows
+    return await persist_cex_rows(owner_id, rows, exchange)

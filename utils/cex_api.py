@@ -151,7 +151,15 @@ def _bybit_sign(api_key: str, api_secret: str,
 
 
 def _bybit_row_to_parsed(r: dict) -> ParsedRow | None:
-    """Bybit exec: symbol=BTCUSDT, side=Buy/Sell, execQty, execPrice, execTime."""
+    """Bybit exec: symbol=BTCUSDT, side=Buy/Sell, execQty, execPrice, execTime.
+
+    Двойная запись: покупка BTC за USDT даёт две проводки —
+      Дебет: BTC +qty (BUY, себестоимость = qty × price × курс quote→RUB)
+      Кредит: USDT −qty×price (TRADE_OUT, конвертация).
+    Продажа:
+      Дебет: USDT +qty×price (TRADE_IN, выручка)
+      Кредит: BTC −qty (SELL, выручка в RUB — через price_oracle).
+    """
     try:
         ts_ms = int(r.get("execTime") or 0)
         if not ts_ms:
@@ -169,32 +177,37 @@ def _bybit_row_to_parsed(r: dict) -> ParsedRow | None:
         base, quote = _split_symbol(symbol)
         if not base:
             return None
-        proceeds_or_cost = float(qty) * float(price)
+        quote_amount = _fmt_amount(float(qty) * float(price))
         exec_id = r.get("execId", "")
 
         if side == "buy":
-            # Купили base за quote: получаем base, отдаём quote.
-            # В учёте: приход base с cost_basis = proceeds_or_cost (в quote).
-            # quote-актив обычно USDT → конвертируем в RUB через get_usd_rub_rate.
             return ParsedRow(
-                ts=ts, asset=base, tx_type=TxType.TRANSFER_IN,
+                ts=ts, asset=base, tx_type=TxType.BUY,
                 amount=qty, fiat_value_rub="",
-                cost_basis_rub="",
+                cost_basis_rub="",  # заполнит cex_sync по курсу quote→RUB
                 note=f"bybit buy {symbol}",
                 external_id=f"bybit:{exec_id}",
+                quote_asset=quote, quote_amount=quote_amount,
             )
         elif side == "sell":
             return ParsedRow(
                 ts=ts, asset=base, tx_type=TxType.SELL,
-                amount=qty, fiat_value_rub="",
+                amount=qty, fiat_value_rub="",  # заполнит cex_sync
                 cost_basis_rub="",
                 note=f"bybit sell {symbol}",
                 external_id=f"bybit:{exec_id}",
+                quote_asset=quote, quote_amount=quote_amount,
             )
         return None
     except Exception as e:
         logger.info(f"bybit row skip: {e}")
         return None
+
+
+def _fmt_amount(value: float) -> str:
+    """Убрать хвостовые нули float-умножения: 1.2300000000000002 → '1.23'."""
+    s = f"{value:.12f}".rstrip("0").rstrip(".")
+    return s or "0"
 
 
 def _split_symbol(symbol: str) -> tuple[str, str]:
@@ -305,6 +318,7 @@ def _okx_sign(api_key: str, api_secret: str, passphrase: str,
 
 
 def _okx_row_to_parsed(r: dict) -> ParsedRow | None:
+    """OKX fill. Двойная запись — аналогично _bybit_row_to_parsed."""
     try:
         ts_ms = int(r.get("ts") or 0)
         if not ts_ms:
@@ -313,21 +327,23 @@ def _okx_row_to_parsed(r: dict) -> ParsedRow | None:
         inst_id = (r.get("instId") or "").strip().upper()
         if "-" not in inst_id:
             return None
-        base, _, _quote = inst_id.partition("-")
+        base, _, quote = inst_id.partition("-")
         side = (r.get("side") or "").strip().lower()
         qty = r.get("fillSz") or "0"
         price = r.get("fillPx") or "0"
         if not qty or float(qty) == 0:
             return None
         trade_id = r.get("tradeId", "")
+        quote_amount = _fmt_amount(float(qty) * float(price))
 
         if side == "buy":
             return ParsedRow(
-                ts=ts, asset=base, tx_type=TxType.TRANSFER_IN,
+                ts=ts, asset=base, tx_type=TxType.BUY,
                 amount=qty, fiat_value_rub="",
                 cost_basis_rub="",
                 note=f"okx buy {inst_id}",
                 external_id=f"okx:{trade_id}",
+                quote_asset=quote, quote_amount=quote_amount,
             )
         elif side == "sell":
             return ParsedRow(
@@ -336,6 +352,7 @@ def _okx_row_to_parsed(r: dict) -> ParsedRow | None:
                 cost_basis_rub="",
                 note=f"okx sell {inst_id}",
                 external_id=f"okx:{trade_id}",
+                quote_asset=quote, quote_amount=quote_amount,
             )
         return None
     except Exception as e:

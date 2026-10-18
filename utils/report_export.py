@@ -419,6 +419,111 @@ def render_xlsx(summary: YearSummary, settings: dict) -> bytes:
     return buf.getvalue()
 
 
+# ------------------------------------------------------- сверка Дт/Кт
+
+
+def render_reconciliation_xlsx(report, settings: dict) -> bytes:
+    """XLSX-сверка: сводка, журнал проводок Дт/Кт, расхождения, балансы.
+
+    report — utils.reconciliation.ReconciliationReport.
+    """
+    wb = Workbook()
+    bold = Font(bold=True)
+    header_fill = PatternFill("solid", fgColor="DDDDDD")
+
+    # 1. Сводка
+    ws = wb.active
+    ws.title = "Сводка"
+    ws.append(["Параметр", "Значение"])
+    for cell in ws[1]:
+        cell.font = bold
+        cell.fill = header_fill
+    ws.append(["Налоговый период", str(report.year)])
+    ws.append(["Плательщик", settings.get("taxpayer_name") or "—"])
+    ws.append(["ИНН", settings.get("taxpayer_inn") or "—"])
+    ws.append(["Проводок в журнале", len(report.entries)])
+    ws.append(["Σ Дебет, RUB", float(report.total_dr_rub)])
+    ws.append(["Σ Кредит, RUB", float(report.total_cr_rub)])
+    ws.append(["Разница Дт−Кт, RUB", float(report.delta_dr_cr)])
+    ws.append(["Расхождений", len(report.issues)])
+    ws.append(["Статус", "OK" if report.ok else "ЕСТЬ РАСХОЖДЕНИЯ"])
+    ws.append(["Дата формирования", time.strftime("%d.%m.%Y %H:%M:%S")])
+    ws.column_dimensions["A"].width = 35
+    ws.column_dimensions["B"].width = 45
+
+    # 2. Журнал проводок
+    ws = wb.create_sheet("Проводки")
+    ws.append(["Дата", "Дт", "Кт", "Операция", "Актив", "Кол-во",
+               "Сумма, RUB", "Парная запись", "Источник", "Tx ID",
+               "Комментарий"])
+    for cell in ws[1]:
+        cell.font = bold
+        cell.fill = header_fill
+    for e in report.entries:
+        ws.append([
+            time.strftime("%d.%m.%Y", time.localtime(e.ts)),
+            e.dr_account,
+            e.cr_account,
+            e.kind,
+            e.asset,
+            float(e.qty),
+            float(e.rub),
+            "да" if e.has_quote_pair else "НЕТ",
+            e.source,
+            e.tx_id,
+            e.note,
+        ])
+    for col, width in enumerate([12, 16, 16, 10, 10, 16, 14, 12, 12, 8, 40], 1):
+        ws.column_dimensions[get_column_letter(col)].width = width
+
+    # 3. Расхождения
+    ws = wb.create_sheet("Расхождения")
+    ws.append(["Тип", "Описание", "Актив", "Tx ID"])
+    for cell in ws[1]:
+        cell.font = bold
+        cell.fill = header_fill
+    for issue in report.issues:
+        ws.append([issue.kind, issue.message, issue.symbol,
+                   ", ".join(str(i) for i in issue.tx_ids)])
+    for col, width in enumerate([18, 90, 12, 14], 1):
+        ws.column_dimensions[get_column_letter(col)].width = width
+
+    # 4. Балансы: расчёт против факта
+    ws = wb.create_sheet("Балансы")
+    ws.append(["Актив", "Расчётный остаток", "Фактический остаток",
+               "Разница", "Остаточная себестоимость, RUB",
+               "Рыночная стоимость, RUB", "Источник факта"])
+    for cell in ws[1]:
+        cell.font = bold
+        cell.fill = header_fill
+    actual_by_symbol: dict[str, float] = {}
+    actual_where: dict[str, str] = {}
+    for a in report.actual:
+        actual_by_symbol[a.symbol] = actual_by_symbol.get(a.symbol, 0.0) + float(a.qty)
+        actual_where.setdefault(a.symbol, a.where)
+    symbols = sorted({b.symbol for b in report.balances} | set(actual_by_symbol))
+    calc_by_symbol = {b.symbol: b for b in report.balances}
+    for symbol in symbols:
+        b = calc_by_symbol.get(symbol)
+        calc_qty = float(b.qty) if b else 0.0
+        act_qty = actual_by_symbol.get(symbol)
+        ws.append([
+            symbol,
+            calc_qty,
+            act_qty if act_qty is not None else "нет данных",
+            (calc_qty - act_qty) if act_qty is not None else "—",
+            float(b.cost_rub) if b else 0.0,
+            float(b.market_value_rub) if (b and b.market_value_rub is not None) else "—",
+            actual_where.get(symbol, "—"),
+        ])
+    for col, width in enumerate([12, 18, 18, 14, 26, 24, 20], 1):
+        ws.column_dimensions[get_column_letter(col)].width = width
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 # ------------------------------------------------------------------ CSV
 
 

@@ -39,6 +39,11 @@ class ParsedRow:
     cost_basis_rub: str
     note: str
     external_id: str
+    # Двойная запись «дебет-кредит»: quote-валюта сделки (USDT и т.п.) и её
+    # количество. Если заполнено — cex_sync добавит парную проводку
+    # (TRADE_IN/TRADE_OUT) и RUB-стоимость через price_oracle.
+    quote_asset: str = ""
+    quote_amount: str = ""
 
 
 # ----------------------------------------------------- распознавание

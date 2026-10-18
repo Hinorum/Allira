@@ -14,7 +14,8 @@ from telegram.ext import Application
 
 from utils.cex_api import (get_cex_watermark, set_cex_watermark,
                            sync_bybit_trades, sync_okx_trades)
-from utils.crypto_db import add_transaction, CryptoError
+from utils.crypto_db import add_transaction, CryptoError, TxType
+from utils.price_oracle import get_asset_price_rub
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,7 @@ async def _run_bybit(data: dict, owner_id: int) -> None:
         data["bybit_key"], data["bybit_secret"],
         since_ts=since_ms, until_ts=until_ms,
     )
-    saved = await _persist(result.rows, owner_id)
+    saved, _dups = await persist_cex_rows(owner_id, result.rows, "bybit")
     if result.rows:
         max_ts = max(r.ts for r in result.rows)
         set_cex_watermark("bybit", max_ts * 1000)
@@ -90,7 +91,7 @@ async def _run_okx(data: dict, owner_id: int) -> None:
         data["okx_key"], data["okx_secret"], data["okx_passphrase"],
         since_ts=since_ms, until_ts=until_ms,
     )
-    saved = await _persist(result.rows, owner_id)
+    saved, _dups = await persist_cex_rows(owner_id, result.rows, "okx")
     if result.rows:
         max_ts = max(r.ts for r in result.rows)
         set_cex_watermark("okx", max_ts * 1000)
@@ -100,23 +101,76 @@ async def _run_okx(data: dict, owner_id: int) -> None:
         logger.warning(f"cex_sync okx: {result.errors[:3]}")
 
 
-async def _persist(rows: list, owner_id: int) -> int:
+async def persist_cex_rows(owner_id: int, rows: list, exchange: str) -> tuple[int, int]:
+    """Записывает сделки с двойной записью «дебет-кредит».
+
+    Возвращает (saved, duplicates). Каждая сделка — ДВЕ проводки:
+      покупка  BTC/USDT → Дт BTC (BUY, себестоимость) / Кт USDT (TRADE_OUT)
+      продажа  BTC/USDT → Дт USDT (TRADE_IN, выручка) / Кт BTC (SELL)
+
+    RUB-стоимость quote-ветки берётся из price_oracle (для стейблкоинов —
+    курс ЦБ на дату сделки). Если котировки нет, обе ноги пишутся без
+    RUB — расчёт зафиксирует это как «нет котировки» в отчёте /tax.
+
+    Используется и фоновой джобой (cex_sync_hourly), и ручным /cex_sync.
+    """
     saved = 0
+    dups = 0
     for row in rows:
         try:
+            fiat = row.fiat_value_rub or ""
+            cost = row.cost_basis_rub or ""
+
+            # RUB-оценка quote-ветки сделки — если она ещё не задана.
+            if not fiat and not cost and getattr(row, "quote_asset", ""):
+                try:
+                    q_price = await get_asset_price_rub(row.quote_asset, row.ts)
+                except Exception:
+                    q_price = None
+                if q_price is not None:
+                    rub_total = float(row.quote_amount) * q_price
+                    if row.tx_type == TxType.BUY:
+                        cost = f"{rub_total:.2f}"
+                    else:
+                        fiat = f"{rub_total:.2f}"
+
             add_transaction(
                 owner_id=owner_id,
                 ts=row.ts,
                 asset_symbol=row.asset,
                 tx_type=row.tx_type,
                 amount=row.amount,
+                fiat_value_rub=fiat or None,
+                cost_basis_rub=cost or None,
                 note=row.note,
-                source=getattr(row, "_exchange", "cex"),
+                source=exchange,
                 external_id=row.external_id,
             )
             saved += 1
-        except CryptoError:
-            pass  # дубль — нормальное состояние
+
+            # Парная проводка quote-валюты (дебет-кредит).
+            quote_asset = getattr(row, "quote_asset", "")
+            quote_amount = getattr(row, "quote_amount", "")
+            if quote_asset and quote_amount and float(quote_amount) > 0:
+                leg_type = (TxType.TRADE_OUT if row.tx_type == TxType.BUY
+                            else TxType.TRADE_IN)
+                add_transaction(
+                    owner_id=owner_id,
+                    ts=row.ts,
+                    asset_symbol=quote_asset,
+                    tx_type=leg_type,
+                    amount=quote_amount,
+                    note=f"{row.note} [парная проводка quote: {quote_asset}]",
+                    source=exchange,
+                    external_id=f"{row.external_id}:quote",
+                )
+                saved += 1
+        except CryptoError as e:
+            if "дубл" in str(e).lower():
+                dups += 1
+            else:
+                logger.info(f"cex persist skip: {e}")
+                dups += 1
         except Exception as e:
             logger.error(f"cex persist fail: {e}", exc_info=True)
-    return saved
+    return saved, dups
