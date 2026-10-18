@@ -271,16 +271,84 @@ def _set_watermark(wallet_id: int, ts: int) -> None:
 
 
 async def _warm_rate_cache_job(context) -> None:
-    """Раз в сутки прогреваем кэш USD→RUB за вчера и сегодня.
+    """Раз в сутки прогреваем кэш котировок.
 
-    CoinGecko историю за прошлые дни не трогаем — там ленивая загрузка
-    при первом обращении через get_coingecko_price.
+    Что делаем:
+      * USD→RUB за вчера и сегодня (через ЦБ РФ).
+      * Исторические цены активов из БД за каждый день активности —
+        чтобы /tax не лагал на десятках тысяч операций.
+
+    CoinGecko сам по себе ленивый (первый запрос за день = 1 API-вызов),
+    но если операций 10к, это 10к запросов подряд. Прогреваем пачками
+    по ассетам: для каждого актива из crypto_assets берём диапазон
+    дат от первой до последней операции в БД и заполняем дыры.
     """
-    from utils.price_oracle import get_usd_rub_rate
+    from utils.crypto_db import list_assets, list_transactions
+    from utils.database import get_db
+    from utils.price_oracle import get_asset_price_rub, get_usd_rub_rate
+
     today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
     yesterday = (datetime.now(tz=timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+
     try:
         await get_usd_rub_rate(today)
         await get_usd_rub_rate(yesterday)
     except Exception as e:
-        logger.warning(f"rate warm: {e}")
+        logger.warning(f"rate warm usd: {e}")
+
+    # Прогрев по ассетам: для каждого актива из crypto_assets с хотя бы
+    # одной операцией — диапазон дат от min(ts) до max(ts).
+    try:
+        with get_db() as conn:
+            asset_ranges = conn.execute("""
+                SELECT a.id, a.symbol, a.coingecko_id,
+                       MIN(t.ts) AS min_ts, MAX(t.ts) AS max_ts
+                FROM crypto_assets a
+                JOIN crypto_transactions t ON t.asset_id = a.id
+                GROUP BY a.id
+            """).fetchall()
+    except Exception as e:
+        logger.warning(f"rate warm: ranges: {e}")
+        return
+
+    today_dt = datetime.now(tz=timezone.utc).date()
+    for r in asset_ranges:
+        if not r["coingecko_id"]:
+            continue
+        start_day = datetime.fromtimestamp(r["min_ts"], tz=timezone.utc).date()
+        end_day = min(today_dt,
+                      datetime.fromtimestamp(r["max_ts"], tz=timezone.utc).date())
+        # Не больше 366 дней назад — CoinGecko free не отдаёт глубже.
+        earliest = today_dt - timedelta(days=366)
+        if start_day < earliest:
+            start_day = earliest
+
+        # Прогреваем дыры — пропускаем дни, по которым уже есть кэш.
+        with get_db() as conn:
+            cached_rows = conn.execute(
+                """SELECT date FROM fiat_rates
+                   WHERE base_symbol=? AND quote_symbol='RUB'
+                     AND date BETWEEN ? AND ?""",
+                (r["coingecko_id"].upper(), start_day.isoformat(), end_day.isoformat()),
+            ).fetchall()
+        cached_set = {row["date"] for row in cached_rows}
+        missing: list[str] = []
+        cur = start_day
+        while cur <= end_day:
+            iso = cur.isoformat()
+            if iso not in cached_set:
+                missing.append(iso)
+            cur += timedelta(days=1)
+
+        if not missing:
+            continue
+
+        logger.info(f"rate warm {r['symbol']}: {len(missing)} дней")
+        for iso in missing:
+            try:
+                ts = int(datetime.strptime(iso, "%Y-%m-%d")
+                         .replace(tzinfo=timezone.utc).timestamp())
+                await get_asset_price_rub(r["symbol"], ts)
+            except Exception as e:
+                logger.warning(f"rate warm {r['symbol']} {iso}: {e}")
+            await asyncio.sleep(0.3)  # не давим CoinGecko
