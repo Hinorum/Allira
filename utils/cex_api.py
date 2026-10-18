@@ -24,11 +24,16 @@ from urllib.parse import urlencode
 from utils.crypto_db import TxType
 from utils.csv_import import ParsedRow
 from utils.http_client import get_client
+from utils.price_oracle import get_asset_price_rub, get_usd_rub_rate
 
 logger = logging.getLogger(__name__)
 
 BYBIT_API = "https://api.bybit.com"
 OKX_API = "https://www.okx.com"
+
+# Quote-валюты, привязанные к доллару: их цена сделки переводится в RUB
+# через курс ЦБ (USD→RUB на дату) — это официальная методика ФНС.
+USD_LIKE_QUOTES = {"USDT", "USDC", "USD", "FDUSD", "TUSD", "DAI", "BUSD", "PYUSD"}
 
 # Безконечный лимит «торгов» Bybit'а — за последние 2 года. OKX — 3 месяца
 # для спота через trade/fills (для расширения нужен /api/v5/trade/fills-history
@@ -169,19 +174,22 @@ def _bybit_row_to_parsed(r: dict) -> ParsedRow | None:
         base, quote = _split_symbol(symbol)
         if not base:
             return None
-        proceeds_or_cost = float(qty) * float(price)
+        # Реальная цена сделки в quote-валюте (обычно USDT) — по ней
+        # tasks/cex_sync посчитает RUB-себестоимость/выручку по курсу ЦБ.
+        quote_value = str(round(float(qty) * float(price), 8))
         exec_id = r.get("execId", "")
 
         if side == "buy":
-            # Купили base за quote: получаем base, отдаём quote.
-            # В учёте: приход base с cost_basis = proceeds_or_cost (в quote).
-            # quote-актив обычно USDT → конвертируем в RUB через get_usd_rub_rate.
+            # Купили base за quote: приход актива по документированной
+            # цене (BUY). Налоговой базы не даёт, но открывает FIFO-лёт
+            # с реальной себестоимостью.
             return ParsedRow(
-                ts=ts, asset=base, tx_type=TxType.TRANSFER_IN,
+                ts=ts, asset=base, tx_type=TxType.BUY,
                 amount=qty, fiat_value_rub="",
                 cost_basis_rub="",
                 note=f"bybit buy {symbol}",
                 external_id=f"bybit:{exec_id}",
+                quote=quote, quote_value=quote_value,
             )
         elif side == "sell":
             return ParsedRow(
@@ -190,6 +198,7 @@ def _bybit_row_to_parsed(r: dict) -> ParsedRow | None:
                 cost_basis_rub="",
                 note=f"bybit sell {symbol}",
                 external_id=f"bybit:{exec_id}",
+                quote=quote, quote_value=quote_value,
             )
         return None
     except Exception as e:
@@ -199,7 +208,9 @@ def _bybit_row_to_parsed(r: dict) -> ParsedRow | None:
 
 def _split_symbol(symbol: str) -> tuple[str, str]:
     """BTCUSDT → (BTC, USDT); ETHUSDT → (ETH, USDT)."""
-    for quote in ("USDT", "USDC", "USD", "BTC", "ETH", "TON", "EUR"):
+    # Порядок важен: FDUSD/TUSD заканчиваются на «USD» — более длинные
+    # стейблкоины проверяются первыми, иначе FDUSD развалился бы на (FD, USD).
+    for quote in ("FDUSD", "TUSD", "USDT", "USDC", "USD", "BTC", "ETH", "TON", "EUR"):
         if symbol.endswith(quote) and len(symbol) > len(quote):
             return symbol[:-len(quote)], quote
     return "", ""
@@ -212,6 +223,63 @@ def yield_row(row: ParsedRow, result: CexSyncResult) -> None:
     if not hasattr(result, "rows"):
         result.rows = []  # type: ignore[attr-defined]
     result.rows.append(row)  # type: ignore[attr-defined]
+
+
+# ------------------------------------------------- цена сделки → RUB
+
+
+async def enrich_rub_prices(row: ParsedRow) -> ParsedRow:
+    """Заполнить fiat_value_rub (sell) или cost_basis_rub (buy) в RUB.
+
+    Биржа отдаёт цену в quote-валюте сделки (обычно USDT). Переводим:
+      1. quote_value × курс ЦБ USD→RUB на дату сделки — если quote «долларовый»
+         стейбл. Это официальная методика: доход/расход в рублях по курсу ЦБ.
+      2. иначе — рыночная котировка актива × количество (приближение).
+
+    Если оба источника недоступны, строка возвращается без цены: тогда
+    себестоимость подтянется позже при расчёте /tax (по котировке на дату).
+    """
+    if row.tx_type not in (TxType.BUY, TxType.SELL):
+        return row
+
+    rub: float | None = None
+    try:
+        quote_value = float(row.quote_value or 0)
+    except (TypeError, ValueError):
+        quote_value = 0.0
+
+    if quote_value > 0 and (row.quote or "").upper() in USD_LIKE_QUOTES:
+        try:
+            usd_rub = await get_usd_rub_rate(
+                time.strftime("%Y-%m-%d", time.gmtime(row.ts))
+            )
+        except Exception as e:
+            logger.info(f"enrich_rub: курс ЦБ не получен: {e}")
+            usd_rub = None
+        if usd_rub:
+            rub = round(quote_value * usd_rub, 2)
+
+    if rub is None:
+        try:
+            price = await get_asset_price_rub(row.asset, row.ts)
+        except Exception as e:
+            logger.info(f"enrich_rub: котировка {row.asset} не получена: {e}")
+            price = None
+        if price is not None:
+            try:
+                qty = float(row.amount or 0)
+            except (TypeError, ValueError):
+                qty = 0.0
+            if qty > 0:
+                rub = round(qty * price, 2)
+
+    if rub is None:
+        return row
+    if row.tx_type == TxType.BUY:
+        row.cost_basis_rub = str(rub)
+    else:
+        row.fiat_value_rub = str(rub)
+    return row
 
 
 # ------------------------------------------------------------------- OKX
@@ -313,21 +381,23 @@ def _okx_row_to_parsed(r: dict) -> ParsedRow | None:
         inst_id = (r.get("instId") or "").strip().upper()
         if "-" not in inst_id:
             return None
-        base, _, _quote = inst_id.partition("-")
+        base, _, quote = inst_id.partition("-")
         side = (r.get("side") or "").strip().lower()
         qty = r.get("fillSz") or "0"
         price = r.get("fillPx") or "0"
         if not qty or float(qty) == 0:
             return None
         trade_id = r.get("tradeId", "")
+        quote_value = str(round(float(qty) * float(price), 8))
 
         if side == "buy":
             return ParsedRow(
-                ts=ts, asset=base, tx_type=TxType.TRANSFER_IN,
+                ts=ts, asset=base, tx_type=TxType.BUY,
                 amount=qty, fiat_value_rub="",
                 cost_basis_rub="",
                 note=f"okx buy {inst_id}",
                 external_id=f"okx:{trade_id}",
+                quote=quote, quote_value=quote_value,
             )
         elif side == "sell":
             return ParsedRow(
@@ -336,6 +406,7 @@ def _okx_row_to_parsed(r: dict) -> ParsedRow | None:
                 cost_basis_rub="",
                 note=f"okx sell {inst_id}",
                 external_id=f"okx:{trade_id}",
+                quote=quote, quote_value=quote_value,
             )
         return None
     except Exception as e:

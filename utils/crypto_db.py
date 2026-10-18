@@ -34,6 +34,8 @@ class TxType:
 
     Категория «income» — то, что образует доход в смысле ст. 214 НК
     (аирдроп, майнинг, стейкинг-вознаграждение, возврат).
+    Категория «acquisition» (buy) — приобретение актива: открывает FIFO-лёт
+    с документированной себестоимостью, но НЕ даёт дохода для НДФЛ.
     Категория «disposal» — реализация, уменьшающая остаток актива
     (продажа, обмен, оплата картой, перевод в пользу другого лица).
     Нейтральные типы (transfer_in, transfer_out) — движение между
@@ -50,6 +52,12 @@ class TxType:
     GIFT_IN = "gift_in"           # входящий дар (не от родственника — ст. 217 НК)
     REFUND = "refund"
     INCOME_OTHER = "income_other"
+
+    # Приобретения (актив пришёл, расход документирован — НЕ доход для НДФЛ).
+    # Отличие от transfer_in: покупка на бирже/DEX — это расход fiat/другой
+    # крипты, поэтому для buy заполняется cost_basis_rub (себестоимость),
+    # по которой потом FIFO спишет актив при продаже.
+    BUY = "buy"
 
     # Расходы (реализация)
     SELL = "sell"
@@ -71,6 +79,17 @@ class TxType:
         }
 
     @classmethod
+    def acquisition_types(cls) -> set[str]:
+        """Приобретения: актив пришёл, налоговой базы не даёт."""
+        return {cls.BUY}
+
+    @classmethod
+    def is_in(cls, t: str) -> bool:
+        """Операции, увеличивающие остаток актива (приход)."""
+        return (t in cls.income_types() or t in cls.acquisition_types()
+                or t == cls.TRANSFER_IN)
+
+    @classmethod
     def disposal_types(cls) -> set[str]:
         return {
             cls.SELL, cls.SWAP_OUT, cls.SPEND, cls.GIFT_OUT,
@@ -83,7 +102,10 @@ class TxType:
 
     @classmethod
     def all(cls) -> list[str]:
-        return sorted(cls.income_types() | cls.disposal_types() | cls.transfer_types())
+        return sorted(
+            cls.income_types() | cls.acquisition_types()
+            | cls.disposal_types() | cls.transfer_types()
+        )
 
     @classmethod
     def label(cls, t: str) -> str:
@@ -96,6 +118,7 @@ class TxType:
             cls.GIFT_IN: "Подарок входящий",
             cls.REFUND: "Возврат",
             cls.INCOME_OTHER: "Прочий доход",
+            cls.BUY: "Покупка",
             cls.SELL: "Продажа",
             cls.SWAP_OUT: "Обмен (исход)",
             cls.SPEND: "Оплата",
@@ -409,7 +432,7 @@ def add_transaction(
 
     amount_raw = _normalize_amount(asset.decimals, amount)
 
-    if tx_type in TxType.income_types() or tx_type == TxType.TRANSFER_IN:
+    if TxType.is_in(tx_type):
         direction = "in"
     else:
         direction = "out"

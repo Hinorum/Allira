@@ -64,6 +64,7 @@ from handlers.crypto_ledger import (
     addtx_command, airdrop_command,
     tx_list_command, tx_del_command, tx_action_callback,
     balance_command, pnl_command, rate_command, import_command,
+    journal_command, oborka_command, journal_csv_command,
 )
 from handlers.crypto_tax import (
     tax_setup_command, tax_setup_status_command,
@@ -302,6 +303,9 @@ BOT_COMMANDS: list[tuple[str, str]] = [
     ("pnl", "Прибыль/убыток за год"),
     ("rate", "Текущий курс актива в RUB"),
     ("import", "Импорт CSV (реплай на файл)"),
+    ("journal", "Журнал проводок дебет/кредит"),
+    ("oborka", "Оборотно-сальдовая ведомость"),
+    ("journal_csv", "CSV журнала проводок"),
     ("tax", "Сводка 3-НДФЛ за год"),
     ("tax_setup", "Настроить ИНН/ФИО/статус"),
     ("tax_pdf", "PDF-отчёт для ФНС"),
@@ -644,6 +648,9 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("pnl", pnl_command))
     application.add_handler(CommandHandler("rate", rate_command))
     application.add_handler(CommandHandler("import", import_command))
+    application.add_handler(CommandHandler("journal", journal_command))
+    application.add_handler(CommandHandler("oborka", oborka_command))
+    application.add_handler(CommandHandler("journal_csv", journal_csv_command))
     application.add_handler(CommandHandler("tax", tax_command))
     application.add_handler(CommandHandler("tax_setup", tax_setup_command))
     application.add_handler(CommandHandler("tax_setup_status", tax_setup_status_command))

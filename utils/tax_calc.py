@@ -242,7 +242,9 @@ def _walk_fifo(
         cost_basis = _to_decimal(row["cost_basis_rub"]) if row["cost_basis_rub"] else Decimal(0)
         fiat_value = _to_decimal(row["fiat_value_rub"]) if row["fiat_value_rub"] else Decimal(0)
 
-        if tx_type in TxType.income_types() or tx_type == TxType.TRANSFER_IN:
+        if (tx_type in TxType.income_types()
+                or tx_type in TxType.acquisition_types()
+                or tx_type == TxType.TRANSFER_IN):
             # Себестоимость прихода (за 1 единицу актива):
             cost_total = cost_basis if cost_basis > 0 else fiat_value
             qty_human = amount / scale
@@ -365,7 +367,7 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
         amount_human = amount_raw / scale
         tx_year = tx.ts >= year_start_ts
 
-        if tx.tx_type in TxType.income_types() or tx.tx_type == TxType.TRANSFER_IN:
+        if TxType.is_in(tx.tx_type):
             # Лот открываем всегда — даже без котировки. Иначе FIFO
             # «потеряет» этот приход и при продаже даст нулевую себестоимость.
             cost_total = _to_decimal(tx.cost_basis_rub) if tx.cost_basis_rub else Decimal(0)
@@ -383,8 +385,9 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
                 source=tx.source or "manual",
             ))
 
-            if tx_year and tx.tx_type != TxType.TRANSFER_IN:
-                # Доход для 3-НДФЛ (transfer_in — внутреннее перемещение).
+            if tx_year and tx.tx_type in TxType.income_types():
+                # Доход для 3-НДФЛ (transfer_in — внутреннее перемещение,
+                # buy — приобретение с расходом, оба дохода не дают).
                 income = _resolve_fiat(tx)
                 if income is None and cost_total > 0:
                     # На входе была задана стоимость — используем её.

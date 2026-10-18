@@ -282,6 +282,7 @@ def _short_type_label(t: str) -> str:
         "gift_in": "Подарок вход.",
         "refund": "Возврат",
         "income_other": "Прочий",
+        "buy": "Покупка",
         "sell": "Продажа",
         "swap_out": "Обмен",
         "spend": "Оплата",

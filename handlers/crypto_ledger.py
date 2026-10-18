@@ -14,6 +14,9 @@
                                             — быстрый ввод аирдропа
   /rate <asset>                           — текущая цена в RUB
   /import — реплаем на CSV-файл          — импорт выписки биржи
+  /journal [year] [N]                     — журнал проводок дебет/кредит
+  /oborka [year]                          — оборотно-сальдовая ведомость
+  /journal_csv [year]                     — CSV журнала проводок
 
 Дизайн:
   • Все хендлеры читают owner_id из bot_data["CRYPTO_OWNER_ID"]
@@ -30,6 +33,7 @@ import logging
 import time
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from typing import Optional
 
 from telegram import InputFile, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
@@ -287,6 +291,16 @@ async def addtx_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning(f"get_asset_price_rub: {e}")
 
+    # Для покупки без указания цены подтягиваем рыночную как приближение
+    # себестоимости (для точной — ручной ввод или /import с выпиской биржи).
+    if not fiat and tx_type in TxType.acquisition_types():
+        try:
+            market = await get_asset_price_rub(asset, ts)
+            if market:
+                fiat = str((Decimal(str(market)) * amount).quantize(Decimal("0.01")))
+        except Exception as e:
+            logger.warning(f"get_asset_price_rub: {e}")
+
     try:
         tx = add_transaction(
             owner_id=_owner_id(context),
@@ -402,7 +416,7 @@ async def tx_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Кнопки: 3 самых вероятных альтернативы типа + «Удалить».
         # Список альтернатив зависит от текущего направления:
         if tx.direction == "in":
-            alts = [TxType.AIRDROP, TxType.MINING, TxType.STAKING,
+            alts = [TxType.AIRDROP, TxType.BUY, TxType.MINING, TxType.STAKING,
                     TxType.GIFT_IN, TxType.REFUND]
         else:
             alts = [TxType.SELL, TxType.SWAP_OUT, TxType.SPEND,
@@ -412,6 +426,7 @@ async def tx_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for alt in alts:
             short = {
                 TxType.AIRDROP: "Аирдроп",
+                TxType.BUY: "Покупка",
                 TxType.MINING: "Майнинг",
                 TxType.STAKING: "Стейкинг",
                 TxType.GIFT_IN: "Подарок вход",
@@ -474,7 +489,7 @@ async def tx_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "UPDATE crypto_transactions SET tx_type=?, direction=? "
                 "WHERE id=? AND owner_id=?",
                 (new_type,
-                 "in" if new_type in TxType.income_types() else "out",
+                 "in" if TxType.is_in(new_type) else "out",
                  tx_id, owner),
             )
         if cur.rowcount:
@@ -727,6 +742,9 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fail = 0
     for row in parsed:
         try:
+            # Цена сделки биржи в quote (USDT) → RUB по курсу ЦБ на дату.
+            from utils.cex_api import enrich_rub_prices
+            row = await enrich_rub_prices(row)
             add_transaction(
                 owner_id=owner,
                 ts=row.ts,
@@ -767,3 +785,144 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def string_list_of(items: list[str]) -> str:
     return ", ".join(f"<code>{x}</code>" for x in items)
+
+
+# ------------------------------------------- /journal, /oborka, /journal_csv
+
+
+def _parse_year_arg(args: list[str]) -> Optional[int]:
+    """Первый аргумент-год (4 цифры, 20xx/21xx) → int, иначе None."""
+    for a in args or []:
+        if a.isdigit() and len(a) == 4 and (a.startswith("20") or a.startswith("21")):
+            return int(a)
+    return None
+
+
+async def journal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/journal [year] [N]` — журнал проводок дебет/кредит за период."""
+    if not await _is_owner_chat(update, context):
+        return
+    args = context.args or []
+    year = _parse_year_arg(args)
+    limit = 10
+    for a in args:
+        if a.isdigit() and len(a) != 4:
+            limit = min(int(a), 50)
+
+    from utils.double_entry import build_journal
+    journal = await build_journal(_owner_id(context), year)
+
+    period = f"за {year}" if year else "за всё время"
+    lines = [f"<b>Журнал проводок {period}</b>\n"]
+    if journal.balanced:
+        lines.append(
+            f"Сверка: <b>дебет = кредит</b> = "
+            f"{format_rub(float(journal.total_debit))} ✓\n"
+        )
+    else:
+        lines.append(
+            f"⚠ <b>НЕСВЕДЕНО!</b> Дебет {format_rub(float(journal.total_debit))} "
+            f"≠ кредит {format_rub(float(journal.total_credit))}\n"
+        )
+
+    if not journal.entries:
+        lines.append("Проводок нет — нечего сводить.")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        return
+
+    # Последние N проводок (новые сверху).
+    from utils.crypto_db import TxType as _TT
+    shown = list(reversed(journal.entries))[:limit]
+    for e in shown:
+        date = datetime.fromtimestamp(e.ts).strftime("%d.%m.%Y")
+        mark = " ⚠без оценки" if e.unpriced else ""
+        qty_str = f"{e.qty:.8f}".rstrip("0").rstrip(".")
+        lines.append(
+            f"<code>{date}</code> · {_TT.label(e.tx_type)} · "
+            f"<b>{qty_str}</b> {e.asset_symbol} · #{e.tx_id}{mark}"
+        )
+        for p in e.postings:
+            if p.debit:
+                lines.append(f"  Д <code>{escape_html(p.account)}</code> "
+                             f"{format_rub(float(p.debit))}")
+            if p.credit:
+                lines.append(f"  К <code>{escape_html(p.account)}</code> "
+                             f"{format_rub(float(p.credit))}")
+    if len(journal.entries) > limit:
+        lines.append(f"\n<i>…и ещё {len(journal.entries) - limit} проводок</i>")
+
+    if journal.warnings:
+        lines.append("\n<b>Замечания сверки:</b>")
+        for w in journal.warnings[:5]:
+            lines.append(f"• {escape_html(w[:200])}")
+        if len(journal.warnings) > 5:
+            lines.append(f"…и ещё {len(journal.warnings) - 5}")
+
+    lines.append(f"\nПолный CSV: <code>/journal_csv"
+                 f" {year or ''}</code>".rstrip())
+    await update.message.reply_text(
+        "\n".join(lines)[:4000], parse_mode="HTML")
+
+
+async def oborka_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/oborka [year]` — оборотно-сальдовая ведомость по счетам."""
+    if not await _is_owner_chat(update, context):
+        return
+    year = _parse_year_arg(context.args or [])
+
+    from utils.double_entry import account_name, build_journal
+    journal = await build_journal(_owner_id(context), year)
+
+    period = f"за {year}" if year else "за всё время"
+    lines = [f"<b>Оборотно-сальдовая ведомость {period}</b>\n"]
+    if not journal.turnovers:
+        lines.append("Оборотов нет.")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        return
+
+    for account in sorted(journal.turnovers):
+        tr = journal.turnovers[account]
+        bal = tr.balance
+        bal_str = (f"Д {format_rub(float(bal))}" if bal >= 0
+                   else f"К {format_rub(float(-bal))}")
+        lines.append(
+            f"<code>{escape_html(account)}</code> — {escape_html(account_name(account))}\n"
+            f"  обр. Д {format_rub(float(tr.debit))} · "
+            f"обр. К {format_rub(float(tr.credit))} · сальдо {bal_str}"
+        )
+
+    lines.append("")
+    if journal.balanced:
+        lines.append(
+            f"<b>Итого: дебет = кредит</b> = "
+            f"{format_rub(float(journal.total_debit))} ✓"
+        )
+    else:
+        lines.append(
+            "⚠ <b>Итого: НЕСВЕДЕНО</b> — "
+            f"Д {format_rub(float(journal.total_debit))} ≠ "
+            f"К {format_rub(float(journal.total_credit))}"
+        )
+    await update.message.reply_text(
+        "\n".join(lines)[:4000], parse_mode="HTML")
+
+
+async def journal_csv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/journal_csv [year]` — полный журнал проводок файлом CSV."""
+    if not await _is_owner_chat(update, context):
+        return
+    year = _parse_year_arg(context.args or [])
+
+    from utils.double_entry import build_journal, render_journal_csv
+    journal = await build_journal(_owner_id(context), year)
+    data = render_journal_csv(journal)
+
+    fname = f"journal_{year or 'all'}.csv"
+    await update.message.reply_document(
+        document=InputFile(io.BytesIO(data), filename=fname),
+        caption=(
+            f"Журнал проводок {year or 'за всё время'}: "
+            f"{len(journal.entries)} операций, "
+            f"{'сведено ✓' if journal.balanced else 'НЕСВЕДЕНО ✗'}"
+        ),
+    )

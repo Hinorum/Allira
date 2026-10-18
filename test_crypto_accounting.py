@@ -20,6 +20,9 @@ import sys
 import tempfile
 import time
 
+# Windows-консоль cp1251 не знает Σ/✅ — переключаем вывод на UTF-8.
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 # Изолированная БД для теста.
 TEST_DB = tempfile.mktemp(suffix=".db")
 os.environ["DB_PATH"] = TEST_DB

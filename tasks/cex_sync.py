@@ -3,17 +3,24 @@
 Раз в час запрашивает сделки через API и добавляет их в БД с защитой от
 дублей по external_id. Ошибки (429, ключ отозван) логируются, но не
 блокируют бота — следующий прогон повторит попытку.
+
+Цены сделок биржа отдаёт в quote-валюте (обычно USDT); перед записью
+utils.cex_api.enrich_rub_prices переводит их в RUB по курсу ЦБ на дату
+(методика ФНС) — так у покупок появляется документированная
+себестоимость, а у продаж — выручка в рублях.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from telegram.ext import Application
 
-from utils.cex_api import (get_cex_watermark, set_cex_watermark,
-                           sync_bybit_trades, sync_okx_trades)
+from utils.cex_api import (enrich_rub_prices, get_cex_watermark,
+                           set_cex_watermark, sync_bybit_trades,
+                           sync_okx_trades)
 from utils.crypto_db import add_transaction, CryptoError
 
 logger = logging.getLogger(__name__)
@@ -63,10 +70,14 @@ async def _sync_job(context) -> None:
 
 
 async def _run_bybit(data: dict, owner_id: int) -> None:
+    # time.time() — ВАЖНО: asyncio event loop time монотонный (отсчёт от
+    # старта процесса), им нельзя измерять календарные даты — окно выгрузки
+    # получалось отрицательным, и первый прогон без водяного знака ничего
+    # не подтягивал.
     since_ms = get_cex_watermark("bybit") or (
-        int((asyncio.get_event_loop().time() - 365 * 86400) * 1000)
+        int((time.time() - 365 * 86400) * 1000)
     )
-    until_ms = int(asyncio.get_event_loop().time() * 1000)
+    until_ms = int(time.time() * 1000)
     result = await sync_bybit_trades(
         data["bybit_key"], data["bybit_secret"],
         since_ts=since_ms, until_ts=until_ms,
@@ -83,9 +94,9 @@ async def _run_bybit(data: dict, owner_id: int) -> None:
 
 async def _run_okx(data: dict, owner_id: int) -> None:
     since_ms = get_cex_watermark("okx") or (
-        int((asyncio.get_event_loop().time() - 90 * 86400) * 1000)
+        int((time.time() - 90 * 86400) * 1000)
     )
-    until_ms = int(asyncio.get_event_loop().time() * 1000)
+    until_ms = int(time.time() * 1000)
     result = await sync_okx_trades(
         data["okx_key"], data["okx_secret"], data["okx_passphrase"],
         since_ts=since_ms, until_ts=until_ms,
@@ -104,12 +115,16 @@ async def _persist(rows: list, owner_id: int) -> int:
     saved = 0
     for row in rows:
         try:
+            # Цена сделки в quote → RUB (курс ЦБ на дату; фолбэк — рынок).
+            row = await enrich_rub_prices(row)
             add_transaction(
                 owner_id=owner_id,
                 ts=row.ts,
                 asset_symbol=row.asset,
                 tx_type=row.tx_type,
                 amount=row.amount,
+                fiat_value_rub=row.fiat_value_rub or None,
+                cost_basis_rub=row.cost_basis_rub or None,
                 note=row.note,
                 source=getattr(row, "_exchange", "cex"),
                 external_id=row.external_id,

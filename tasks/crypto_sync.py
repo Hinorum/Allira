@@ -110,7 +110,10 @@ async def sync_jetton_transfers(wallet, api_key: str) -> int:
     Классификация (умная):
       * обе стороны перевода — мои кошельки → TRANSFER_IN/OUT (не доход)
       * в одном событии есть и входящий, и исходящий JettonTransfer →
-        оба SWAP (обмен через DEX типа STON.fi)
+        исходящий SWAP_OUT (реализация), входящий BUY (приобретение по
+        цене обмена). Входящая сторона обмена НЕ является доходом —
+        иначе ФНС получила бы двойное обложение: и реализацию уходящей
+        стороны, и «доход» приходящей.
       * входящий без пары и не от своего → AIRDROP (доход по НК)
       * исходящий без пары и не своему → SWAP_OUT (расход по НК)
     """
@@ -217,7 +220,10 @@ async def sync_jetton_transfers(wallet, api_key: str) -> int:
                 elif direction == "out" and recipient in my_addresses:
                     tx_type = TxType.TRANSFER_OUT
                 elif is_swap:
-                    tx_type = TxType.SWAP_OUT if direction == "out" else TxType.AIRDROP
+                    # Обмен (DEX): уходящая сторона — реализация, входящая —
+                    # приобретение (не доход! иначе двойной налог).
+                    tx_type = (TxType.SWAP_OUT if direction == "out"
+                               else TxType.BUY)
                 elif direction == "in":
                     tx_type = TxType.AIRDROP
                 else:
@@ -232,6 +238,13 @@ async def sync_jetton_transfers(wallet, api_key: str) -> int:
                         fiat = str(round(human_amount * market, 2))
                 except Exception:
                     pass
+
+                # У BUY рыночная стоимость — это себестоимость приобретения,
+                # она кладётся в cost_basis_rub, а не в доход (fiat_value_rub).
+                if tx_type == TxType.BUY:
+                    cost_basis, fiat_value = fiat, None
+                else:
+                    cost_basis, fiat_value = None, (fiat or None)
 
                 ext_id = f"{EXTERNAL_PREFIX}:{ev.get('event_id', '')}:{symbol}:{direction}"
                 try:
@@ -251,7 +264,8 @@ async def sync_jetton_transfers(wallet, api_key: str) -> int:
                         asset_symbol=symbol,
                         tx_type=tx_type,
                         amount=str(amount_int),
-                        fiat_value_rub=fiat or None,
+                        fiat_value_rub=fiat_value,
+                        cost_basis_rub=cost_basis,
                         note=(f"auto jetton-sync; "
                               f"op_hash={ev.get('event_id', '')[:20]}"),
                         source="jetton-sync",

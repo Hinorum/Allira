@@ -39,6 +39,11 @@ class ParsedRow:
     cost_basis_rub: str
     note: str
     external_id: str
+    # Валюта расчётов сделки (quote, обычно USDT) и сумма в этой валюте.
+    # Нужны, чтобы в tasks/cex_sync перевести реальную цену сделки в RUB
+    # по курсу ЦБ на дату — рыночная котировка для покупки лишь приближение.
+    quote: str = ""
+    quote_value: str = ""
 
 
 # ----------------------------------------------------- распознавание
@@ -101,32 +106,30 @@ def _parse_bybit(body: Iterable[list[str]]) -> tuple[list[ParsedRow], list[str]]
         price = _decimal_str(r[4])
         if not qty or float(qty) == 0:
             continue
+        quote_value = str(_safe_mul(qty, price))
+        # Цену сделки кладём в quote/quote_value; RUB-конвертацию делает
+        # utils.cex_api.enrich_rub_prices (курс ЦБ на дату) — здесь
+        # cost/fiat остаются пустыми, чтобы USDT-цена не попала в RUB-поля.
         if side == "buy":
-            tx_type = TxType.SPEND  # покупка: фиат уходит, крипта приходит
-            # В Bybit «buy» = купили актив за фиат. У нас это выглядит
-            # как «приход» актива (income) с cost_basis = qty*price.
-            # Направление income не даёт taxable income, но FIFO-лот
-            # открывает. С точки зрения крипто-учёта покупка — это
-            # arrival актива с известной себестоимостью.
-            # Реализация: отдельный псевдо-тип income_purchase?
-            # Проще использовать TRANSFER_IN + cost_basis — тогда отчёт
-            # 3-НДФЛ не покажет доход, а FIFO-лот откроется.
-            tx_type = TxType.TRANSFER_IN
-            cost_basis = str(_safe_mul(qty, price))
-            fiat_value = ""
+            # Покупка: крипта приходит, фиат уходит. Тип BUY открывает
+            # FIFO-лёт с документированной себестоимостью и НЕ даёт дохода
+            # для НДФЛ (в отличие от старого TRANSFER_IN, из-за которого
+            # себестоимость терялась и при последующей продаже завышалась
+            # прибыль).
+            tx_type = TxType.BUY
         elif side == "sell":
             tx_type = TxType.SELL
-            cost_basis = ""
-            fiat_value = str(_safe_mul(qty, price))
         else:
             errors.append(f"строка {i}: неизвестный side {side!r}")
             continue
         rows.append(ParsedRow(
             ts=ts, asset=symbol, tx_type=tx_type,
-            amount=qty, fiat_value_rub=fiat_value,
-            cost_basis_rub=cost_basis,
+            amount=qty, fiat_value_rub="",
+            cost_basis_rub="",
             note=f"bybit {side} {r[1]}",
             external_id=f"bybit:{ts}:{r[1]}:{side}:{qty}",
+            quote=_quote_from_bybit(r[1]),
+            quote_value=quote_value,
         ))
     return rows, errors
 
@@ -155,23 +158,26 @@ def _parse_okx(body: Iterable[list[str]]) -> tuple[list[ParsedRow], list[str]]:
         price = _decimal_str(r[4])
         if not qty or float(qty) == 0:
             continue
+        quote_value = str(_safe_mul(qty, price))
+        # Цена сделки — в quote/quote_value; RUB делает enrich_rub_prices.
         if side == "buy":
-            tx_type = TxType.TRANSFER_IN
-            cost_basis = str(_safe_mul(qty, price))
-            fiat_value = ""
+            tx_type = TxType.BUY  # приобретение с документированной ценой
         elif side == "sell":
             tx_type = TxType.SELL
-            cost_basis = ""
-            fiat_value = str(_safe_mul(qty, price))
         else:
             errors.append(f"строка {i}: неизвестный side {side!r}")
             continue
+        # BTC-USDT → quote = USDT (вторая часть instId через дефис).
+        inst = r[1].strip().upper()
+        quote = inst.partition("-")[2] if "-" in inst else ""
         rows.append(ParsedRow(
             ts=ts, asset=symbol, tx_type=tx_type,
-            amount=qty, fiat_value_rub=fiat_value,
-            cost_basis_rub=cost_basis,
+            amount=qty, fiat_value_rub="",
+            cost_basis_rub="",
             note=f"okx {side} {r[1]}",
             external_id=f"okx:{ts}:{r[1]}:{side}:{qty}",
+            quote=quote,
+            quote_value=quote_value,
         ))
     return rows, errors
 
@@ -224,6 +230,13 @@ def _symbol_from_bybit(symbol: str) -> str:
         if s.endswith(quote) and len(s) > len(quote):
             return s[:-len(quote)]
     return ""
+
+
+def _quote_from_bybit(symbol: str) -> str:
+    """BTCUSDT → USDT (валюта расчётов сделки)."""
+    s = symbol.strip().upper()
+    base = _symbol_from_bybit(s)
+    return s[len(base):] if base else ""
 
 
 def _symbol_from_okx(inst_id: str) -> str:

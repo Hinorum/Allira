@@ -9,6 +9,8 @@ import time
 TEST_DB = tempfile.mktemp(suffix=".db")
 os.environ["DB_PATH"] = TEST_DB
 sys.path.insert(0, ".")
+# Windows-консоль cp1251 не знает эмодзи/Σ — переключаем вывод на UTF-8.
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
 async def main() -> int:
