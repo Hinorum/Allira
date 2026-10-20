@@ -26,6 +26,17 @@ os.environ["DB_PATH"] = TEST_DB
 # Отключаем сетевые вызовы — налог считается по мануальным fiat_value.
 sys.path.insert(0, ".")
 
+# Тесты печатают кириллицу, «Σ» и эмодзи. Консоль Windows по умолчанию
+# отдаёт cp866/cp1251, где этих символов нет, и скрипт падает с
+# UnicodeEncodeError уже на финальном print — проверки при этом успешно
+# прошли. Переключаем вывод на UTF-8, а если поток не даёт перенастроить
+# кодировку — просим заменять непечатаемое, чтобы тест дошёл до конца.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
+
 
 async def main() -> int:
     # Перенастроим БД на тестовый файл ДО импорта, чтобы открылся правильный.

@@ -39,3 +39,30 @@ services:
         sync: false
       - key: TONAPI_API_KEY
         sync: false
+      # Крипто-бухгалтерия. Пусто — модуль выключен (работает ручной ввод
+      # и CoinGecko). CEX-ключи read-only: дают историю сделок, но не вывод.
+      - key: TAXPAYER_INN
+        sync: false
+      - key: TAX_STATUS
+        value: "resident"
+      - key: COST_BASIS_METHOD
+        value: "fifo"
+      - key: CRYPTO_OWNER_ID
+        sync: false
+      - key: CBR_API_URL
+        value: "https://www.cbr-xml-daily.ru"
+      - key: BYBIT_API_KEY
+        sync: false
+      - key: BYBIT_API_SECRET
+        sync: false
+      - key: OKX_API_KEY
+        sync: false
+      - key: OKX_API_SECRET
+        sync: false
+      - key: OKX_PASSPHRASE
+        sync: false
+      # Веб-панель /admin. Пусто — панель отдаёт 401 и выключена.
+      # Длинная случайная строка:
+      #   python -c "import secrets; print(secrets.token_urlsafe(32))"
+      - key: ADMIN_PANEL_TOKEN
+        sync: false

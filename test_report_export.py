@@ -10,6 +10,14 @@ TEST_DB = tempfile.mktemp(suffix=".db")
 os.environ["DB_PATH"] = TEST_DB
 sys.path.insert(0, ".")
 
+# Кириллица, «Σ» и эмодзи в выводе против кодовой страницы cp866/cp1251
+# консоли Windows роняют скрипт UnicodeEncodeError на финальном print.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
+
 
 async def main() -> int:
     import utils.database as db

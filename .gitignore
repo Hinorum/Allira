@@ -10,3 +10,7 @@ __pycache__/
 test_*.pdf
 test_*.xlsx
 test_*.csv
+# Локальное окружение: не коммитить — весит сотни мегабайт
+.venv/
+venv/
+env/
