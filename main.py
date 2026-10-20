@@ -451,6 +451,9 @@ async def post_init(application: Application):
         "NEWS_CHANNEL_ID": config.news_channel_id,
         "MARKETAPP_API_KEY": config.marketapp_api_key,
         "MARKETAPP_WALLET": config.marketapp_wallet,
+        "TONAPI_API_KEY": config.tonapi_api_key,
+        # NFT-коллекции для автопостинга: имя → адрес
+        "NFT_COLLECTIONS": config.nft_collections,
         "ADMIN_USER_IDS": config.admin_user_ids,
         "CREATOR_USER_IDS": config.creator_user_ids,
         "CREATOR_USERNAME": config.creator_username,

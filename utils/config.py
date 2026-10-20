@@ -1,6 +1,48 @@
 import os
 from dataclasses import dataclass, field
 
+# NFT-коллекции TON для автопостинга: имя → адрес.
+# Lost Dogs — коллекция бота (см. промпты).
+DEFAULT_COLLECTIONS: dict = {
+    "Lost Dogs": "EQAl_hUCAeEv-fKtGxYtITAS6PPxuMRaQwHj0QAHeWe6ZSD0",
+}
+
+
+def _parse_collections(raw: str) -> dict:
+    """Разбор NFT_COLLECTIONS: `Имя:адрес,Имя2:адрес2` или просто адреса.
+
+    Пустая строка — дефолтный watchlist (Lost Dogs). Имя без адреса
+    игнорируется: без адреса коллекцию не опросить.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return dict(DEFAULT_COLLECTIONS)
+
+    result: dict = {}
+    for chunk in raw.replace(";", ",").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        # «0:abc…» — raw-адрес TON, двоеточие внутри, а не разделитель.
+        if chunk.startswith("0:"):
+            result[f"Коллекция {len(result) + 1}"] = chunk
+            continue
+        if ":" in chunk:
+            name, _, address = chunk.partition(":")
+            name = name.strip()
+            address = address.strip()
+            if name and address:
+                result[name] = address
+            continue
+        # Голый адрес — имя возьмём из дефолтного списка, если он там есть
+        for known_name, known_address in DEFAULT_COLLECTIONS.items():
+            if known_address.lower() == chunk.lower():
+                result[known_name] = known_address
+                break
+        else:
+            result[f"Коллекция {len(result) + 1}"] = chunk
+    return result or dict(DEFAULT_COLLECTIONS)
+
 
 @dataclass
 class BotConfig:
@@ -20,6 +62,8 @@ class BotConfig:
     marketapp_wallet: str = ""
     toncenter_api_key: str = ""
     tonapi_api_key: str = ""
+    # NFT-коллекции для автопостинга: имя → адрес
+    nft_collections: dict = field(default_factory=lambda: dict(DEFAULT_COLLECTIONS))
     admin_chat_id: str = ""
     admin_user_ids: tuple = ()
     # ЛС-доступ: бот отвечает в личке только создателю. ID — точное
@@ -81,6 +125,7 @@ class BotConfig:
             marketapp_wallet=os.getenv("MARKETAPP_WALLET", "").strip(),
             toncenter_api_key=os.getenv("TONCENTER_API_KEY", "").strip(),
             tonapi_api_key=os.getenv("TONAPI_API_KEY", "").strip(),
+            nft_collections=_parse_collections(os.getenv("NFT_COLLECTIONS", "")),
             taxpayer_inn=os.getenv("TAXPAYER_INN", "").strip(),
             tax_status=os.getenv("TAX_STATUS", "resident").strip().lower(),
             cost_basis_method=os.getenv("COST_BASIS_METHOD", "fifo").strip().lower(),
