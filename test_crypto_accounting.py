@@ -152,5 +152,87 @@ async def main() -> int:
     return 0 if not errors else 1
 
 
+async def regression_market_quote() -> int:
+    """Регресс: рыночная котировка — float, количество — Decimal.
+
+    Раньше строка `income = amount_human * market` роняла весь годовой
+    отчёт (/tax, /pnl, выгрузки PDF/XLSX/CSV) с TypeError, как только у
+    транзакции не было вручную введённой цены. Сценарий повторяет
+    обычный случай: аирдроп без fiat_value_rub, оценка по котировке.
+    """
+    import utils.database as db
+    db.DB_PATH = TEST_DB
+    db.init_db()
+
+    from utils.crypto_db import (
+        Chain, TxType, add_transaction, add_wallet, ensure_asset,
+    )
+    import utils.tax_calc as tax_calc
+
+    owner = 999002
+    year = 2026
+
+    ensure_asset("ETH", "Ethereum", chain=Chain.OTHER, decimals=18,
+                 coingecko_id="ethereum")
+    wallet = add_wallet(owner, Chain.OTHER, "0xtestfakeaddress0000", "test wallet")
+    t_air = int(time.mktime(time.strptime("2026-03-01 12:00:00", "%Y-%m-%d %H:%M:%S")))
+
+    # Ни cost_basis_rub, ни fiat_value_rub: цена должна взяться из котировки.
+    add_transaction(
+        owner_id=owner, ts=t_air, asset_symbol="ETH",
+        tx_type=TxType.AIRDROP, amount="2",
+        wallet_id=wallet.id,
+        note="airdrop без ручной цены",
+    )
+
+    # Подменяем сетевую котировку на float — ровно тот тип, который
+    # возвращает price_oracle.get_asset_price_rub.
+    async def fake_price(symbol: str, ts: int) -> float:
+        return 250_000.0
+
+    original = tax_calc.get_asset_price_rub
+    tax_calc.get_asset_price_rub = fake_price
+
+    errors: list[str] = []
+    summary = None
+    try:
+        summary = await tax_calc.compute_year_report(owner, year)
+    except TypeError as exc:
+        errors.append(f"рыночная котировка роняет отчёт: {exc}")
+    finally:
+        tax_calc.get_asset_price_rub = original
+
+    print()
+    print("=" * 60)
+    print("Регресс: рыночная котировка вместо ручной цены")
+    print("=" * 60)
+
+    if summary is not None:
+        print(f"Доход: {summary.total_income_rub} RUB (ожидаем 500 000)")
+        print(f"Warnings: {summary.warnings}")
+        print(f"Skipped: {summary.skipped}")
+        print()
+        # 2 ETH × 250 000 = 500 000
+        if summary.total_income_rub != 500000:
+            errors.append(f"доход должен быть 500 000, не {summary.total_income_rub}")
+
+    if not errors:
+        print("✅ РЫНОЧНЫЙ ПУТЬ СЧИТАЕТСЯ")
+    else:
+        print("❌ ОШИБКИ:")
+        for e in errors:
+            print(f"  - {e}")
+
+    from utils import database as _db
+    _db.close_all()
+    try:
+        os.unlink(TEST_DB)
+    except OSError:
+        pass
+    return 0 if not errors else 1
+
+
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    rc = asyncio.run(main())
+    rc |= asyncio.run(regression_market_quote())
+    sys.exit(rc)

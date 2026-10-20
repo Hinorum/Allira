@@ -401,7 +401,7 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
                             "tx_id": tx.id, "reason": "no_quote", "symbol": symbol,
                         })
                         continue
-                    income = amount_human * market
+                    income = amount_human * _price_to_decimal(market)
                 summary.income_events.append(IncomeEvent(
                     tx_id=tx.id,
                     ts=tx.ts,
@@ -430,7 +430,7 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
                             "tx_id": tx.id, "reason": "no_quote", "symbol": symbol,
                         })
                         continue
-                    proceeds = amount_human * market
+                    proceeds = amount_human * _price_to_decimal(market)
 
                 gain = proceeds - cost
                 if shortfall > 0:
@@ -548,6 +548,17 @@ def _resolve_fiat(tx: Tx) -> Optional[Decimal]:
         if v > 0:
             return v
     return None
+
+
+def _price_to_decimal(price: float) -> Decimal:
+    """Рыночная котировка приходит из price_oracle как float.
+
+    Decimal * float в Python не поддерживается — умножение падает с
+    TypeError, и весь годовой отчёт (/tax, /pnl, выгрузки) не считается
+    целиком. Приводим цену к Decimal через str: str даёт десятичную
+    запись без двоичного хвоста, а дальше _round2 округляет до копеек.
+    """
+    return Decimal(str(price))
 
 
 def _tax_status(owner_id: int) -> str:
