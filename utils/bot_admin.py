@@ -106,6 +106,21 @@ def jobs_status(application) -> list[dict]:
     return sorted(out, key=lambda j: j["name"])
 
 
+def llm_queue_stats() -> dict:
+    """Состояние очереди запросов к LLM — для панели и /admin-меню."""
+    from utils.llm_queue import llm_queue
+
+    stats = llm_queue.stats()
+    return {
+        "waiting": stats.waiting,
+        "active": stats.active,
+        "processed": stats.processed,
+        "rejected": stats.rejected,
+        "workers": stats.workers,
+        "max_queue": stats.max_queue,
+    }
+
+
 def crypto_stats(owner_id: int) -> dict:
     """Сводка крипто-учёта для панели: кошельки, операции, балансы, синки."""
     if not owner_id:
@@ -186,6 +201,7 @@ def full_status(application, config, start_time: float) -> dict:
         "database": database_stats(),
         "crypto": crypto_stats(owner_id),
         "marketapp": marketapp,
+        "llm_queue": llm_queue_stats(),
         "config": {
             # Только признаки «задано/не задано» — секреты не отдаются.
             "bot_token": bool(config.bot_token),

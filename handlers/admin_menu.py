@@ -119,6 +119,18 @@ def admin_status_text(application, config, start_time: float) -> str:
     else:
         lines.append("Фоновые задачи: не запущены")
 
+    # Очередь LLM: если она растёт, пользователи ждут ответов — это
+    # видно сразу, а не по жалобам в личке.
+    queue = st.get("llm_queue") or {}
+    waiting = int(queue.get("waiting") or 0)
+    active = int(queue.get("active") or 0)
+    if waiting or active:
+        lines.append("")
+        lines.append(
+            f"<b>Очередь запросов:</b> ждут {waiting}, "
+            f"в работе {active}, воркеров {queue.get('workers', 0)}"
+        )
+
     keys = st["config"]
     missing = [k for k, v in keys.items() if not v]
     if missing:

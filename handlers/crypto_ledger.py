@@ -229,15 +229,20 @@ async def addtx_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     args = context.args or []
     usage = (
-        "Использование:\n"
-        "<code>/addtx &lt;type&gt; &lt;asset&gt; &lt;amount&gt; "
-        "[ДД.ММ.ГГГГ] [цена_RUB] [комментарий]</code>\n\n"
-        f"type ∈ {string_list_of(TxType.all())}\n"
-        "asset — символ (BTC, TON, USDT, NOT…)\n"
-        "amount — количество актива\n"
+        "➕ <b>Записать операцию</b>\n\n"
+        "Формат:\n"
+        "<code>/addtx &lt;тип&gt; &lt;актив&gt; &lt;количество&gt; "
+        "[дата] [цена ₽] [комментарий]</code>\n\n"
+        f"типы: {string_list_of(TxType.all())}\n"
+        "актив — символ (BTC, TON, USDT, NOT…)\n"
+        "количество — сколько\n"
         "дата — по умолчанию сегодня (МСК)\n"
-        "цена_RUB — фиатная стоимость всей операции (если знаешь)\n"
-        "комментарий — свободный текст"
+        "цена ₽ — фиатная стоимость всей операции (если знаешь)\n"
+        "комментарий — свободный текст\n\n"
+        "Примеры:\n"
+        "<code>/addtx airdrop BTC 0.001 15.01.2025</code>\n"
+        "<code>/addtx sell BTC 0.3 20.06.2025 2500000</code>\n"
+        "<code>/addtx mining TON 12 01.02.2025 3000 майнинг</code>"
     )
     if len(args) < 3:
         await update.message.reply_text(usage, parse_mode="HTML")
@@ -326,9 +331,17 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
     if not args:
         await update.message.reply_text(
-            "Использование:\n"
-            "<code>/airdrop &lt;asset&gt; &lt;amount&gt; "
-            "[ДД.ММ.ГГГГ] [цена_RUB] [комментарий]</code>",
+            "🎁 <b>Записать аирдроп</b>\n\n"
+            "Формат:\n"
+            "<code>/airdrop &lt;актив&gt; &lt;количество&gt; "
+            "[дата] [цена ₽] [комментарий]</code>\n\n"
+            "Примеры:\n"
+            "<code>/airdrop BTC 0.5</code> — 0.5 BTC сегодня\n"
+            "<code>/airdrop TON 25 15.01.2026 180000</code> — 25 TON с ценой\n"
+            "<code>/airdrop NOT 1000 20.01.2026</code> — 1000 NOT\n\n"
+            "Дата по умолчанию — сегодня. Цена нужна, чтобы посчитать доход: "
+            "если её не указать, возьму рыночную на дату операции.\n\n"
+            "Проверить, что записалось: <code>/tx_list</code>",
             parse_mode="HTML",
         )
         return

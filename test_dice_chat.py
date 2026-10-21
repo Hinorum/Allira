@@ -372,7 +372,7 @@ async def main() -> int:
     original_log = mh.log_message
     original_ban = mh.is_user_banned
 
-    async def fake_llm_error(user_prompt, system_prompt, model, api_key, history=None, images=None):
+    async def fake_llm_error(user_prompt, system_prompt, model, api_key, history=None, images=None, **kwargs):
         return ERR_TECHNICAL
 
     async def fake_snapshot():
@@ -446,7 +446,7 @@ async def main() -> int:
     # Подменяем LLM, чтобы поймать сам промпт.
     captured = {}
 
-    async def fake_llm(user_prompt, system_prompt, model, api_key, history=None, images=None):
+    async def fake_llm(user_prompt, system_prompt, model, api_key, history=None, images=None, **kwargs):
         captured["prompt"] = user_prompt
         return "ответ"
 
@@ -507,7 +507,7 @@ async def main() -> int:
     message2 = chat_message()
     update2 = Update(update_id=4, message=message2)
 
-    async def fake_llm_ok(user_prompt, system_prompt, model, api_key, history=None, images=None):
+    async def fake_llm_ok(user_prompt, system_prompt, model, api_key, history=None, images=None, **kwargs):
         return "Нормальный ответ"
 
     mh.get_llm_response = fake_llm_ok

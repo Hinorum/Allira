@@ -7,6 +7,7 @@ from datetime import datetime
 from cachetools import TTLCache
 from prompts.loader import load_post_prompt
 from utils.http_client import get_client, with_retry
+from utils.llm_queue import QueueFull, llm_queue
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +168,9 @@ ERR_NO_MODELS = "Все модели временно недоступны. По
 ERR_SERVICE_DOWN = "Сервис временно недоступен. Попробуй позже!"
 ERR_EMPTY_ANSWER = "Модель вернула пустой ответ. Попробуй переформулировать!"
 ERR_TECHNICAL = "Технические неполадки! Попробуй еще раз."
+# Очередь запросов переполнена: ждать полчаса бесполезно, лучше сказать
+# прямо и предложить вернуться позже.
+ERR_QUEUE_FULL = "Сейчас очередь запросов переполнена — слишком много одновременных вопросов. Попробуй через минуту."
 
 SERVICE_ERRORS = (
     ERR_RATE_LIMITED,
@@ -174,6 +178,7 @@ SERVICE_ERRORS = (
     ERR_SERVICE_DOWN,
     ERR_EMPTY_ANSWER,
     ERR_TECHNICAL,
+    ERR_QUEUE_FULL,
 )
 
 
@@ -212,15 +217,31 @@ def _record_success(model: str):
 # Сколько запросов к OpenRouter может лететь одновременно. Без ограничителя
 # всплеск сообщений давал столько же параллельных вызовов — это упиралось
 # в лимиты бесплатного тарифа и в RAM free-инстанса.
-LLM_CONCURRENCY = 4
+#
+# Теперь ограничение живёт в очереди utils.llm_queue: запросы
+# обслуживаются по очереди (FIFO), одновременных вызовов меньше, а
+# ожидающий знает свою позицию. Здесь осталась только страховка на
+# случай, если очередь не поднялась (например, вне event loop).
+LLM_CONCURRENCY = 2
 _llm_semaphore = asyncio.Semaphore(LLM_CONCURRENCY)
 
 
 @with_retry(max_retries=2, base_delay=1.0)
-async def _call_openrouter(payload: dict, headers: dict, timeout: float = 25.0):
-    client = await get_client()
-    async with _llm_semaphore:
+async def _call_openrouter(payload: dict, headers: dict, timeout: float = 25.0,
+                           on_queue=None):
+    async def _do():
+        client = await get_client()
         return await client.post(OPENROUTER_URL, json=payload, headers=headers, timeout=timeout)
+
+    # Сначала пробуем через очередь (она и держит порядок), при сбое —
+    # страховочный семафор, чтобы запрос не потерялся.
+    try:
+        return await llm_queue.submit(_do, on_wait=on_queue)
+    except QueueFull:
+        raise
+    except Exception:
+        async with _llm_semaphore:
+            return await _do()
 
 async def get_llm_response(
     user_prompt: str,
@@ -229,6 +250,7 @@ async def get_llm_response(
     api_key: str,
     history: list[dict] | None = None,
     images: list[str] | None = None,
+    on_queue=None,
 ) -> str:
     # Разделитель вынесен в переменную: обратный слэш внутри f-string запрещён
     # на Python 3.11, а на Render зафиксирован именно 3.11.11.
@@ -327,7 +349,8 @@ async def get_llm_response(
 
             payload["model"] = m
             try:
-                resp = await _call_openrouter(payload, headers, timeout=25.0)
+                resp = await _call_openrouter(payload, headers, timeout=25.0,
+                                             on_queue=on_queue)
                 if resp.status_code == 200:
                     result = _parse_ok(resp)
                     if result:
@@ -346,7 +369,8 @@ async def get_llm_response(
     async def _run(imgs: list[str] | None) -> tuple[str | None, str | None]:
         """Один проход по цепочке моделей. Возвращает (ответ, сервисная ошибка)."""
         messages[-1]["content"] = _user_content(imgs)
-        resp = await _call_openrouter(payload, headers, timeout=30.0)
+        resp = await _call_openrouter(payload, headers, timeout=30.0,
+                                         on_queue=on_queue)
 
         if resp.status_code == 429:
             logger.warning("Превышен лимит API")
@@ -393,6 +417,11 @@ async def get_llm_response(
                 return result
 
         return err or ERR_NO_MODELS
+
+    except QueueFull:
+        # Очередь переполнена: ждать бесполезно, лучше честно сказать.
+        logger.warning("Очередь LLM переполнена — запрос отклонён")
+        return ERR_QUEUE_FULL
 
     except Exception as e:
         logger.error(f"Ошибка LLM: {e}")

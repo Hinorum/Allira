@@ -36,7 +36,9 @@ from utils.database import (
 from utils.config import BotConfig
 from utils.http_client import close_client
 from prompts.loader import preload_all_prompts
-from handlers.start_command import start_command, help_command, show_help_callback
+from handlers.start_command import (
+    start_command, help_command, show_help_callback, register_menu_handlers,
+)
 from handlers.wallet_command import marketapprent_command, marketappgifts_command, marketapptop_command
 from handlers.message_handler import (
     handle_message,
@@ -75,6 +77,7 @@ from handlers.reconcile_command import reconcile_command, reconcile_xlsx_command
 from handlers.admin_menu import admin_command, admin_menu_callback
 from utils import bot_admin, web_panel
 from utils.log_buffer import setup_log_buffer
+from utils.llm_queue import llm_queue
 from tasks.autoposting import setup_autoposting
 from tasks.marketapp_reports import setup_marketapp_jobs, LAST_LINKAGE, LAST_HISTORY_META, LAST_SYNC, LAST_HTTP_ERROR
 from tasks.crypto_sync import setup_crypto_sync_jobs
@@ -305,39 +308,52 @@ def run_health_server():
 
 # Команды для выпадающего меню "/" — их же Telegram подсказывает при наборе.
 # Ограничения API: до 100 команд, имя до 32 символов (без "/"), подпись до 256.
+#
+# Порядок — по смыслу и по частоте: сперва то, чем пользуются чаще всего,
+# потом редкие вещи. Раньше список начинался с команд аренды подарков, а
+# /balance — прятался в середине: в выпадающем меню это первое, куда
+# смотрят, и нужная команда была не на виду.
 BOT_COMMANDS: list[tuple[str, str]] = [
-    ("start", "Меню и приветствие"),
+    # Главное
+    ("start", "Меню: портфель, операции, отчёты, игра"),
     ("help", "Как мной пользоваться"),
-    ("marketapptop", "ТОП подарков: сумма и доходность (TON/сут)"),
-    ("marketappgifts", "Доход по каждому подарку отдельно"),
-    ("marketapprent", "Отчёт по аренде кошелька"),
-    ("stats", "Статистика бота"),
-    ("history", "Последние турниры"),
-    ("leaderboard", "Таблица лидеров"),
     ("clear", "Забыть контекст разговора"),
-    ("start_tournament", "Запустить турнир на кубиках"),
-    ("stop_tournament", "Остановить турнир"),
-    # Крипто-бухгалтерия
-    ("wallet_add", "Добавить кошелёк"),
-    ("wallet_list", "Список кошельков + баланс"),
-    ("wallet_del", "Архивировать кошелёк"),
-    ("addtx", "Записать операцию с криптой"),
-    ("airdrop", "Быстрый ввод аирдропа"),
-    ("tx_list", "История операций"),
-    ("tx_del", "Удалить операцию"),
-    ("balance", "Портфель с текущей ценой"),
+    # Портфель и деньги
+    ("balance", "Портфель: что есть и сколько заработано"),
     ("pnl", "Прибыль/убыток за год"),
     ("rate", "Текущий курс актива в RUB"),
+    ("wallet_list", "Мои кошельки и остатки"),
+    ("wallet_add", "Добавить кошелёк"),
+    ("wallet_del", "Архивировать кошелёк"),
+    # Операции
+    ("tx_list", "История операций"),
+    ("addtx", "Записать операцию"),
+    ("airdrop", "Быстрый ввод аирдропа"),
+    ("tx_del", "Удалить операцию"),
     ("import", "Импорт CSV (реплай на файл)"),
+    # Отчётность
     ("tax", "Сводка 3-НДФЛ за год"),
-    ("tax_setup", "Настроить ИНН/ФИО/статус"),
     ("tax_pdf", "PDF-отчёт для ФНС"),
     ("tax_xlsx", "Детальная XLSX"),
     ("tax_csv", "CSV доходов/реализаций"),
-    ("cex_status", "Статус подключения к биржам"),
-    ("cex_sync", "Синк сделок с бирж"),
+    ("tax_setup", "Настроить ИНН/ФИО/статус"),
+    ("tax_setup_status", "Текущие настройки ФНС"),
+    # Аренда подарков
+    ("marketapptop", "ТОП подарков: сумма и доходность (TON/сут)"),
+    ("marketappgifts", "Доход по каждому подарку отдельно"),
+    ("marketapprent", "Отчёт по аренде кошелька"),
+    # Игра
+    ("start_tournament", "Запустить турнир на кубиках"),
+    ("stop_tournament", "Остановить турнир"),
+    ("history", "Последние турниры"),
+    ("leaderboard", "Таблица лидеров"),
+    # Синхронизация и сверка
     ("reconcile", "Сверка дебет-кредит + балансы"),
     ("reconcile_xlsx", "XLSX-выгрузка сверки"),
+    ("cex_status", "Статус подключения к биржам"),
+    ("cex_sync", "Синк сделок с бирж"),
+    ("stats", "Статистика бота"),
+    # Владелец
     ("admin", "Сервис управления (владелец)"),
 ]
 
@@ -521,11 +537,15 @@ async def post_init(application: Application):
 
 
 async def post_shutdown(application: Application):
-    logger.info("Завершение работы бота...")
+    logger.info("Завершаю работу...")
     await stop_persist_task()
+    # Воркеры очереди LLM: без остановки они остаются pending-задачами и
+    # при перезапуске процесса Python ругается «Task was destroyed».
+    await llm_queue.shutdown()
     await close_client()
     close_all()
     logger.info("Бот остановлен")
+
 
 
 async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -714,6 +734,8 @@ def build_application() -> Application:
     application.add_handler(CallbackQueryHandler(
         show_help_callback, pattern="^show_help$"
     ))
+    # Главное меню: разделы и быстрые действия.
+    register_menu_handlers(application)
     application.add_handler(CallbackQueryHandler(
         start_tournament_from_menu, pattern="^start_tournament_from_menu$"
     ))

@@ -617,6 +617,20 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
 
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
 
+    # Уведомление «вы в очереди»: юзер видит, что запрос ждёт, а не
+    # завис. Сообщение удаляется, как только ответ пришёл.
+    queue_notice = {"id": None}
+
+    async def on_queue(position: int) -> None:
+        try:
+            sent = await message.reply_text(
+                f"⏳ В очереди {position} — отвечу, как освободится. "
+                "Обычно это занимает несколько секунд.",
+            )
+            queue_notice["id"] = getattr(sent, "message_id", None)
+        except Exception as e:
+            logger.debug(f"Не удалось сообщить о позиции в очереди: {e}")
+
     try:
         # В промпт уходит контекст цитаты и содержимое файла, в историю —
         # исходный текст юзера: иначе реплаи и вложения раздували бы
@@ -650,8 +664,20 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
             model=model,
             api_key=bot_data["OPENROUTER_API_KEY"],
             history=_history_for_prompt(context, speaker),
-            images=images or None
+            images=images or None,
+            on_queue=on_queue,
         )
+
+        # Уведомление о очереди больше не нужно — убираем, чтобы в чате
+        # не висело «⏳ в очереди» рядом с уже готовым ответом.
+        if queue_notice["id"] is not None:
+            try:
+                await context.bot.delete_message(
+                    chat_id=message.chat_id, message_id=queue_notice["id"],
+                )
+            except Exception:
+                pass
+            queue_notice["id"] = None
 
         # Сервисную ошибку («Слишком много запросов!», «Все модели
         # недоступны») в историю не кладём: она не ответ бота, а заглушка
