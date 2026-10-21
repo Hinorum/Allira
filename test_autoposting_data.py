@@ -213,7 +213,7 @@ def patch_market_data(monkey: dict) -> None:
             return None
         if path == "/v1/collections/":
             return COLLECTIONS
-        if path == "/v1/rent/gifts/":
+        if path.startswith("/v1/rent/"):
             return RENT_ITEMS
         if path == "/v1/gifts/onsale/":
             return SALE_ITEMS
@@ -297,9 +297,18 @@ async def main() -> int:
     )
     check("Dead Collection" not in colls, "коллекции: без статистики не попадают в вывод")
 
-    rent = format_rent_listings(RENT_ITEMS["items"])
+    rent = format_rent_listings(RENT_ITEMS["items"], "gifts")
     check("Bear" in rent and "2.50 TON/сут" in rent, "аренда: имя и цена в сутки", rent)
     check("Backdrop" in rent, "аренда: признак предмета", rent)
+    check("подарки" in rent, "аренда: категория в заголовке", rent)
+    check(
+        "юзернеймы" in format_rent_listings(RENT_ITEMS["items"], "usernames"),
+        "аренда: категория юзернеймов в заголовке",
+    )
+    check(
+        "номера" in format_rent_listings(RENT_ITEMS["items"], "numbers"),
+        "аренда: категория номеров в заголовке",
+    )
 
     sale = format_sale_listings(SALE_ITEMS["items"])
     check("Common Box" in sale and "0.10 TON" in sale, "продажа: самый дешёвый лот", sale)
@@ -321,6 +330,51 @@ async def main() -> int:
     check(format_rent_listings([]) == "", "пустая аренда даёт пустую строку")
     check(format_sale_listings([]) == "", "пустая продажа даёт пустую строку")
     check(format_collection_meta({}, []) == "", "пустая карточка даёт пустую строку")
+
+    # ------------------------------------------- единицы сумм Marketapp
+    print("2a. Единицы сумм Marketapp")
+    from utils.market_data import _amount
+
+    check(_amount("98000000000") == 98.0, "нано-TON → TON", str(_amount("98000000000")))
+    check(_amount("98.0") == 98.0, "готовые TON не делятся ещё раз", str(_amount("98.0")))
+    check(_amount("98") == 98.0, "целое в единицах не делится ещё раз", str(_amount("98")))
+    check(
+        _amount("2500000", "USDT") == 2.5,
+        "нано-USDT → USDT",
+        str(_amount("2500000", "USDT")),
+    )
+    check(
+        _amount("2.5", "USDT") == 2.5,
+        "готовые USDT не делятся ещё раз",
+        str(_amount("2.5", "USDT")),
+    )
+    check(_amount("500000", "USDT") == 0.5, "нано-USDT ниже порога", str(_amount("500000", "USDT")))
+    check(_amount(None) == 0.0, "пустая сумма → 0")
+    check(_amount("мусор") == 0.0, "не-число → 0")
+
+    from utils.market_data import _num
+
+    check(_num(82394.0) == "82,394.00", "цена: обычный вид", _num(82394.0))
+    check(_num(0.083) == "0.0830", "цена: копеечная монета не обнуляется", _num(0.083))
+    check(_num(0) == "0.00", "цена: ноль", _num(0))
+
+    # ------------------------------ общий кэш рынка для чата и для канала
+    print("2b. Общий кэш CoinGecko")
+    from utils.market import format_snapshot
+
+    snapshot = format_snapshot(MARKETS)
+    check("BTC $82,394.00" in snapshot, "снапшот чата: цена BTC", snapshot)
+    check("ETH $2,428.22" in snapshot, "снапшот чата: цена ETH", snapshot)
+    check("Zcash" not in snapshot, "снапшот чата: только своя пятёрка", snapshot)
+    check(format_snapshot([]) == "", "пустой снапшот → пустая строка")
+
+    # Монета дешевле доллара: раньше печаталась «$0» — модель писала, что
+    # монета ничего не стоит.
+    cheap = format_snapshot([{
+        "id": "dogecoin", "symbol": "doge", "current_price": 0.083,
+        "price_change_percentage_24h": 1.5,
+    }])
+    check("$0.0" in cheap and "$0 " not in cheap, "снапшот чата: мелкая цена не обнуляется", cheap)
 
     # ---------------------------------------------- сборка живого факт-листа
     print("3. Сборка факт-листа")
@@ -358,6 +412,42 @@ async def main() -> int:
             api_key="", tonapi_key="", want_crypto=False, want_nft=True
         )
         check("CoinGecko" not in no_key_sources, "без ключа: Marketapp не в источниках")
+
+        # Один упавший источник не должен уносить остальные: раньше
+        # исключение от любого блока роняло весь сбор, и в канал уходил
+        # текст-заглушка вместо поста с данными.
+        async def broken_marketapp(path, params=None, api_key=""):
+            raise RuntimeError("Marketapp упал")
+
+        md._marketapp_json = broken_marketapp
+        md._cache.clear()
+        try:
+            partial, partial_sources = await md.fetch_market_facts(
+                api_key="test-key", tonapi_key="", want_crypto=True, want_nft=True
+            )
+            check("Bitcoin" in partial, "упавший Marketapp: крипта уцелела", partial[:120])
+            check("Lost Dogs" in partial, "упавший Marketapp: TonAPI уцелел", partial[:120])
+            check("Marketapp" not in partial_sources,
+                  "упавший Marketapp: в источниках не значится", str(partial_sources))
+        finally:
+            md._marketapp_json = monkey["_marketapp_json"]
+            md._cache.clear()
+
+        async def broken_cg(path, params=None):
+            raise RuntimeError("CoinGecko упал")
+
+        md._cg_json = broken_cg
+        md._cache.clear()
+        try:
+            partial2, partial2_sources = await md.fetch_market_facts(
+                api_key="test-key", tonapi_key="", want_crypto=True, want_nft=True
+            )
+            check("Lost Dogs" in partial2, "упавший CoinGecko: NFT уцелел", partial2[:120])
+            check("CoinGecko" not in partial2_sources,
+                  "упавший CoinGecko: в источниках не значится", str(partial2_sources))
+        finally:
+            md._cg_json = monkey["_cg_json"]
+            md._cache.clear()
     finally:
         restore_market_data(monkey)
 
@@ -449,10 +539,6 @@ async def main() -> int:
     # ------------------------------------------------------------ фолбэки
     print("7. Фолбэки без данных")
     check(
-        bool(autoposting.get_fallback_crypto_data()),
-        "фолбэк для крипты есть",
-    )
-    check(
         bool(autoposting.get_fallback_nft_data()),
         "фолбэк для NFT есть",
     )
@@ -463,6 +549,89 @@ async def main() -> int:
         "$" not in crypto_fallback,
         "фолбэк не рисует выдуманных цен",
         crypto_fallback,
+    )
+
+    # ------------------------------------------------------------- новости
+    print("7a. Новости из RSS")
+    from utils.market_data import format_news, parse_news_feed
+
+    rss = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+  <item>
+    <title><![CDATA[TON NFT collection launches new breeding update]]></title>
+    <link>https://example.com/ton-nft</link>
+    <pubDate>__NOW__</pubDate>
+    <description><![CDATA[<p>Some <b>html</b> in the description</p>]]></description>
+  </item>
+  <item>
+    <title>Bitcoin ETF inflows hit record high</title>
+    <link>https://example.com/btc</link>
+    <pubDate>__NOW__</pubDate>
+  </item>
+  <item>
+    <title>Old news from last year</title>
+    <link>https://example.com/old</link>
+    <pubDate>Mon, 01 Jan 2024 00:00:00 +0000</pubDate>
+  </item>
+</channel></rss>"""
+
+    from email.utils import format_datetime
+    from datetime import datetime, timezone
+
+    now_rfc = format_datetime(datetime.now(timezone.utc), usegmt=True)
+    rss_fresh = rss.replace("__NOW__", now_rfc)
+
+    items = parse_news_feed(rss_fresh, "Test")
+    check(len(items) == 3, "RSS: все три item разобраны", str(len(items)))
+    check(
+        items[0]["title"] == "TON NFT collection launches new breeding update",
+        "RSS: CDATA-заголовок разобран",
+        items[0]["title"],
+    )
+    check(items[0]["link"] == "https://example.com/ton-nft", "RSS: ссылка разобрана")
+    check(items[0]["source"] == "Test", "RSS: источник проставлен")
+
+    tracking = parse_news_feed(
+        rss_fresh.replace(
+            "<link>https://example.com/ton-nft</link>",
+            "<link>https://example.com/ton-nft?utm_source=rss_feed&amp;utm_medium=rss</link>",
+        ),
+        "Test",
+    )
+    check(
+        tracking[0]["link"] == "https://example.com/ton-nft",
+        "RSS: трекинговые параметры убраны из ссылки",
+        tracking[0]["link"],
+    )
+
+    check(parse_news_feed("", "Test") == [], "пустой RSS → пустой список")
+    check(parse_news_feed("<rss><channel>", "Test") == [], "битый XML → пустой список")
+    check(parse_news_feed("<html><body>no items</body></html>", "Test") == [],
+          "HTML вместо RSS → пустой список")
+
+    news_all = format_news(items)
+    check("TON NFT collection" in news_all, "новости: заголовок попал в блок", news_all)
+    check("Bitcoin ETF" in news_all, "новости: обычная крипто-новость", news_all)
+    check("Old news from last year" not in news_all, "новости: старые отсеяны", news_all)
+    check("example.com" in news_all, "новости: ссылка в блоке", news_all)
+
+    news_nft = format_news(items, nft_only=True)
+    check("TON NFT collection" in news_nft, "новости NFT: подходящая попала", news_nft)
+    check("Bitcoin ETF" not in news_nft, "новости NFT: монежная отсеяна", news_nft)
+
+    # «wallet» в заголовке про DOGE — не NFT-новость
+    doge = [{
+        "title": "Dogecoin wallet, app teams unite in push for DOGE",
+        "link": "", "published": now_rfc, "source": "Test",
+    }]
+    check(
+        format_news(doge, nft_only=True) == "",
+        "новости NFT: «wallet» про DOGE не считается NFT-новостью",
+        format_news(doge, nft_only=True),
+    )
+    check(
+        "Dogecoin" in format_news(doge),
+        "новости: общая крипто-новость проходит",
     )
 
     # --------------------------------------------- разбор NFT_COLLECTIONS

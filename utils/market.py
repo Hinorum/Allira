@@ -1,42 +1,39 @@
 import logging
-import time
-from cachetools import TTLCache
 
-from utils.http_client import get_client, with_retry
+from utils.market_data import get_markets
 
 logger = logging.getLogger(__name__)
 
-COINS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 # id монет, которые видит Аллира: основной рынок + пара мемкоинов для разнообразия
-SNAPSHOT_IDS = "bitcoin,ethereum,solana,binancecoin,dogecoin"
-
-# Кэш и на успех, и на провал: при 429 от CoinGecko не хотим спамить
-# запросом на каждое сообщение — 10 минут без цифр лучше, чем блокировка.
-_snapshot_cache: TTLCache = TTLCache(maxsize=2, ttl=600)
+SNAPSHOT_IDS = ("bitcoin", "ethereum", "solana", "binancecoin", "dogecoin")
 
 
-@with_retry(max_retries=1, base_delay=1.0)
-async def _fetch_markets(params: dict):
-    client = await get_client()
-    return await client.get(
-        COINS_URL,
-        params=params,
-        headers={"User-Agent": "AlliraCryptoBot/1.0"},
-        timeout=10.0,
-    )
+def _price(value: float) -> str:
+    """Цена с разумной точностью.
+
+    Раньше все цены печатались без дробной части: Dogecoin с курсом
+    $0.13 превращался в «DOGE $0» — и модель писала в чат, что он
+    ничего не стоит.
+    """
+    if value >= 1:
+        return f"${value:,.2f}"
+    return f"${value:,.4f}"
 
 
 def format_snapshot(data: list) -> str:
-    """Список ответа CoinGecko → короткая строка для промпта."""
+    """Список монет CoinGecko → короткая строка для промпта."""
+    wanted = set(SNAPSHOT_IDS)
     parts: list[str] = []
     for coin in data:
+        if coin.get("id") not in wanted:
+            continue
         symbol = (coin.get("symbol") or "").upper()
         price = coin.get("current_price")
         change = coin.get("price_change_percentage_24h")
-        if not symbol or price is None:
+        if not symbol or not isinstance(price, (int, float)):
             continue
         change_str = f" {change:+.1f}%" if isinstance(change, (int, float)) else ""
-        parts.append(f"{symbol} ${price:,.0f}{change_str}")
+        parts.append(f"{symbol} {_price(price)}{change_str}")
     if not parts:
         return ""
     # Разделитель "; " — запятая внутри пары "BTC $118,432" ломала бы чтение
@@ -47,29 +44,17 @@ async def get_market_snapshot() -> str:
     """Короткий рыночный снапшот для промпта. '' при ошибке/пустоте.
 
     Аллира — криптоперсонаж: без живых цифр модель выдумывает курсы.
-    Результат (включая провал) кэшируется на 10 минут.
-    """
-    cached = _snapshot_cache.get("snapshot")
-    if cached is not None:
-        return cached
 
-    result = ""
+    Данные берутся из общего кэша utils.market_data: раньше чат ходил в
+    CoinGecko отдельным запросом по пяти id, а канал — сотней по
+    капитализации. Два запроса вместо одного, и оба упирались в 429
+    бесплатного тарифа. Кэш и на провал тоже общий: 10 минут без цифр
+    лучше, чем блокировка.
+    """
     try:
-        response = await _fetch_markets({
-            "vs_currency": "usd",
-            "ids": SNAPSHOT_IDS,
-            "order": "market_cap_desc",
-            "price_change_percentage": "24h",
-        })
-        if response.status_code == 200:
-            result = format_snapshot(response.json())
-        else:
-            logger.warning(f"CoinGecko markets: {response.status_code}")
+        markets = await get_markets()
     except Exception as e:
         logger.warning(f"Снапшот рынка недоступен: {e}")
+        return ""
 
-    if not result:
-        # Фиксируем и провал, чтобы не долбить API с каждого сообщения
-        result = ""
-    _snapshot_cache["snapshot"] = result
-    return result
+    return format_snapshot(markets)

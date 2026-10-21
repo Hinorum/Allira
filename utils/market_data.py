@@ -17,7 +17,11 @@ global) и подставлял его в промпт. Три следстви�
 
 import asyncio
 import logging
+import re
 import time
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from cachetools import TTLCache
 
 from utils.http_client import get_client, with_retry
@@ -28,6 +32,22 @@ logger = logging.getLogger(__name__)
 COINGECKO_URL = "https://api.coingecko.com/api/v3"
 MARKETAPP_API_URL = "https://api.marketapp.org"
 TONAPI_API_URL = "https://tonapi.io/v2"
+
+# RSS-ленты крипто-новостей. Ключей не требуют — в отличие от новостного
+# API CryptoCompare, который теперь отдаёт 401 без ключа.
+NEWS_FEEDS = (
+    ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
+    ("Cointelegraph", "https://cointelegraph.com/rss"),
+)
+
+# Слова, по которым новость считается про NFT/TON, а не про монеты.
+# Сопоставление по границам слова: без них «ton» ловил «Button», а
+# «wallet» — новости про DOGE-кошельки, не про NFT.
+NFT_PATTERN = re.compile(
+    r"\b(nft|nfts|ton|getgems|collection|collections|pfp|mint|minting|"
+    r"telegram|bluechip|rugpull|dao|soulbound|airdrop|metaverse)\b",
+    re.IGNORECASE,
+)
 
 # Кэш живых данных: пост выходит раз в 12-14 часов, а внутри одного поста
 # данные нужны в нескольких блоках (цифры + тренды + NFT). Кэш на 10 минут
@@ -45,7 +65,12 @@ _UA = {"User-Agent": "AlliraCryptoBot/1.0"}
 
 
 def _num(value, digits: int = 2) -> str:
-    """Число в строку с разделителем тысяч; не-числа — пустая строка."""
+    """Число в строку с разделителем тысяч; не-числа — пустая строка.
+
+    Для цен: у монет дешевле доллара двух знаков не хватало — Dogecoin
+    с курсом $0.13 печатался как «$0.13», а копеечные монеты как «$0.00».
+    Теперь точность подстраивается под величину.
+    """
     if value is None or isinstance(value, bool):
         return ""
     try:
@@ -54,6 +79,8 @@ def _num(value, digits: int = 2) -> str:
         return ""
     if digits == 0:
         return f"{number:,.0f}"
+    if 0 < abs(number) < 1:
+        return f"{number:,.4f}"
     return f"{number:,.{digits}f}"
 
 
@@ -239,6 +266,35 @@ def format_ton(coin: dict) -> str:
     return "Нативный токен сети:\n" + line
 
 
+async def get_markets() -> list:
+    """Топ-100 монет CoinGecko. Общий кэш для канала и для чата.
+
+    Раньше чат и автопостинг ходили в CoinGecko разными запросами: чат
+    брал пять монет по ids, канал — сотню по капитализации. Два запроса
+    вместо одного, и оба упирались в 429 бесплатного тарифа.
+    """
+    cached = _cache.get("markets")
+    if cached is not None:
+        return cached
+
+    data = await _cg_json(
+        "/coins/markets",
+        {
+            "vs_currency": "usd",
+            "order": "market_cap_desc",
+            "per_page": 100,
+            "page": 1,
+            "sparkline": "false",
+            "price_change_percentage": "24h,7d",
+        },
+    )
+    markets = data if isinstance(data, list) else []
+    # Кэшируем и пустой ответ: при 429 не хотим долбить API на каждое
+    # сообщение в чат.
+    _cache["markets"] = markets
+    return markets
+
+
 async def fetch_crypto_facts() -> str:
     """Живой блок по крипте. Пустая строка — данных нет."""
     cached = _cache.get("crypto")
@@ -251,18 +307,8 @@ async def fetch_crypto_facts() -> str:
     # per_page=100: в одном ответе умещается и топ для показа, и лидеры
     # роста/падения, и нативный токен сети. Отдельный запрос за TON раньше
     # был четвёртым подряд — и упирался в 429 бесплатного тарифа.
-    markets = await _cg_json(
-        "/coins/markets",
-        {
-            "vs_currency": "usd",
-            "order": "market_cap_desc",
-            "per_page": 100,
-            "page": 1,
-            "sparkline": "false",
-            "price_change_percentage": "24h,7d",
-        },
-    )
-    if isinstance(markets, list) and markets:
+    markets = await get_markets()
+    if markets:
         top = format_top_coins(markets)
         if top:
             blocks.append(top)
@@ -349,10 +395,15 @@ async def _marketapp_json(path: str, params: dict | None, api_key: str):
 
 
 def _amount(value, currency: str = "") -> float:
-    """Сумма из строки-«нано» с учётом валюты.
+    """Сумма Marketapp: нано-единицы или уже готовые единицы.
 
-    TON/GRAM считаются в 1e9, USDT — в 1e6. Раньше всё делилось на 1e9:
-    лот в USDT показывался в тысячу раз дороже реального.
+    API мечет формат: `price_per_day` документирован как «nanograms»,
+    `price` в ленте платежей — уже в TON, а у `floor`/`min_bid` единицы
+    не описаны вовсе. Раньше всё делилось на 1e9, и цена в USDT
+    показывалась в тысячу раз дороже реальной.
+
+    Разбор по разряду: значение ниже порога — это уже единицы, выше —
+    нано. Порог разный для TON (1e6 nano = 0.001 TON) и USDT (1e4).
     """
     if value is None:
         return 0.0
@@ -360,7 +411,14 @@ def _amount(value, currency: str = "") -> float:
         raw = float(value)
     except (TypeError, ValueError):
         return 0.0
-    divisor = 1e6 if (currency or "").upper() == "USDT" else 1e9
+    if raw == 0:
+        return 0.0
+    if (currency or "").upper() == "USDT":
+        divisor, units_limit = 1e6, 1e4
+    else:
+        divisor, units_limit = 1e9, 1e6
+    if abs(raw) < units_limit:
+        return raw
     return raw / divisor
 
 
@@ -421,7 +479,7 @@ def format_collections(collections: list) -> str:
     return "NFT-коллекции TON (Marketapp, по объёму за 30 дней):\n" + "\n".join(lines)
 
 
-def format_rent_listings(items: list) -> str:
+def format_rent_listings(items: list, category: str = "") -> str:
     """Живые лоты аренды: сколько стоит аренда подарка/юзернейма/номера."""
     lines = []
     for item in items or []:
@@ -438,7 +496,12 @@ def format_rent_listings(items: list) -> str:
         lines.append(f"{name}{trait}: аренда {per_day:.2f} TON/сут")
     if not lines:
         return ""
-    return "Сейчас в аренде (Marketapp):\n" + "\n".join(lines)
+    title = {
+        "gifts": "Сейчас в аренде (подарки, Marketapp)",
+        "usernames": "Сейчас в аренде (юзернеймы, Marketapp)",
+        "numbers": "Сейчас в аренде (номера, Marketapp)",
+    }.get(category, "Сейчас в аренде (Marketapp)")
+    return f"{title}:\n" + "\n".join(lines)
 
 
 def format_sale_listings(items: list) -> str:
@@ -487,11 +550,15 @@ async def fetch_marketapp_facts(api_key: str) -> str:
         if block:
             blocks.append(block)
 
-    rent = await _marketapp_json("/v1/rent/gifts/", {"limit": 5}, api_key)
-    if isinstance(rent, dict):
-        block = format_rent_listings(rent.get("items"))
-        if block:
-            blocks.append(block)
+    # Аренда есть у трёх категорий: подарки, юзернеймы и номера. Раньше
+    # читались только подарки — половина аренды TON-рынка в пост не
+    # попадала вовсе.
+    for category in RENT_CATEGORIES:
+        rent = await _marketapp_json(f"/v1/rent/{category}/", {"limit": 4}, api_key)
+        if isinstance(rent, dict):
+            block = format_rent_listings(rent.get("items"), category)
+            if block:
+                blocks.append(block)
 
     sale = await _marketapp_json("/v1/gifts/onsale/", {"limit": 6}, api_key)
     if isinstance(sale, dict):
@@ -609,6 +676,160 @@ async def fetch_collection_facts(collections: dict[str, str], api_key: str = "")
     return result
 
 
+# ------------------------------------------------------------------ Новости
+
+
+def _local_name(tag: str) -> str:
+    """Имя тега без XML-пространства имён: `{ns}item` → `item`."""
+    return (tag or "").rsplit("}", 1)[-1]
+
+
+def _child_text(node, name: str) -> str:
+    """Текст первого дочернего элемента с таким именем."""
+    for child in node:
+        if _local_name(child.tag) == name:
+            return (child.text or "").strip()
+    return ""
+
+
+def _clean_url(url: str) -> str:
+    """Ссылка без трекинговых параметров.
+
+    RSS-ленты лепят в адрес `?utm_source=rss_feed&utm_medium=rss&utm_campaign=…`
+    — это треть промпта на каждый заголовок, и в канал такая ссылка
+    выглядит мусором.
+    """
+    if not url:
+        return ""
+    return url.split("?", 1)[0].rstrip("?&")
+
+
+def _strip_html(text: str) -> str:
+    """Убирает теги и схлопывает пробелы — описание в RSS это HTML."""
+    if not text:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"&[a-z]+;|&#\d+;", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def parse_news_feed(xml_text: str, source: str = "") -> list[dict]:
+    """RSS → список заголовков: {title, link, published}.
+
+    Заголовок — единственное, что уходит в пост: полные тексты новостей
+    съедают промпт и модель начинает их пересказывать вместо своего текста.
+    """
+    if not xml_text or "<item" not in xml_text:
+        return []
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        logger.warning(f"RSS {source}: битый XML ({e})")
+        return []
+
+    items = []
+    for node in root.iter():
+        if _local_name(node.tag) != "item":
+            continue
+        title = _strip_html(_child_text(node, "title"))
+        if not title:
+            continue
+        link = _child_text(node, "link")
+        if not link:
+            for child in node:
+                if _local_name(child.tag) == "link" and child.get("href"):
+                    link = child.get("href", "")
+                    break
+        published = ""
+        for field in ("pubDate", "published", "date"):
+            published = _child_text(node, field)
+            if published:
+                break
+        items.append({
+            "title": title,
+            "link": _clean_url(link),
+            "published": published,
+            "source": source,
+        })
+    return items
+
+
+def _is_fresh(item: dict, max_age_hours: int = 36) -> bool:
+    """Новость не старше max_age_hours. Без даты — пропускаем."""
+    raw = item.get("published")
+    if not raw:
+        return False
+    try:
+        moment = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return False
+    if moment is None:
+        return False
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - moment).total_seconds() / 3600
+    return -2 <= age <= max_age_hours
+
+
+def format_news(items: list[dict], nft_only: bool = False) -> str:
+    """Свежие заголовки — короткий блок для факт-листа."""
+    chosen = []
+    for item in items:
+        title = item.get("title") or ""
+        if nft_only and not NFT_PATTERN.search(title):
+            continue
+        if not _is_fresh(item):
+            continue
+        chosen.append(item)
+    if not chosen:
+        return ""
+
+    lines = []
+    for item in chosen[:5]:
+        line = f"- {item['title']}"
+        source = item.get("source")
+        if source:
+            line += f" ({source})"
+        if item.get("link"):
+            line += f" — {item['link']}"
+        lines.append(line)
+    if not lines:
+        return ""
+    title = "Свежие новости по NFT и TON:" if nft_only else "Свежие крипто-новости:"
+    return title + "\n" + "\n".join(lines)
+
+
+@with_retry(max_retries=1, base_delay=2.0)
+async def _fetch_feed(url: str):
+    client = await get_client()
+    # Таймаут скромный: лента — вспомогательный источник, и ждать её
+    # полминуты ради поста нельзя.
+    return await client.get(url, headers=_UA, timeout=12.0, follow_redirects=True)
+
+
+async def fetch_news_facts(nft_only: bool = False) -> str:
+    """Свежие заголовки из RSS-лент. Пустая строка — ленты недоступны."""
+    cached = _cache.get(f"news_{nft_only}")
+    if cached is not None:
+        return cached
+
+    items: list[dict] = []
+    for source, url in NEWS_FEEDS:
+        try:
+            response = await _fetch_feed(url)
+        except Exception as e:
+            logger.warning(f"RSS {source}: {type(e).__name__} {e}")
+            continue
+        if response.status_code != 200:
+            logger.warning(f"RSS {source}: HTTP {response.status_code}")
+            continue
+        items.extend(parse_news_feed(response.text, source))
+
+    result = format_news(items, nft_only)
+    _cache[f"news_{nft_only}"] = result
+    return result
+
+
 # ------------------------------------------------------------------- Сводка
 
 
@@ -629,25 +850,53 @@ async def fetch_market_facts(
     в список, только если по нему пришли реальные данные: в промпте модели
     важно знать, откуда цифры, чтобы она не приписала источнику то, чего
     в нём нет.
+
+    Источники независимы: падение одного не уносит остальные. Раньше
+    исключение от любого блока роняло весь сбор — и в канал уходил
+    текст-заглушка вместо поста с данными.
     """
     watchlist = collections or DEFAULT_COLLECTIONS
     blocks: list[str] = []
     sources: list[str] = []
 
     if want_crypto:
-        crypto = await fetch_crypto_facts()
+        try:
+            crypto = await fetch_crypto_facts()
+        except Exception as e:
+            logger.warning(f"Блок крипты не собрался: {e}")
+            crypto = ""
         if crypto:
             blocks.append(crypto)
             sources.append("CoinGecko")
 
+    # Новости идут отдельным блоком: в посте о крипте это заголовки дня,
+    # в посте о NFT — только те, что про NFT и TON.
+    try:
+        news = await fetch_news_facts(nft_only=not want_crypto)
+    except Exception as e:
+        logger.warning(f"Блок новостей не собрался: {e}")
+        news = ""
+    if news:
+        blocks.append(news)
+        sources.append("RSS-новости")
+
     if want_nft:
         nft_parts = []
-        marketapp = await fetch_marketapp_facts(api_key)
+
+        try:
+            marketapp = await fetch_marketapp_facts(api_key)
+        except Exception as e:
+            logger.warning(f"Блок Marketapp не собрался: {e}")
+            marketapp = ""
         if marketapp:
             nft_parts.append(marketapp)
             sources.append("Marketapp")
 
-        tonapi = await fetch_collection_facts(watchlist, tonapi_key)
+        try:
+            tonapi = await fetch_collection_facts(watchlist, tonapi_key)
+        except Exception as e:
+            logger.warning(f"Блок TonAPI не собрался: {e}")
+            tonapi = ""
         if tonapi:
             nft_parts.append(tonapi)
             sources.append("TonAPI")
