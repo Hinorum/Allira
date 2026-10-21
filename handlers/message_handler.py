@@ -17,7 +17,7 @@ try:
 except ImportError:  # pragma: no cover
     PdfReader = None
 
-from utils.ai_responses import get_llm_response, decide_speaker
+from utils.ai_responses import get_llm_response, decide_speaker, is_service_error
 from utils.market import get_market_snapshot
 from utils.database import (
     check_rate_limit, upsert_user, log_message, is_user_banned
@@ -194,9 +194,15 @@ def _build_user_prompt(text: str, message) -> str:
 
 # Фото для vision-канала: data-URL уходит в OpenRouter напрямую в payload,
 # поэтому держим потолок — base64 раздувает байты вчетверо.
-MAX_IMAGE_BYTES = 8 * 1024 * 1024
+#
+# Потолок и размер кэша считаются вместе: base64 от 4 МБ — это ~5.3 МБ
+# строки, и 64 таких записи в кэше съедали бы больше 300 МБ RAM. На
+# бесплатном инстансе Render (512 МБ) это уже OOM, а депозиций с картинками
+# в компании хватает, чтобы это случилось.
+MAX_IMAGE_BYTES = 4 * 1024 * 1024
 # Повторные реплаи на одно фото не качают файл заново: file_id стабилен.
-_image_cache: TTLCache = TTLCache(maxsize=64, ttl=3600)
+# Кэш маленький намеренно — вытеснение старых записей дешевле, чем OOM.
+_image_cache: TTLCache = TTLCache(maxsize=8, ttl=1800)
 
 
 async def _file_data_url(
@@ -531,8 +537,15 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
         return
 
     bot_data = context.bot_data
-    bot_username = bot_data.get("bot_username", "")
+    bot_username = (bot_data.get("bot_username") or "").strip()
     user = message.from_user
+
+    # Бот не отвечает на собственные сообщения. В новостном канале бот
+    # читает свою же ленту, и пост автопостинга может содержать слово
+    # «аллира» — тогда бот отвечал бы сам себе, а в канале появлялись
+    # реплики-заикания.
+    if user is not None and user.id == getattr(context.bot, "id", None):
+        return
 
     if user and await is_user_banned(user.id):
         return
@@ -588,7 +601,14 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
                 return
             await upsert_user(user.id, user.username, user.first_name)
 
-        clean_text = re.sub(re.escape(f"@{bot_username}"), "", raw_text, flags=re.IGNORECASE).strip()
+        # Пустой bot_username — это пустая регулярка: re.sub("", "", text)
+        # вставляет пустую строку в каждый разрез. Вырезаем упоминание
+        # только когда никто известен.
+        clean_text = raw_text
+        if bot_username:
+            clean_text = re.sub(
+                re.escape(f"@{bot_username}"), "", clean_text, flags=re.IGNORECASE
+            ).strip()
         # Медиа без подписи: до vision-фазы бот про него знает только тип
         text = f"{clean_text} {media_stub}".strip() or "Привет!"
 
@@ -633,8 +653,14 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
             images=images or None
         )
 
-        _append_history(context, "user", text, speaker)
-        _append_history(context, "assistant", response, speaker)
+        # Сервисную ошибку («Слишком много запросов!», «Все модели
+        # недоступны») в историю не кладём: она не ответ бота, а заглушка
+        # провайдера. Иначе модель в следующем раунде видела свою прошлую
+        # реплику «Технические неполадки! Попробуй ещё раз» и продолжала
+        # её в том же духе.
+        if not is_service_error(response):
+            _append_history(context, "user", text, speaker)
+            _append_history(context, "assistant", response, speaker)
 
         if len(response) > 4000:
             if is_private:

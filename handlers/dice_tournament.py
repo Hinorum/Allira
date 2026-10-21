@@ -18,6 +18,20 @@ ROLL_COOLDOWN = 2.0
 MAX_REMATCHES = 3
 ELIMINATION_PERCENTAGE = 4
 
+# Сколько игроков держим в памяти о последних бросках. Словарь рос вечно:
+# каждый новый участник tournaments оставлял в нём запись навсегда, и на
+# долгоживущем инстансе он превращался в утечку.
+MAX_ROLL_HISTORY = 512
+
+
+def _remember_roll(user_id: int, moment: float):
+    """Запомнить время броска, не давая словарю расти бесконечно."""
+    last_roll_times[user_id] = moment
+    if len(last_roll_times) > MAX_ROLL_HISTORY:
+        # Выкидываем самые старые записи — порядок вставки в dict сохраняет.
+        for key in list(last_roll_times.keys())[:len(last_roll_times) - MAX_ROLL_HISTORY]:
+            last_roll_times.pop(key, None)
+
 _tournament_states: dict[int, dict] = {}
 _round_announcing: set[int] = set()
 
@@ -132,6 +146,10 @@ def _default_state(chat_id: int = None) -> dict:
         "player_rolls_in_round": {},
         "admin_user_id": None,
         "player_with_bye": None,
+        # Счётчики переигровок по матчам: ключ — пара игроков, значение —
+        # сколько раз пара заворачивала. Раньше счётчик был один на весь
+        # раунд, и пары конкурировали за него.
+        "rematch_counts": {},
         "rematch_count": 0,
         "is_final_round": False,
     }
@@ -162,6 +180,28 @@ def _make_pairs(player_ids: list[int]) -> tuple[list[tuple[int, int]], int | Non
         bye_player = player_ids.pop()
     pairs = [(player_ids[i], player_ids[i + 1]) for i in range(0, len(player_ids), 2)]
     return pairs, bye_player
+
+
+def _match_key(p1_id: int, p2_id: int) -> str:
+    """Ключ матча: пара игроков в фиксированном порядке.
+
+    Нужен для счётчика переигровок: пара одна и та же, но порядок в
+    `round_matches` может поменяться.
+    """
+    low, high = (p1_id, p2_id) if p1_id < p2_id else (p2_id, p1_id)
+    return f"{low}:{high}"
+
+
+def _display_name(user) -> str:
+    """Имя для показа в чате: ник, имя или заглушка.
+
+    У Telegram first_name может быть None — тогда в ответе «None, ты на
+    арене!». Имя из first_name в текст сообщения идёт через escape_html,
+    потому что там может встретиться '<' или '&'.
+    """
+    if user is None:
+        return "Игрок"
+    return str(user.first_name or user.username or f"User_{user.id}")
 
 
 def _name(player: dict) -> str:
@@ -367,9 +407,17 @@ async def announce_round_results(context: ContextTypes.DEFAULT_TYPE, chat_id: in
                     message_lines.append(f"⚠️ {_name(p1_data)} vs {_name(p2_data)} — не все броски засчитаны.")
                     continue
 
+                # Счётчик переигровок — на КАЖДЫЙ матч. Раньше он был один
+                # на весь раунд: две пары, обе заповшие в первом раунде,
+                # делили один счётчик, и на втором раунде одна из них
+                # получала «жребий» без честной третьей попытки.
+                key = _match_key(p1_id, p2_id)
+                counts = state.setdefault("rematch_counts", {})
+
                 if p1_roll == p2_roll:
-                    state["rematch_count"] = state.get("rematch_count", 0) + 1
-                    if state["rematch_count"] >= MAX_REMATCHES:
+                    count = counts.get(key, 0) + 1
+                    counts[key] = count
+                    if count >= MAX_REMATCHES:
                         winner_id = random.choice([p1_id, p2_id])
                         loser_id = p2_id if winner_id == p1_id else p1_id
                         state["players"][winner_id]["total_score"] += 1
@@ -379,15 +427,17 @@ async def announce_round_results(context: ContextTypes.DEFAULT_TYPE, chat_id: in
                         winner_name = _name(state["players"][winner_id])
                         message_lines.append(
                             f"    {_name(p1_data)} ({p1_roll}) vs {_name(p2_data)} ({p2_roll}) -> "
-                            f"Ничья ×{state['rematch_count']}! Жребий: <b>{winner_name}</b> проходит"
+                            f"Ничья ×{count}! Жребий: <b>{winner_name}</b> проходит"
                         )
+                        counts.pop(key, None)
                     else:
                         rematch_matches.append((p1_id, p2_id))
                         message_lines.append(
                             f"    {_name(p1_data)} ({p1_roll}) vs {_name(p2_data)} ({p2_roll}) -> "
-                            f"Ничья (переигровка #{state['rematch_count']})"
+                            f"Ничья (переигровка #{count})"
                         )
                 elif p1_roll > p2_roll:
+                    counts.pop(key, None)
                     state["players"][p1_id]["total_score"] += 1
                     state["players"][p2_id]["is_eliminated"] = True
                     state["players"][p2_id]["eliminated_round"] = round_num
@@ -397,6 +447,7 @@ async def announce_round_results(context: ContextTypes.DEFAULT_TYPE, chat_id: in
                         f"<b>{_name(p1_data)}</b> побеждает"
                     )
                 else:
+                    counts.pop(key, None)
                     state["players"][p2_id]["total_score"] += 1
                     state["players"][p1_id]["is_eliminated"] = True
                     state["players"][p1_id]["eliminated_round"] = round_num
@@ -408,7 +459,8 @@ async def announce_round_results(context: ContextTypes.DEFAULT_TYPE, chat_id: in
 
             state["round_matches"] = rematch_matches
             if not rematch_matches:
-                state["rematch_count"] = 0
+                # Все матчи закрыты — счётчики переигровок больше не нужны.
+                state["rematch_counts"] = {}
 
         elif state["tournament_mode"] == "all_vs_all":
             active_players = [
@@ -644,16 +696,16 @@ async def register_for_tournament(update: Update, context: ContextTypes.DEFAULT_
         return
 
     if user.id in state["players"]:
-        await query.answer(f"{user.first_name}, ты уже на арене!", show_alert=False)
+        await query.answer(f"{_display_name(user)}, ты уже на арене!", show_alert=False)
     else:
         state["players"][user.id] = {
             "user_id": user.id,
-            "username": user.first_name or f"User_{user.id}",
+            "username": _display_name(user),
             "total_score": 0,
             "is_eliminated": False,
             "eliminated_round": 0,
         }
-        await query.answer(f"{user.first_name}, ты на арене!", show_alert=False)
+        await query.answer(f"{_display_name(user)}, ты на арене!", show_alert=False)
         await update_tournament_message(context, chat_id)
 
 
@@ -754,22 +806,27 @@ async def set_tournament_mode(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     state = _get_state(chat_id)
 
+    # Все отказы — тостом (answer), а НЕ правкой сообщения. Сообщение с
+    # кнопками режима общее для всего чата: раньше любой (не админ),
+    # нажавший «1 на 1», редактировал его своим текстом и убирал кнопки.
+    # Турнир после этого нельзя было запустить — админ уже не мог выбрать
+    # режим.
     if user_id != state.get("admin_user_id"):
-        await query.edit_message_text("Только админ может выбрать режим.", reply_markup=None)
+        await query.answer("Только админ может выбрать режим.", show_alert=True)
         return
 
     if state["tournament_mode"] is not None:
-        await query.edit_message_text(f"Режим уже выбран: {state['tournament_mode']}.", reply_markup=None)
+        await query.answer(f"Режим уже выбран: {state['tournament_mode']}.", show_alert=True)
         return
 
     if state["registration_open"]:
-        await query.edit_message_text("Сначала заверши набор.", reply_markup=None)
+        await query.answer("Сначала заверши набор.", show_alert=True)
         return
 
     try:
         _, mode = query.data.split(":")
     except ValueError:
-        await query.edit_message_text("Ошибка. Попробуй снова.", reply_markup=None)
+        await query.answer("Ошибка. Попробуй снова.", show_alert=True)
         return
 
     state["tournament_mode"] = mode
@@ -779,7 +836,7 @@ async def set_tournament_mode(update: Update, context: ContextTypes.DEFAULT_TYPE
     active_ids = [uid for uid, data in state["players"].items() if not data.get("is_eliminated")]
 
     if len(active_ids) < 2:
-        await query.edit_message_text("Мало игроков.", reply_markup=None)
+        await query.answer("Мало игроков.", show_alert=True)
         await end_tournament(context, chat_id)
         return
 
@@ -820,14 +877,14 @@ async def make_tournament_roll(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if user.id not in state["players"] or state["players"][user.id].get("is_eliminated"):
-        await query.answer(f"{user.first_name}, ты не в этом раунде.", show_alert=True)
+        await query.answer(f"{_display_name(user)}, ты не в этом раунде.", show_alert=True)
         return
 
     if user.id not in state["active_players_in_round"]:
         if user.id in state["player_rolls_in_round"]:
-            await query.answer(f"{user.first_name}, ты уже бросил: {state['player_rolls_in_round'][user.id]}.", show_alert=True)
+            await query.answer(f"{_display_name(user)}, ты уже бросил: {state['player_rolls_in_round'][user.id]}.", show_alert=True)
         else:
-            await query.answer(f"{user.first_name}, сейчас не твоя очередь.", show_alert=True)
+            await query.answer(f"{_display_name(user)}, сейчас не твоя очередь.", show_alert=True)
         return
 
     now = time.time()
@@ -836,20 +893,22 @@ async def make_tournament_roll(update: Update, context: ContextTypes.DEFAULT_TYP
         remaining = round(ROLL_COOLDOWN - (now - last_roll), 1)
         await query.answer(f"Подожди {remaining}с.", show_alert=True)
         return
-    last_roll_times[user.id] = now
+    _remember_roll(user.id, now)
 
     await query.answer("Бросаем кубик...")
 
+    rolled = False
     try:
         dice_message = await context.bot.send_dice(chat_id=chat_id, emoji=DiceEmoji.DICE)
         dice_value = dice_message.dice.value
 
         state["player_rolls_in_round"][user.id] = dice_value
         state["active_players_in_round"].discard(user.id)
+        rolled = True
 
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"<i>{escape_html(user.first_name or 'Игрок')} бросил: <b>{dice_value}</b>!</i>",
+            text=f"<i>{escape_html(_display_name(user))} бросил: <b>{dice_value}</b>!</i>",
             reply_to_message_id=dice_message.message_id,
             parse_mode="HTML"
         )
@@ -865,11 +924,17 @@ async def make_tournament_roll(update: Update, context: ContextTypes.DEFAULT_TYP
             await announce_round_results(context, chat_id)
 
     except Exception as e:
-        logger.error(f"Ошибка броска для {user.first_name}: {e}")
+        logger.error(f"Ошибка броска для {_display_name(user)}: {e}")
+        if rolled:
+            # Бросок уже засчитан — сорвалась лишь отправка сообщения о нём.
+            # Просить «нажми кнопку снова» бессмысленно: игрок уже бросил,
+            # и кнопка начнёт отвечать «ты уже бросил».
+            await query.answer("Бросок засчитан, но сообщение не отправилось.", show_alert=True)
+            return
         try:
             await query.answer("Ошибка при броске. Попробуй снова.", show_alert=True)
         except Exception:
-            await context.bot.send_message(chat_id=chat_id, text=f"{user.first_name}, ошибка при броске. Нажми кнопку снова.")
+            await context.bot.send_message(chat_id=chat_id, text=f"{_display_name(user)}, ошибка при броске. Нажми кнопку снова.")
 
 
 async def stop_tournament_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
