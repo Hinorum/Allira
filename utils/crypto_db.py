@@ -415,6 +415,33 @@ def _normalize_amount(decimals: int, amount: str | float | Decimal) -> str:
     return str(raw)
 
 
+def _normalize_money(value, label: str) -> Optional[str]:
+    """Рублевая сумма → нормализованная строка (или None).
+
+    Проверка нужна, потому что оба денежных поля приходили свободным
+    текстом (панель, ручной ввод): «8 500» или «8500₽» сохранялись как
+    есть, и потом float() на таком значении ронял /admin, а отрицательная
+    себестоимость давала отрицательный расход в отчёте для ФНС.
+
+    Пустая строка — это «сумма не задана», а не ноль.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip().replace(" ", "").replace("\u00a0", "").replace("₽", "")
+        if not text:
+            return None
+    else:
+        text = str(value).strip()
+    try:
+        amount = Decimal(text)
+    except (InvalidOperation, TypeError, ValueError):
+        raise CryptoError(f"{label.capitalize()} должна быть числом: {value!r}")
+    if amount < 0:
+        raise CryptoError(f"{label.capitalize()} не может быть отрицательной: {value!r}")
+    return str(amount)
+
+
 def add_transaction(
     owner_id: int,
     ts: int,
@@ -455,15 +482,19 @@ def add_transaction(
     else:
         direction = "out"
 
-    fv = str(fiat_value_rub) if fiat_value_rub not in (None, "") else None
-    cb = str(cost_basis_rub) if cost_basis_rub not in (None, "") else None
+    fv = _normalize_money(fiat_value_rub, "сумма")
+    cb = _normalize_money(cost_basis_rub, "себестоимость")
 
     with get_db() as conn:
-        # Защита от дублей: внешний источник + external_id.
+        # Защита от дублей: владелец + внешний источник + external_id.
+        # owner_id в условии обязателен: без него второй владелец учёта
+        # получал ЧУЖУЮ транзакцию вместо своей — импорт для него молча
+        # не создавал запись, а отчёт показывал чужую операцию.
         if source != "manual" and external_id:
             dup = conn.execute(
-                "SELECT id FROM crypto_transactions WHERE source=? AND external_id=?",
-                (source, external_id),
+                "SELECT id FROM crypto_transactions "
+                "WHERE owner_id=? AND source=? AND external_id=?",
+                (owner_id, source, external_id),
             ).fetchone()
             if dup:
                 logger.info(f"add_transaction: дубль {source}/{external_id} — пропуск")
@@ -487,6 +518,25 @@ def get_transaction(tx_id: int) -> Optional[Tx]:
             "SELECT * FROM crypto_transactions WHERE id = ?", (tx_id,),
         ).fetchone()
     return _tx_from_row(row) if row else None
+
+
+def find_duplicate(owner_id: int, source: str, external_id: str) -> Optional[int]:
+    """id уже существующей транзакции с тем же external_id или None.
+
+    Нужен там, где важно отличить «сохранено» от «дубль»: add_transaction
+    на дубле возвращает существующую запись, не бросая исключения, и
+    вызывающий код считал её новой — импорт рапортовал «сохранено 100»,
+    хотя в базе ничего не изменилось.
+    """
+    if not external_id or source == "manual":
+        return None
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id FROM crypto_transactions "
+            "WHERE owner_id=? AND source=? AND external_id=?",
+            (owner_id, source, external_id),
+        ).fetchone()
+    return int(row["id"]) if row else None
 
 
 def list_transactions(

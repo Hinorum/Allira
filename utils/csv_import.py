@@ -12,6 +12,14 @@
   (ts, asset_symbol, tx_type, amount, fiat_value_rub, cost_basis_rub, note)
 Затем эти записи передаются в add_transaction() с source='bybit' / 'okx'
 и external_id — защита от дублей уже встроена в crypto_db.
+
+ВАЖНО про валюту. Цена в выписке биржи — это quote-валюта пары (USDT, BTC и
+т.п.), а не рубли. Раньше qty*price писалось прямо в fiat_value_rub /
+cost_basis_rub, а эти поля во всём проекте считаются РУБЛЯМИ: покупка 0.5 BTC
+по 60000 USDT попадала в отчёт с себестоимостью 30 000 ₽ вместо ~2.4 млн ₽.
+Теперь парсер отдаёт quote_asset/quote_amount, как и API-путь, а перевод в
+рубли делает price_oracle — если котировки нет, сделка пишется без рублевой
+оценки и попадает в отчёт как «нет котировки», а не как неверное число.
 """
 
 from __future__ import annotations
@@ -21,6 +29,7 @@ import io
 import logging
 import time
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import IO, Iterable
 
 from utils.crypto_db import TxType
@@ -44,6 +53,9 @@ class ParsedRow:
     # (TRADE_IN/TRADE_OUT) и RUB-стоимость через price_oracle.
     quote_asset: str = ""
     quote_amount: str = ""
+    # Источник для add_transaction: bybit / okx / csv. Пусто — источник
+    # вызывающего (cex_sync).
+    source: str = ""
 
 
 # ----------------------------------------------------- распознавание
@@ -97,7 +109,7 @@ def _parse_bybit(body: Iterable[list[str]]) -> tuple[list[ParsedRow], list[str]]
         except Exception:
             errors.append(f"строка {i}: не парсится время {r[0]!r}")
             continue
-        symbol = _symbol_from_bybit(r[1])
+        symbol, quote = _split_bybit(r[1])
         if not symbol:
             errors.append(f"строка {i}: не парсится symbol {r[1]!r}")
             continue
@@ -106,32 +118,24 @@ def _parse_bybit(body: Iterable[list[str]]) -> tuple[list[ParsedRow], list[str]]
         price = _decimal_str(r[4])
         if not qty or float(qty) == 0:
             continue
+        quote_amount = _safe_mul(qty, price)
         if side == "buy":
-            tx_type = TxType.SPEND  # покупка: фиат уходит, крипта приходит
-            # В Bybit «buy» = купили актив за фиат. У нас это выглядит
-            # как «приход» актива (income) с cost_basis = qty*price.
-            # Направление income не даёт taxable income, но FIFO-лот
-            # открывает. С точки зрения крипто-учёта покупка — это
-            # arrival актива с известной себестоимостью.
-            # Реализация: отдельный псевдо-тип income_purchase?
-            # Проще использовать TRANSFER_IN + cost_basis — тогда отчёт
-            # 3-НДФЛ не покажет доход, а FIFO-лот откроется.
-            tx_type = TxType.TRANSFER_IN
-            cost_basis = str(_safe_mul(qty, price))
-            fiat_value = ""
+            # Покупка: цена в quote-валюте, поэтому рублёвую себестоимость
+            # не считаем здесь — её посчитает price_oracle по курсу на дату
+            # сделки (для стейблкоинов — курс ЦБ).
+            tx_type = TxType.BUY
         elif side == "sell":
             tx_type = TxType.SELL
-            cost_basis = ""
-            fiat_value = str(_safe_mul(qty, price))
         else:
             errors.append(f"строка {i}: неизвестный side {side!r}")
             continue
         rows.append(ParsedRow(
             ts=ts, asset=symbol, tx_type=tx_type,
-            amount=qty, fiat_value_rub=fiat_value,
-            cost_basis_rub=cost_basis,
+            amount=qty, fiat_value_rub="", cost_basis_rub="",
             note=f"bybit {side} {r[1]}",
             external_id=f"bybit:{ts}:{r[1]}:{side}:{qty}",
+            quote_asset=quote, quote_amount=quote_amount,
+            source="bybit",
         ))
     return rows, errors
 
@@ -151,7 +155,7 @@ def _parse_okx(body: Iterable[list[str]]) -> tuple[list[ParsedRow], list[str]]:
             except Exception:
                 errors.append(f"строка {i}: не парсится время {r[0]!r}")
                 continue
-        symbol = _symbol_from_okx(r[1])
+        symbol, quote = _split_okx(r[1])
         if not symbol:
             errors.append(f"строка {i}: не парсится instId {r[1]!r}")
             continue
@@ -160,23 +164,21 @@ def _parse_okx(body: Iterable[list[str]]) -> tuple[list[ParsedRow], list[str]]:
         price = _decimal_str(r[4])
         if not qty or float(qty) == 0:
             continue
+        quote_amount = _safe_mul(qty, price)
         if side == "buy":
-            tx_type = TxType.TRANSFER_IN
-            cost_basis = str(_safe_mul(qty, price))
-            fiat_value = ""
+            tx_type = TxType.BUY
         elif side == "sell":
             tx_type = TxType.SELL
-            cost_basis = ""
-            fiat_value = str(_safe_mul(qty, price))
         else:
             errors.append(f"строка {i}: неизвестный side {side!r}")
             continue
         rows.append(ParsedRow(
             ts=ts, asset=symbol, tx_type=tx_type,
-            amount=qty, fiat_value_rub=fiat_value,
-            cost_basis_rub=cost_basis,
+            amount=qty, fiat_value_rub="", cost_basis_rub="",
             note=f"okx {side} {r[1]}",
             external_id=f"okx:{ts}:{r[1]}:{side}:{qty}",
+            quote_asset=quote, quote_amount=quote_amount,
+            source="okx",
         ))
     return rows, errors
 
@@ -215,6 +217,7 @@ def _parse_internal(body: Iterable[list[str]]) -> tuple[list[ParsedRow], list[st
             amount=amount, fiat_value_rub=fiat,
             cost_basis_rub=cost, note=note,
             external_id=external_id,
+            source="csv",
         ))
     return rows, errors
 
@@ -224,20 +227,34 @@ def _parse_internal(body: Iterable[list[str]]) -> tuple[list[ParsedRow], list[st
 
 def _symbol_from_bybit(symbol: str) -> str:
     """BTCUSDT → BTC, ETHUSDT → ETH, TONUSDT → TON."""
+    base, _quote = _split_bybit(symbol)
+    return base
+
+
+def _split_bybit(symbol: str) -> tuple[str, str]:
+    """BTCUSDT → (BTC, USDT). Пустая quote — пара непонятна."""
     s = symbol.strip().upper()
     for quote in ("USDT", "USDC", "USD", "BTC", "ETH", "EUR", "TON"):
         if s.endswith(quote) and len(s) > len(quote):
-            return s[:-len(quote)]
-    return ""
+            return s[:-len(quote)], quote
+    return "", ""
 
 
 def _symbol_from_okx(inst_id: str) -> str:
     """BTC-USDT → BTC."""
+    base, _quote = _split_okx(inst_id)
+    return base
+
+
+def _split_okx(inst_id: str) -> tuple[str, str]:
+    """BTC-USDT → (BTC, USDT). У фьючеров BTC-USDT-SWAP — берём первые два."""
     s = inst_id.strip().upper()
-    if "-" in s:
-        base, _, _quote = s.partition("-")
-        return base
-    return ""
+    if "-" not in s:
+        return "", ""
+    parts = s.split("-")
+    if len(parts) < 2:
+        return "", ""
+    return parts[0], parts[1]
 
 
 def _decimal_str(value: str) -> str:
@@ -252,11 +269,19 @@ def _decimal_str(value: str) -> str:
     return s
 
 
-def _safe_mul(a: str, b: str) -> float:
+def _safe_mul(a: str, b: str) -> str:
+    """Произведение двух строк-чисел. Decimal, а не float.
+
+    float давал артефакты вида 0.1*3 = 0.30000000000000004, и это мусор
+    попадал в рублёвые поля транзакций — вплоть до отчёта для ФНС.
+    """
     try:
-        return float(a) * float(b)
-    except (TypeError, ValueError):
-        return 0.0
+        result = Decimal(a) * Decimal(b)
+    except (InvalidOperation, TypeError, ValueError):
+        return "0"
+    if result == result.to_integral_value():
+        return str(result.quantize(Decimal("1")))
+    return str(result.normalize())
 
 
 def _parse_bybit_ts(value: str) -> int:

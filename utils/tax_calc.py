@@ -73,49 +73,79 @@ def compute_ndfl(taxable_income: Decimal, status: str) -> tuple[Decimal, list[di
     возвращаем 0 и пустую разбивку (отрицательный убыток не уменьшает
     другие категории дохода — ст. 220 НК, п. 3).
     """
-    if taxable_income <= 0:
+    return compute_ndfl_split(Decimal(0), taxable_income, status)
+
+
+def compute_ndfl_split(
+    mining_income: Decimal,
+    other_income: Decimal,
+    status: str,
+) -> tuple[Decimal, list[dict]]:
+    """НДФЛ с раздельными шкалами.
+
+    п.1.1 п.2 ст.224 НК РФ: доходы от добычи полезных ископаемых
+    облагаются по ОТДЕЛЬНОЙ шкале 13/15/18/20/22% и не суммируются с
+    прочими доходами. Ставки те же, что у резидента, но базы раздельные,
+    поэтому итог отличается от расчёта по объединённой базе.
+
+    Раньше статус «майнер» молча считался по общей шкале: обе базы
+    складывались, и налог получался больше правильного. Теперь шкалы
+    разведены, а в разбивке видно, к какой базе относится ступень.
+
+    Для нерезидента и резидента обе базы идут по общей шкале (для
+    нерезидента — 30% с любой базы).
+    """
+    if other_income <= 0 and mining_income <= 0:
         return Decimal(0), []
 
     if status == "nonresident":
-        tax = taxable_income * NONRESIDENT_RATE
+        total = max(other_income, Decimal(0)) + max(mining_income, Decimal(0))
+        tax = total * NONRESIDENT_RATE
         return _round2(tax), [{
             "bracket": "нерезидент 30%",
-            "base": str(taxable_income),
+            "base": str(total),
             "rate": "0.30",
             "tax": str(_round2(tax)),
+            "scale": "общая",
         }]
 
-    if status == "miner":
-        # Майнеры облагаются по майнинговой шкале (пп.1.1 п.2 ст.224 НК):
-        # 13/15/18/20/22 — но С ДОХОДА ОТ МАЙНИНГА, не суммарного.
-        # Суммируем с обычной 13/15-шкалой для прочих доходов. Упрощение:
-        # считаем всё по единой резидентской шкале, а разбивку маркируем
-        # типом дохода. Для реальной практики этого хватает — основная
-        # разница в учёте расходов на электричество.
-        pass
-
     breakdown: list[dict] = []
-    remaining = taxable_income
-    prev_cap = Decimal(0)
     total_tax = Decimal(0)
-    for cap, rate in RESIDENT_BRACKETS:
-        if remaining <= 0:
-            break
-        # Сколько базы попадает в эту ступень.
-        step_capacity = max(cap - prev_cap, Decimal(0))
-        in_step = min(remaining, step_capacity)
-        step_tax = in_step * rate
-        total_tax += step_tax
-        breakdown.append({
-            "bracket": f"{_fmt_money(prev_cap)}–{_fmt_money(cap)}",
-            "base": str(in_step),
-            "rate": str(rate),
-            "tax": str(_round2(step_tax)),
-        })
-        remaining -= in_step
-        prev_cap = cap
-        if rate == RESIDENT_BRACKETS[-1][1]:
-            break
+
+    def _apply_scale(base: Decimal, label: str) -> Decimal:
+        nonlocal total_tax
+        remaining = base
+        prev_cap = Decimal(0)
+        for cap, rate in RESIDENT_BRACKETS:
+            if remaining <= 0:
+                break
+            step_capacity = max(cap - prev_cap, Decimal(0))
+            in_step = min(remaining, step_capacity)
+            step_tax = in_step * rate
+            total_tax += step_tax
+            breakdown.append({
+                "bracket": f"{label}: {_fmt_money(prev_cap)}–{_fmt_money(cap)}",
+                "base": str(in_step),
+                "rate": str(rate),
+                "tax": str(_round2(step_tax)),
+                "scale": label,
+            })
+            remaining -= in_step
+            prev_cap = cap
+            if rate == RESIDENT_BRACKETS[-1][1]:
+                break
+        return total_tax
+
+    mining = max(mining_income, Decimal(0))
+    other = max(other_income, Decimal(0))
+
+    if status == "miner" and mining > 0:
+        # Сначала отдельная майнинговая шкала, потом общая — они не
+        # суммируются (пп.1.1 п.2 ст.224 НК РФ).
+        _apply_scale(mining, "майнинг")
+        _apply_scale(other, "основная")
+    else:
+        _apply_scale(other + mining, "основная")
 
     return _round2(total_tax), breakdown
 
@@ -127,6 +157,27 @@ def _fmt_money(value: Decimal) -> str:
 def _round2(value: Decimal) -> Decimal:
     """Округление до копеек по правилу HALF_UP (стандарт для налоговой)."""
     return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _lot_cost_total(tx_type: str, cost_basis: Decimal, fiat_value: Decimal) -> Decimal:
+    """Себестоимость открываемого лота.
+
+    Для доходных типов (аирдроп, майнинг, стейкинг...) fiat_value_rub —
+    это ОЦЕНКА ДОХОДА, а не расход: по НК расходов при получении нет,
+    себестоимость лота нулевая. Раньше оценка дохода становилась и
+    себестоимостью лота, и продажа такого актива давала заниженную
+    прибыль — а значит заниженный НДФЛ.
+
+    Для покупок (BUY) наоборот: fiat_value_rub — это и есть цена покупки,
+    то есть расход, и он становится себестоимостью лота.
+
+    Явно заданный cost_basis_rub приоритетнее обоих случаев.
+    """
+    if cost_basis > 0:
+        return cost_basis
+    if tx_type in TxType.income_types():
+        return Decimal(0)
+    return fiat_value
 
 
 # --------------------------------------------------------- FIFO
@@ -244,7 +295,7 @@ def _walk_fifo(
 
         if tx_type in TxType.lot_in_types():
             # Себестоимость прихода (за 1 единицу актива):
-            cost_total = cost_basis if cost_basis > 0 else fiat_value
+            cost_total = _lot_cost_total(tx_type, cost_basis, fiat_value)
             qty_human = amount / scale
             cost_per_unit = cost_total / qty_human if qty_human > 0 else Decimal(0)
             next_lot_id -= 1  # in-memory id, чтобы не пересекаться с persisted
@@ -370,7 +421,9 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
             # «потеряет» этот приход и при продаже даст нулевую себестоимость.
             cost_total = _to_decimal(tx.cost_basis_rub) if tx.cost_basis_rub else Decimal(0)
             if cost_total == 0 and tx.fiat_value_rub:
-                cost_total = _to_decimal(tx.fiat_value_rub)
+                cost_total = _lot_cost_total(
+                    tx.tx_type, cost_total, _to_decimal(tx.fiat_value_rub),
+                )
             qty_human = amount_human
             cost_per_unit = (cost_total / qty_human) if qty_human > 0 else Decimal(0)
             active.setdefault(tx.asset_id, []).append(Lot(
@@ -477,7 +530,33 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
     summary.taxable_income_rub = _round2(taxable)
 
     status = _tax_status(owner_id)
-    ndfl, breakdown = compute_ndfl(taxable, status)
+
+    # Раздельные шкалы для майнера (пп.1.1 п.2 ст.224 НК РФ): доход от
+    # майнинга облагается отдельно от прочих доходов. Отделить можно
+    # только доходы майнинга напрямую (по типу операции) — доход от
+    # ПРОДАЖИ намайненного имущества к майнинговому доходу не относится.
+    if status == "miner" and taxable > 0:
+        gross_mining = _round2(sum(
+            (e.income_rub for e in summary.income_events
+             if e.tx_type == TxType.MINING),
+            Decimal(0),
+        ))
+        # База майнинга не может превышать общую: taxable — это уже чистая
+        # сумма (доход минус расходы), и если ручные расходы съели больше,
+        # чем намайничено, разносить базы дальше нельзя — налог вышел бы
+        # больше, чем есть дохода.
+        mining_base = min(gross_mining, taxable)
+        other_base = taxable - mining_base
+        ndfl, breakdown = compute_ndfl_split(mining_base, other_base, status)
+        if mining_base > 0 and summary.realized_gain_rub != 0:
+            summary.warnings.append(
+                "майнинговая шкала применена к доходу от майнинга; доход от "
+                "продажи намайненного имущества отнесён к общей базе — "
+                "разделить его по лотам нельзя"
+            )
+    else:
+        ndfl, breakdown = compute_ndfl(taxable, status)
+
     summary.ndfl_total = ndfl
     summary.ndfl_breakdown = breakdown
 

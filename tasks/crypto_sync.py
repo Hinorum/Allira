@@ -20,6 +20,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Optional
 
 from telegram.ext import Application
@@ -223,13 +224,24 @@ async def sync_jetton_transfers(wallet, api_key: str) -> int:
                 else:
                     tx_type = TxType.SWAP_OUT
 
+                # Сумма в минимальных единицах (Jetton отдаёт «нано»).
+                # add_transaction ждёт ЧЕЛОВЕЧЕСКОЕ количество и сам
+                # умножает его на 10**decimals. Раньше сюда передавался
+                # amount_int — то есть 1 TON записывался как 1 000 000 000 TON,
+                # а рублёвая оценка считалась по правильному числу. Итог:
+                # в отчёте для ФНС абсурдные количества при правдоподобных
+                # суммах, и вечный «расхват» в /reconcile.
+                human_amount = (Decimal(amount_int) / (Decimal(10) ** decimals))
+                human_amount_str = f"{human_amount:f}"
+
                 # Получить котировку для авто-цены (если возможно).
                 fiat = ""
                 try:
                     market = await get_asset_price_rub(symbol, ts)
                     if market:
-                        human_amount = amount_int / (10 ** decimals)
-                        fiat = str(round(human_amount * market, 2))
+                        fiat = str(round(
+                            human_amount * Decimal(str(market)), 2,
+                        ))
                 except Exception:
                     pass
 
@@ -250,7 +262,7 @@ async def sync_jetton_transfers(wallet, api_key: str) -> int:
                         wallet_id=wallet.id,
                         asset_symbol=symbol,
                         tx_type=tx_type,
-                        amount=str(amount_int),
+                        amount=human_amount_str,
                         fiat_value_rub=fiat or None,
                         note=(f"auto jetton-sync; "
                               f"op_hash={ev.get('event_id', '')[:20]}"),

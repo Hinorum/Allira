@@ -14,7 +14,9 @@ from telegram.ext import Application
 
 from utils.cex_api import (get_cex_watermark, set_cex_watermark,
                            sync_bybit_trades, sync_okx_trades)
-from utils.crypto_db import add_transaction, CryptoError, TxType
+from utils.crypto_db import (
+    add_transaction, find_duplicate, CryptoError, TxType,
+)
 from utils.price_oracle import get_asset_price_rub
 
 logger = logging.getLogger(__name__)
@@ -120,6 +122,17 @@ async def persist_cex_rows(owner_id: int, rows: list, exchange: str) -> tuple[in
         try:
             fiat = row.fiat_value_rub or ""
             cost = row.cost_basis_rub or ""
+            # Источник строки: CSV-импорт несёт свой (bybit/okx/csv), API —
+            # общий на биржу. Без этого импорт CSV помечался бы как
+            # источник биржи и дедупликация склеивала бы разные данные.
+            source = getattr(row, "source", "") or exchange
+
+            # Дубль проверяем ДО вставки: add_transaction на дубле
+            # возвращает существующую запись, не бросая исключения, и
+            # «сохранено» росло на каждый повторно импортированный ряд.
+            if find_duplicate(owner_id, source, row.external_id) is not None:
+                dups += 1
+                continue
 
             # RUB-оценка quote-ветки сделки — если она ещё не задана.
             if not fiat and not cost and getattr(row, "quote_asset", ""):
@@ -143,7 +156,7 @@ async def persist_cex_rows(owner_id: int, rows: list, exchange: str) -> tuple[in
                 fiat_value_rub=fiat or None,
                 cost_basis_rub=cost or None,
                 note=row.note,
-                source=exchange,
+                source=source,
                 external_id=row.external_id,
             )
             saved += 1
@@ -161,7 +174,7 @@ async def persist_cex_rows(owner_id: int, rows: list, exchange: str) -> tuple[in
                     tx_type=leg_type,
                     amount=quote_amount,
                     note=f"{row.note} [парная проводка quote: {quote_asset}]",
-                    source=exchange,
+                    source=source,
                     external_id=f"{row.external_id}:quote",
                 )
                 saved += 1

@@ -20,7 +20,7 @@ import asyncio
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from utils.crypto_db import (CryptoError, add_transaction, add_wallet,
@@ -74,15 +74,32 @@ def database_stats() -> dict:
 
 
 def jobs_status(application) -> list[dict]:
-    """Состояние фоновых задач PTB: имя, интервал, время до следующего запуска."""
+    """Состояние фоновых задач PTB: имя, интервал, время до следующего запуска.
+
+    Job.next_t в python-telegram-bot — это datetime, а не число. Раньше
+    тут стояло int(next_t), исключение падало на ПЕРВОМ же задании, и
+    весь список фоновых задач был пустым: в панели «нет задач», в
+    Telegram-меню «не запущены». Админ не мог увидеть, живы ли автосинк
+    бирж и сканер TON.
+    """
     out: list[dict] = []
     try:
         jq = application.job_queue
+        now = datetime.now(timezone.utc)
         for job in jq.jobs():
             next_t = getattr(job, "next_t", None)
+            seconds = None
+            if next_t is not None:
+                if isinstance(next_t, (int, float)):
+                    seconds = int(next_t)
+                else:
+                    moment = next_t
+                    if moment.tzinfo is None:
+                        moment = moment.replace(tzinfo=timezone.utc)
+                    seconds = int((moment - now).total_seconds())
             out.append({
                 "name": job.name,
-                "next_run_in_s": int(next_t) if next_t is not None else None,
+                "next_run_in_s": seconds,
             })
     except Exception as e:
         logger.warning(f"jobs_status: {e}")

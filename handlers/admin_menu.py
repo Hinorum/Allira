@@ -44,18 +44,32 @@ def _owner_id(context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def _is_owner_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Guard: отвечаем только владельцу (CREATOR_USER_IDS / @username)."""
+    """Guard: отвечаем только владельцу (CREATOR_USER_IDS / @username).
+
+    Проверка закрыта по умолчанию. Раньше при пустом CREATOR_USERNAME
+    (переменная задана, но пустая) любой аккаунт БЕЗ username проходил
+    проверку: `username != creator_username` давало «» != «» → False →
+    guard отдавал меню. Вместе с незаполненным CREATOR_USER_IDS это
+    означало, что админ-меню (кошельки, операции, настройки ФНС, запуск
+    синков) доставалось любому, у кого нет @username.
+    """
     if not update.effective_user:
         return False
     user_id = update.effective_user.id
     creator_ids = context.bot_data.get("CREATOR_USER_IDS") or ()
-    creator_username = (context.bot_data.get("CREATOR_USERNAME") or "").lstrip("@").lower()
-    username = (update.effective_user.username or "").lower()
-    if creator_ids and user_id not in creator_ids:
-        if update.message:
-            await update.message.reply_text("Команды доступны только владельцу бота.")
-        return False
-    if not creator_ids and username != creator_username:
+    creator_username = (context.bot_data.get("CREATOR_USERNAME") or "").lstrip("@").strip().lower()
+    username = (update.effective_user.username or "").strip().lower()
+
+    if creator_ids:
+        allowed = user_id in creator_ids
+    elif creator_username:
+        allowed = bool(username) and username == creator_username
+    else:
+        # Ни ID, ни username не заданы — владельца определить не по чему.
+        # Закрываем доступ, а не открываем его всем подряд.
+        allowed = False
+
+    if not allowed:
         if update.message:
             await update.message.reply_text("Команды доступны только владельцу бота.")
         return False
@@ -144,12 +158,34 @@ def _format_tx(owner_id: int) -> str:
     lines = ["<b>📒 Последние операции</b>"]
     for r in rows:
         arrow = "🟢" if r["direction"] == "in" else "🔴"
-        fiat = f" · {format_rub(float(r['fiat_rub']))}" if r["fiat_rub"] else ""
+        fiat = _rub_cell(r["fiat_rub"])
         lines.append(
             f"{arrow} {escape_html(r['date'])} {escape_html(r['type'])} "
             f"<b>{escape_html(r['asset'])}</b> {escape_html(r['qty'])}{fiat}"
         )
     return "\n".join(lines)
+
+
+def _rub_cell(raw) -> str:
+    """Рублевая сумма для показа. Не-число не должно ронять меню.
+
+    Поле в веб-панели — свободный текст: туда можно вписать «8 500»
+    с пробелом или «8500₽». Раньше float() на таком значении поднимал
+    ValueError, и список операций в /admin переставал открываться
+    совсем — до исправления самой строки в базе.
+    """
+    if not raw:
+        return ""
+    text = str(raw).strip()
+    try:
+        return f" · {format_rub(float(text))}"
+    except (TypeError, ValueError):
+        cleaned = text.replace(" ", "").replace(" ", "").replace("₽", "")
+        try:
+            return f" · {format_rub(float(cleaned))}"
+        except (TypeError, ValueError):
+            # Совсем не число — показываем как есть, но экранированным.
+            return f" · {escape_html(text)}"
 
 
 def _format_tax(owner_id: int) -> str:
@@ -223,7 +259,15 @@ async def admin_menu_callback(update: Update,
                               context: ContextTypes.DEFAULT_TYPE):
     """Callback-кнопки меню (prefix `adm:`)."""
     query = update.callback_query
-    if not query or not await _is_owner_chat(update, context):
+    if not query:
+        return
+    if not await _is_owner_chat(update, context):
+        # Отказ всё равно нужно подтвердить: иначе кнопка у чужого
+        # пользователя крутится до таймаута Telegram (секунд 60).
+        try:
+            await query.answer("Только владелец бота.", show_alert=True)
+        except Exception:
+            pass
         return
     await query.answer()
 
@@ -258,7 +302,13 @@ async def admin_menu_callback(update: Update,
         return
 
     if action == "wallet_toggle" and len(parts) > 2:
-        wallet_id = int(parts[2])
+        try:
+            wallet_id = int(parts[2])
+        except ValueError:
+            # Некорректный callback_data: раньше ValueError уходил в
+            # error_handler, и админ получал «Что-то сломалось».
+            await show("Некорректный кошелёк.", BACK_BUTTON)
+            return
         current = {w["id"]: w for w in bot_admin.wallets_ui(owner_id)}.get(wallet_id)
         if current is not None:
             bot_admin.set_wallet_active(owner_id, wallet_id,

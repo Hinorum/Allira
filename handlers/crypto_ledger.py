@@ -44,6 +44,7 @@ from utils.csv_import import parse_csv
 from utils.database import get_db
 from utils.price_oracle import format_rub, get_asset_price_rub
 from utils.tax_calc import rebuild_lots
+from tasks.cex_sync import persist_cex_rows
 
 logger = logging.getLogger(__name__)
 
@@ -722,35 +723,21 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     owner = _owner_id(context)
-    saved = 0
-    skipped = 0
+    # Импорт идёт через persist_cex_rows — тем же путём, что и API-синк.
+    # Раньше CSV-строки писались напрямую, и quote-сумма (USDT) попадала
+    # в рублёвые поля: покупка 0.5 BTC по 60000 USDT давала себестоимость
+    # 30 000 ₽ вместо ~2.4 млн ₽, и отчёт 3-НДФЛ был занижен в ~80 раз.
+    # Здесь quote переводится в рубли по курсу на дату сделки, а если
+    # котировки нет — сделка пишется без рублевой оценки и попадает в
+    # отчёт как «нет котировки», а не как неверное число.
+    saved, dups = await persist_cex_rows(owner, parsed, "csv")
+    skipped = dups
     fail = 0
-    for row in parsed:
-        try:
-            add_transaction(
-                owner_id=owner,
-                ts=row.ts,
-                asset_symbol=row.asset,
-                tx_type=row.tx_type,
-                amount=row.amount,
-                fiat_value_rub=row.fiat_value_rub or None,
-                cost_basis_rub=row.cost_basis_rub or None,
-                note=row.note,
-                source="csv",
-                external_id=row.external_id,
-            )
-            saved += 1
-        except CryptoError as e:
-            logger.info(f"/import: skip {row.external_id}: {e}")
-            skipped += 1
-        except Exception as e:
-            logger.error(f"/import: fail {row.external_id}: {e}", exc_info=True)
-            fail += 1
 
     msg_lines = [
         "<b>Импорт завершён:</b>",
         f"• распознано строк: {len(parsed)}",
-        f"• сохранено: {saved}",
+        f"• сохранено проводок: {saved}",
     ]
     if skipped:
         msg_lines.append(f"• пропущено (дубли/ошибки): {skipped}")

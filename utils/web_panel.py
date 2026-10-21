@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import hmac
 import threading
 import time
 import urllib.parse
@@ -57,15 +58,34 @@ def configure(config, application, start_time: float, token: str) -> None:
 
 
 def _authorized(handler) -> bool:
+    """Проверка токена: строгое равенство, а не вхождение подстроки.
+
+    Раньше было `_token in header` — «терпим Bearer-префикс» превратилось
+    в «терпим любую строку, содержащую токен»: заголовок
+    «xx<токен>yy» проходил проверку. Сравнение — через
+    hmac.compare_digest, чтобы не светить секрет по времени ответа.
+    """
     if not _token:
         return False
-    header = handler.headers.get("X-Admin-Token", "")
+    header = (handler.headers.get("X-Admin-Token") or "").strip()
     if header:
-        return _token in header  # терпим Bearer-префикс
+        if header.startswith("Bearer "):
+            header = header[len("Bearer "):].strip()
+        return hmac.compare_digest(header, _token)
     # Запасной вариант: query-параметр для отладки.
     query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query)
-    supplied = (query.get("token") or [""])[0]
-    return bool(supplied) and _token in supplied
+    supplied = (query.get("token") or [""])[0].strip()
+    return bool(supplied) and hmac.compare_digest(supplied, _token)
+
+
+def _clamp(value: int, low: int, high: int) -> int:
+    """Ограничить число диапазоном.
+
+    В SQLite отрицательный LIMIT означает «без ограничения»: запрос
+    ?limit=-1 отдавал всю таблицу транзакций одним куском — память и
+    время запроса росли вместе с базой.
+    """
+    return max(low, min(value, high))
 
 
 # ------------------------------------------------------------ диспетчер
@@ -78,6 +98,14 @@ def handle_get(handler) -> bool:
     parsed = urllib.parse.urlparse(handler.path)
     path = parsed.path.rstrip("/") or "/"
     if path == "/admin":
+        # Токен не задан — панель выключена (404, как и обещает докстринг):
+        # порт на Render виден всему интернету, и афишировать панель
+        # ровно тогда, когда её собирались скрыть, незачем.
+        # Страница отдаётся без токена: это пустая SPA-оболочка, всё
+        # содержимое — за /admin/api/*, а токен вводится в её форме.
+        if not _token:
+            handler._respond(404, "not found", "text/plain; charset=utf-8")
+            return True
         handler._respond(200, _page_html(), "text/html; charset=utf-8")
         return True
     if not path.startswith("/admin/api/"):
@@ -92,7 +120,7 @@ def handle_get(handler) -> bool:
         if api == "status":
             data = bot_admin.full_status(_application, _config, _start_time)
         elif api == "logs":
-            limit = int((query.get("limit") or ["150"])[0])
+            limit = _clamp(int((query.get("limit") or ["150"])[0]), 1, 400)
             level = (query.get("level") or [""])[0]
             data = {"lines": recent_logs(limit=limit, level=level)}
         elif api == "wallets":
@@ -100,8 +128,8 @@ def handle_get(handler) -> bool:
         elif api == "transactions":
             data = {"rows": bot_admin.transactions_ui(
                 _owner_id(),
-                limit=min(int((query.get("limit") or ["50"])[0]), 200),
-                offset=int((query.get("offset") or ["0"])[0]),
+                limit=_clamp(int((query.get("limit") or ["50"])[0]), 1, 200),
+                offset=_clamp(int((query.get("offset") or ["0"])[0]), 0, 10_000_000),
                 asset=(query.get("asset") or [""])[0],
                 tx_type=(query.get("type") or [""])[0],
             )}
@@ -143,9 +171,16 @@ def handle_post(handler) -> bool:
                 str(body.get("label") or ""),
             )
         elif api == "wallets/toggle":
+            # bool("false") — это True: клиент, присылающий булево
+            # строкой (curl, form-encoded), получал обратное тому, что
+            # просил. Разбираем значение явно.
+            active_raw = body.get("active", True)
+            if isinstance(active_raw, str):
+                active = active_raw.strip().lower() in ("1", "true", "yes", "on")
+            else:
+                active = bool(active_raw)
             ok = bot_admin.set_wallet_active(
-                _owner_id(), int(body.get("id") or 0),
-                bool(body.get("active", True)))
+                _owner_id(), int(body.get("id") or 0), active)
             data = {"ok": ok}
         elif api == "transactions":
             data = bot_admin.add_transaction_ui(
@@ -350,7 +385,7 @@ padding:12px;font-size:12px;max-height:60vh;overflow:auto;white-space:pre-wrap}
     <div class="row">
       <div><label>Актив</label><input id="f-asset" placeholder="BTC"></div>
       <div><label>Тип</label><select id="f-type"><option value="">все</option></select></div>
-      <div style="flex:0"><button class="btn ghost" onclick="loadTx()">Показать</button></div>
+      <div style="flex:0"><button class="btn ghost" onclick="loadTx(true)">Показать</button></div>
     </div>
     <table id="tx" style="margin-top:12px">
       <thead><tr><th>Дата</th><th>Тип</th><th>Актив</th><th>Кол-во</th>
@@ -474,7 +509,7 @@ const k=[
  ["Сообщений",((s.database||{}).counts||{}).messages],
 ];
 document.getElementById("kpis").innerHTML=k.map(x=>
-`<div class="kpi"><div class="v">${x[1]??"—"}</div><div class="l">${x[0]}</div></div>`).join("");
+`<div class="kpi"><div class="v">${esc(x[1]??"—")}</div><div class="l">${esc(x[0])}</div></div>`).join("");
 document.getElementById("jobs").querySelector("tbody").innerHTML=
 (s.jobs||[]).map(j=>`<tr><td class="mono">${esc(j.name)}</td><td>${
 j.next_run_in_s==null?"—":sec(j.next_run_in_s)}</td></tr>`).join("")||
@@ -499,14 +534,14 @@ async function loadCrypto(){
 try{
 const s=await api("/admin/api/status"), c=s.crypto||{};
 const bal=(c.balances||[]).map(b=>`<tr><td class=mono>${esc(b.symbol)}</td>
-<td>${b.qty}</td><td>${(+b.cost_rub).toLocaleString("ru-RU")}</td></tr>`).join("");
+<td>${esc(b.qty)}</td><td>${(+b.cost_rub).toLocaleString("ru-RU")}</td></tr>`).join("");
 document.querySelector("#bal tbody").innerHTML=bal||
 '<tr><td colspan=3 class=muted>нет остатков</td></tr>';
 const w=await api("/admin/api/wallets");
 document.querySelector("#wallets tbody").innerHTML=(w.wallets||[]).map(x=>
 `<tr><td>${esc(x.chain)}</td><td>${esc(x.label)}</td>
-<td class="mono">${esc(x.address.slice(0,14))}…</td><td>${x.tx_count}</td>
-<td><button class="btn ghost" onclick="toggleWallet(${x.id},${!x.active})">
+<td class="mono">${esc(x.address.slice(0,14))}…</td><td>${esc(x.tx_count)}</td>
+<td><button class="btn ghost" onclick="toggleWallet(${parseInt(x.id,10)||0},${!x.active})">
 ${x.active?"выключить":"включить"}</button></td></tr>`).join("")||
 '<tr><td colspan=5 class=muted>кошельков нет</td></tr>';
 }catch(e){toast(e.message,true);}
@@ -532,20 +567,22 @@ document.getElementById("a-type").innerHTML=opts;
 document.getElementById("f-type").innerHTML='<option value="">все</option>'+opts;
 }
 async function loadTx(reset){
+try{
 if(reset){txOffset=0;document.querySelector("#tx tbody").innerHTML="";}
 const f=document.getElementById("f-asset").value.trim();
 const t=document.getElementById("f-type").value;
 const d=await api(`/admin/api/transactions?limit=50&offset=${txOffset}`+
 `&asset=${encodeURIComponent(f)}&type=${encodeURIComponent(t)}`);
-const rows=(d.rows||[]).map(r=>`<tr><td class=mono>${r.date}</td>
-<td><span class="pill ${r.direction}">${r.type}</span></td>
-<td class=mono>${r.asset}</td><td>${r.qty}</td>
-<td>${r.fiat_rub||r.cost_rub||"—"}</td><td class=muted>${r.source}</td>
+const rows=(d.rows||[]).map(r=>`<tr><td class=mono>${esc(r.date)}</td>
+<td><span class="pill ${esc(r.direction)}">${esc(r.type)}</span></td>
+<td class=mono>${esc(r.asset)}</td><td>${esc(r.qty)}</td>
+<td>${esc(r.fiat_rub||r.cost_rub||"—")}</td><td class=muted>${esc(r.source)}</td>
 <td class="small muted">${esc(r.note)}</td>
-<td><button class="btn ghost" onclick="delTx(${r.id})">✕</button></td></tr>`).join("");
+<td><button class="btn ghost" onclick="delTx(${parseInt(r.id,10)||0})">✕</button></td></tr>`).join("");
 document.querySelector("#tx tbody").insertAdjacentHTML("beforeend",rows||
 (reset?'<tr><td colspan=8 class=muted>нет операций</td></tr>':""));
 txOffset+=(d.rows||[]).length;
+}catch(e){toast("Операции: "+e.message,true);}
 }
 function moreTx(){loadTx(false);}
 async function addTx(){

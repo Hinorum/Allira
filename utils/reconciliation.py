@@ -304,7 +304,15 @@ def compute_balances(owner_id: int, up_to_ts: Optional[int] = None) -> list[Bala
         amount_raw = _to_decimal(r["amount_raw"])
         amount = amount_raw / scale  # human-единицы
         tx_type = r["tx_type"]
-        cost_total = _to_decimal(r["cost_basis_rub"] or r["fiat_value_rub"] or 0)
+        # Себестоимость лота — по тем же правилам, что и в tax_calc:
+        # явная cost_basis_rub приоритетна; для доходных типов
+        # (аирдроп, майнинг...) fiat_value_rub — это оценка ДОХОДА, а не
+        # расход, и себестоимостью не становится. Раньше строка "0" в
+        # cost_basis_rub перебивала fiat_value_rub (строка "0" истинна),
+        # и одна и та же операция в сверке и в отчёте считалась по-разному.
+        cost_total = _to_decimal(r["cost_basis_rub"] or 0)
+        if cost_total <= 0 and tx_type not in TxType.income_types():
+            cost_total = _to_decimal(r["fiat_value_rub"] or 0)
 
         if tx_type in TxType.lot_in_types():
             qty_map[symbol] = qty_map.get(symbol, Decimal(0)) + amount
