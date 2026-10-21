@@ -251,10 +251,15 @@ async def get_llm_response(
     history: list[dict] | None = None,
     images: list[str] | None = None,
     on_queue=None,
+    json_mode: bool = False,
 ) -> str:
     # Разделитель вынесен в переменную: обратный слэш внутри f-string запрещён
     # на Python 3.11, а на Render зафиксирован именно 3.11.11.
-    cache_key = f"{model}:{uuid.uuid5(uuid.NAMESPACE_DNS, _cache_source(user_prompt, system_prompt))}"
+    # json_mode — часть ключа: ответ в JSON-режиме нельзя отдать как текст.
+    cache_key = (
+        f"{model}:{'json' if json_mode else 'text'}:"
+        f"{uuid.uuid5(uuid.NAMESPACE_DNS, _cache_source(user_prompt, system_prompt))}"
+    )
 
     # Кэш только для запросов без истории и без картинок: ключ строится по
     # тексту, а с изображениями одинаковый текст даёт разные ответы.
@@ -304,6 +309,11 @@ async def get_llm_response(
         "temperature": 0.8,
         "max_tokens": 1500
     }
+    if json_mode:
+        # Разбор структурированных данных (список операций из свободного
+        # текста). Модель обязана ответить чистым JSON без пояснений.
+        payload["response_format"] = {"type": "json_object"}
+        payload["temperature"] = 0.1
 
     def _extract_content(data: dict) -> str | None:
         choices = data.get("choices")

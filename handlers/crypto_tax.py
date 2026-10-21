@@ -24,7 +24,7 @@ import time
 from datetime import datetime
 
 from telegram import InputFile, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ContextTypes
+from telegram.ext import ApplicationHandlerStop, ContextTypes
 
 from utils.common import escape_html
 from utils.crypto_db import get_tax_settings, set_tax_settings
@@ -130,6 +130,126 @@ async def tax_setup_status_command(update: Update, context: ContextTypes.DEFAULT
     await _send_tax_status(update, context)
 
 
+# ------------------------------- форма настройки ФНС (по шагам)
+
+SETUP_KEY = "tax_setup_wizard"
+
+SETUP_STATUSES = [
+    ("resident", "🇷🇺 Резидент"),
+    ("miner", "⛏ Майнер"),
+    ("nonresident", "🌍 Нерезидент"),
+]
+
+
+def _setup_state(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    state = context.user_data.get(SETUP_KEY)
+    if not isinstance(state, dict):
+        state = {}
+        context.user_data[SETUP_KEY] = state
+    return state
+
+
+async def start_tax_setup_wizard(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Пошаговая форма: ИНН → ФИО → статус.
+
+    Раньше настройка требовала синтаксиса `ИНН=… ИМЯ=… СТАТУС=…`, который
+    надо было помнить и не опечатать. Теперь это три вопроса подряд.
+    """
+    state = _setup_state(context)
+    state.clear()
+    state["step"] = "inn"
+    state["owner"] = _owner_id(context)
+    await message.reply_text(
+        "🧾 <b>Настройка отчёта 3-НДФЛ</b>\n\n"
+        "Напиши ИНН — 12 цифр. Он печатается в шапке отчёта.",
+        parse_mode="HTML",
+    )
+
+
+async def tax_setup_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Текстовый ввод в форме настройки."""
+    state = context.user_data.get(SETUP_KEY)
+    if not isinstance(state, dict) or not state.get("step"):
+        return
+    message = getattr(update, "message", None)
+    if message is None:
+        return
+    text = ((getattr(message, "text", None) or "").strip())
+    if not text:
+        return
+
+    step = state.get("step")
+    if step == "inn":
+        digits = "".join(ch for ch in text if ch.isdigit())
+        if len(digits) != 12:
+            await message.reply_text(
+                "ИНН — это 12 цифр. Проверь и пришли ещё раз."
+            )
+            raise ApplicationHandlerStop
+        state["inn"] = digits
+        state["step"] = "name"
+        await message.reply_text(
+            "ИНН принят. Теперь ФИО плательщика — как в налоговой декларации.",
+            parse_mode="HTML",
+        )
+        raise ApplicationHandlerStop
+
+    if step == "name":
+        state["name"] = text[:120]
+        state["step"] = "status"
+        await message.reply_text(
+            "ФИО принято. Остался статус налогоплательщика:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(label, callback_data=f"taxsetup:status:{value}")]
+                for value, label in SETUP_STATUSES
+            ]),
+        )
+        raise ApplicationHandlerStop
+
+    raise ApplicationHandlerStop
+
+
+async def tax_setup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Кнопки формы настройки."""
+    query = update.callback_query
+    if not query or not (query.data or "").startswith("taxsetup:"):
+        return False
+    action = (query.data or "")[9:]
+
+    if action == "start":
+        await query.answer()
+        await start_tax_setup_wizard(query.message, context)
+        return True
+
+    if action.startswith("status:"):
+        value = action[7:]
+        state = _setup_state(context)
+        owner = state.get("owner") or _owner_id(context)
+        payload = {}
+        if state.get("inn"):
+            payload["taxpayer_inn"] = state["inn"]
+        if state.get("name"):
+            payload["taxpayer_name"] = state["name"]
+        if value in {v for v, _ in SETUP_STATUSES}:
+            payload["tax_status"] = value
+        if payload:
+            set_tax_settings(owner, **payload)
+        context.user_data.pop(SETUP_KEY, None)
+        await query.answer("Готово")
+        settings = get_tax_settings(owner)
+        await query.message.reply_text(
+            "✅ <b>Настройки сохранены</b>\n\n"
+            f"ИНН: <code>{escape_html(settings.get('taxpayer_inn') or '—')}</code>\n"
+            f"Плательщик: <code>{escape_html(settings.get('taxpayer_name') or '—')}</code>\n"
+            f"Статус: <b>{escape_html(settings.get('tax_status') or 'resident')}</b>\n\n"
+            f"Теперь отчёт: <code>/tax</code>",
+            parse_mode="HTML",
+        )
+        return True
+
+    return True
+
+
 # --------------------------------------------------------- /tax
 
 
@@ -140,12 +260,41 @@ async def tax_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
     year = int(args[0]) if args and args[0].isdigit() else datetime.now().year
     owner = _owner_id(context)
+    settings = get_tax_settings(owner)
+
+    # Без ИНН и ФИО отчёт для ФНС неполон. Не молчим: прямо говорим, чего
+    # не хватает, и даём кнопку — до настройки был отдельный заход через
+    # /tax_setup с синтаксисом ИНН=… ИМЯ=…, о котором надо было помнить.
+    if not (settings.get("taxpayer_inn") and settings.get("taxpayer_name")):
+        await update.message.reply_text(
+            "⚠️ <b>Для отчёта не хватает данных</b>\n\n"
+            f"ИНН: {escape_html(settings.get('taxpayer_inn') or '—')}\n"
+            f"Плательщик: {escape_html(settings.get('taxpayer_name') or '—')}\n\n"
+            "Заполни — и отчёт будет готов к подаче. Считаю за это время.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✍️ Заполнить ИНН и ФИО",
+                                      callback_data="taxsetup:start")],
+            ]),
+        )
 
     await update.message.reply_text(
         f"Считаю отчёт за {year}… Это занимает до минуты."
     )
+    await _send_tax_summary(update.message.chat_id, context, year)
+
+
+async def _send_tax_summary(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
+                             year: int) -> None:
+    """Считает сводку за год и отправляет её с кнопками экспорта."""
+    owner = _owner_id(context)
     summary = await compute_year_report(owner, year)
     cache_report(owner, summary)
+
+    current_year = datetime.now().year
+    years = [current_year]
+    if current_year - 1 not in years:
+        years.append(current_year - 1)
 
     keyboard = InlineKeyboardMarkup([
         [
@@ -155,6 +304,14 @@ async def tax_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton("CSV доходы", callback_data=f"taxcsvi:{year}"),
             InlineKeyboardButton("CSV реализация", callback_data=f"taxcsvs:{year}"),
+        ],
+        [
+            InlineKeyboardButton("⚖️ Сверить с сетью",
+                                 callback_data=f"taxrecon:{year}"),
+        ],
+        [
+            InlineKeyboardButton(f"📅 {years[0]}", callback_data=f"taxyear:{years[0]}"),
+            InlineKeyboardButton(f"📅 {years[1]}", callback_data=f"taxyear:{years[1]}"),
         ],
     ])
 
@@ -167,6 +324,12 @@ async def tax_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>НДФЛ к уплате:</b> <b>{format_rub(float(summary.ndfl_total))}</b>\n\n"
         f"Доходов: {len(summary.income_events)} | Реализаций: {len(summary.disposal_events)}\n"
     )
+    if not summary.income_events and not summary.disposal_events:
+        text += (
+            "\n<i>Операций за этот год нет. Записать первую: "
+            "<code>/addtx</code> — или пришли список операций обычным "
+            "текстом, я разберу его сам.</i>\n"
+        )
     if summary.warnings:
         text += "\n<b>Замечания:</b>\n"
         for w in summary.warnings[:8]:
@@ -174,14 +337,15 @@ async def tax_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(summary.warnings) > 8:
             text += f"…и ещё {len(summary.warnings) - 8}\n"
 
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML",
+                                   reply_markup=keyboard)
 
 
 # --------------------------------------------------------- экспорт
 
 
 async def tax_export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback от /tax — выгрузка PDF/XLSX/CSV в чат."""
+    """Callback от /tax — выгрузка PDF/XLSX/CSV, смена года, сверка."""
     query = update.callback_query
     await query.answer()
     if not query.data or ":" not in query.data:
@@ -192,6 +356,27 @@ async def tax_export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     except ValueError:
         return
     owner = _owner_id(context)
+
+    # Смена года — пересчитываем сводку, не пересобирая PDF.
+    if kind == "taxyear":
+        await _send_tax_summary(query.message.chat_id, context, year_int)
+        return
+
+    # Сверка с сетью прямо из отчёта: раньше до неё надо было доходить
+    # отдельной командой, и шаг «а не разошёлся ли учёт» часто
+    # пропускали.
+    if kind == "taxrecon":
+        await query.message.reply_text(
+            f"Сверяю дебет-кредит за {year_int}… Загружаю балансы сети и бирж."
+        )
+        from handlers.reconcile_command import _format_report
+        from utils.reconciliation import reconcile
+
+        config = context.bot_data.get("BOT_CONFIG")
+        report = await reconcile(owner, year_int, config=config, with_actual=True)
+        await query.message.reply_text(_format_report(report), parse_mode="HTML")
+        return
+
     summary = await compute_year_report(owner, year_int)
     settings = get_tax_settings(owner)
 

@@ -45,6 +45,9 @@ from utils.database import get_db
 from utils.price_oracle import format_rub, get_asset_price_rub
 from utils.tax_calc import rebuild_lots
 from tasks.cex_sync import persist_cex_rows
+from handlers.tx_wizard import (
+    normalize_type, start_bulk_flow, start_wizard,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +227,12 @@ async def wallet_del_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def addtx_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """`/addtx <type> <asset> <amount> [date] [price_rub] [note...]`"""
+    """`/addtx <type> <asset> <amount> [date] [price_rub] [note...]`
+
+    Без аргументов — пошаговая форма. Если первый аргумент не похож на
+    тип операции — бот предлагает разобрать свободный текст как список
+    операций: десять записей одной командой вместо десяти команд.
+    """
     if not await _is_owner_chat(update, context):
         return
     args = context.args or []
@@ -244,11 +252,25 @@ async def addtx_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>/addtx sell BTC 0.3 20.06.2025 2500000</code>\n"
         "<code>/addtx mining TON 12 01.02.2025 3000 майнинг</code>"
     )
+
+    if not args:
+        # Ничего не передали — ведём по шагам, без синтаксиса.
+        await start_wizard(update, context)
+        return
+
+    first = args[0].strip().lower()
+    if normalize_type(first) is None:
+        # Это не тип операции: значит, пользователь описал операции
+        # словами. Предлагаем разобрать список.
+        await start_bulk_flow(update, context, " ".join(args))
+        return
+
     if len(args) < 3:
         await update.message.reply_text(usage, parse_mode="HTML")
         return
     tx_type = args[0].strip().lower()
     asset = args[1].strip().upper()
+
     try:
         amount = Decimal(args[2].replace(",", "."))
     except InvalidOperation:

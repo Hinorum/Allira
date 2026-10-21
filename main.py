@@ -71,7 +71,9 @@ from handlers.crypto_tax import (
     tax_setup_command, tax_setup_status_command,
     tax_command, tax_export_callback,
     tax_pdf_command, tax_xlsx_command, tax_csv_command,
+    tax_setup_callback, tax_setup_text_handler,
 )
+from handlers.tx_wizard import bulk_callback, wizard_callback, wizard_text_handler
 from handlers.cex_command import cex_status_command, cex_sync_command
 from handlers.reconcile_command import reconcile_command, reconcile_xlsx_command
 from handlers.admin_menu import admin_command, admin_menu_callback
@@ -752,10 +754,20 @@ def build_application() -> Application:
         set_tournament_mode, pattern="^set_tournament_mode:"
     ))
     application.add_handler(CallbackQueryHandler(
-        tax_export_callback, pattern="^tax(pdf|xlsx|csvi|csvs):"
+        tax_export_callback, pattern="^tax(pdf|xlsx|csvi|csvs|recon|year):"
     ))
     application.add_handler(CallbackQueryHandler(
         tx_action_callback, pattern="^tx(set|del):"
+    ))
+    # Мастер записи операций: кнопки и пошаговая форма.
+    application.add_handler(CallbackQueryHandler(
+        wizard_callback, pattern=r"^wiz:(?!bulk_)"
+    ))
+    application.add_handler(CallbackQueryHandler(
+        bulk_callback, pattern=r"^wiz:bulk_"
+    ))
+    application.add_handler(CallbackQueryHandler(
+        tax_setup_callback, pattern=r"^taxsetup:"
     ))
 
     application.add_handler(InlineQueryHandler(handle_inline_query))
@@ -766,6 +778,19 @@ def build_application() -> Application:
     # стикеры, файлы). COMMAND отсекает только текстовые команды — у подписей
     # свои caption_entities, но команды в подписи никто не шлёт.
     content = (filters.TEXT | filters.CAPTION | filters.ATTACHMENT) & ~filters.COMMAND
+
+    # Мастера (запись операции, настройка ФНС) перехватывают обычный текст
+    # до того, как он уйдёт в ИИ-чат. Группы -2 и -1 — раньше основной:
+    # в одной группе срабатывает только первый подходящий обработчик, а
+    # мастера два и оба должны получить шанс.
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        wizard_text_handler,
+    ), group=-2)
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        tax_setup_text_handler,
+    ), group=-1)
 
     if config.news_channel_id:
         application.add_handler(MessageHandler(
