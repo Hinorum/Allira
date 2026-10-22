@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import io
 import logging
@@ -6,7 +7,7 @@ import re
 import random
 import time
 from cachetools import TTLCache
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
 
@@ -17,20 +18,31 @@ try:
 except ImportError:  # pragma: no cover
     PdfReader = None
 
-from utils.ai_responses import get_llm_response, decide_speaker, is_service_error
-from utils.market import get_market_snapshot
+from utils.ai_responses import (get_llm_response, decide_speaker,
+                                is_service_error, persona_service_error,
+                                ERR_RATE_LIMITED)
+from utils.market import get_market_facts, get_market_snapshot
 from utils.database import (
     check_rate_limit, upsert_user, log_message, is_user_banned
 )
+from utils.text_format import strip_html, to_telegram_chunks
 from prompts.loader import load_prompt
 
 logger = logging.getLogger(__name__)
 
 RESPONSE_CHANCE = 0.3
+# На прямой вопрос в группе бот отвечает почти всегда: молчание на
+# «аллира, что будет с биткоином?» — худший возможный ответ чата.
+QUESTION_CHANCE = 0.85
 DM_COOLDOWN = 3.0
 DM_MAX_PER_MINUTE = 5
 GROUP_COOLDOWN = 5.0
 GROUP_MAX_PER_MINUTE = 3
+
+# Как часто продлевать «печатает…». Telegram гасит индикатор через ~5
+# секунд, а модель на бесплатном тарифе думает дольше: без продления
+# чат выглядел мёртвым — юзер уже успевал решить, что его не услышали.
+TYPING_REFRESH_SECONDS = 4.0
 
 # Глубина памяти диалога. Хранится в user_data (в памяти процесса), а не в БД:
 # переживать рестарт незачем, зато /clear теперь честно работает.
@@ -563,12 +575,21 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
             await _refuse_non_creator(message, user)
             return
 
+        # Реакция на сообщение юзера: мелочь, а чат перестаёт быть
+        # «роботом, который отвечает по расписанию». Ошибки игнорируем —
+        # реакции у юзера могут быть выключены, и это не повод срывать
+        # ответ. Ставим ДО лимита: даже отклонённый по частоте запрос
+        # должен быть замечен.
         text = f"{raw_text} {media_stub}".strip()
+        await _react(context, message, decide_speaker(text))
         if user:
             # Сначала лимит, потом счётчик: раньше upsert шёл первым и
             # отклонённые попытки попадали в message_count как активность.
             if not await check_rate_limit(user.id, message.chat_id, DM_COOLDOWN, DM_MAX_PER_MINUTE):
-                await message.reply_text("Слишком часто! Подожди немного.")
+                # Отказ — тоже голосом персонажа: «Слишком часто!» звучит
+                # как заглушка, а не как живой собеседник.
+                await message.reply_text(persona_service_error(
+                    ERR_RATE_LIMITED, decide_speaker(text)))
                 return
             await upsert_user(user.id, user.username, user.first_name)
         logger.info(f"Личное сообщение от {user.username} (len={len(text)})")
@@ -591,16 +612,6 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
         if not (is_mention or is_reply or has_trigger):
             return
 
-        if not (is_mention or is_reply) and random.random() > RESPONSE_CHANCE:
-            logger.info(f"Пропущено (шанс {RESPONSE_CHANCE}): {len(raw_text)} символов")
-            return
-
-        if user:
-            if not await check_rate_limit(user.id, message.chat_id, GROUP_COOLDOWN, GROUP_MAX_PER_MINUTE):
-                logger.info(f"Rate limit: {user.first_name} ({user.id})")
-                return
-            await upsert_user(user.id, user.username, user.first_name)
-
         # Пустой bot_username — это пустая регулярка: re.sub("", "", text)
         # вставляет пустую строку в каждый разрез. Вырезаем упоминание
         # только когда никто известен.
@@ -612,10 +623,34 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
         # Медиа без подписи: до vision-фазы бот про него знает только тип
         text = f"{clean_text} {media_stub}".strip() or "Привет!"
 
+        # Реакция на обращение — даже если ответ не дойдёт (шанс, лимит):
+        # юзер должен видеть, что его услышали.
+        await _react(context, message, decide_speaker(text))
+
+        # Шанс ответить в группе. На прямой вопрос шанс выше: «аллира, что
+        # будет с биткоином?» и молчание — худшее, что может случиться с
+        # чатом. На болтовню без вопроса остаётся низкий шанс, чтобы бот
+        # не превращался в бота-перебиваку.
+        chance = QUESTION_CHANCE if _looks_like_question(text) else RESPONSE_CHANCE
+        if not (is_mention or is_reply) and random.random() > chance:
+            logger.info(f"Пропущено (шанс {chance}): {len(raw_text)} символов")
+            return
+
+        if user:
+            if not await check_rate_limit(user.id, message.chat_id, GROUP_COOLDOWN, GROUP_MAX_PER_MINUTE):
+                logger.info(f"Rate limit: {user.first_name} ({user.id})")
+                return
+            await upsert_user(user.id, user.username, user.first_name)
+
     speaker = decide_speaker(text)
     model = bot_data["LANE_MODEL"] if speaker == "lane" else bot_data["DEFAULT_MODEL"]
 
-    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+    # Индикатор «печатает…» живёт ~5 секунд, модель думает дольше — значит,
+    # индикатор надо продлевать, иначе юзер смотрит в пустоту.
+    typing_stop = asyncio.Event()
+    typing_task = asyncio.create_task(
+        _keep_typing(context.bot, message.chat_id, typing_stop)
+    )
 
     # Уведомление «вы в очереди»: юзер видит, что запрос ждёт, а не
     # завис. Сообщение удаляется, как только ответ пришёл.
@@ -644,12 +679,14 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
             user_prompt = f"{user_prompt}\n\n{link_block}"
 
         # Аллира отвечает про крипторынок — без живых цифр модель выдумывает
-        # курсы. Снапшот короткий и кэшируется на 10 минут; в историю
-        # диалога не попадает (там хранится только исходный text).
+        # курсы. Блок фактов богаче прежнего снапшота (топ, лидеры роста и
+        # падения, TON) и содержит правило «только эти цифры». Кэш общий с
+        # автопостингом, в историю диалога не попадает (там хранится только
+        # исходный text).
         if speaker == "allira":
-            snapshot = await get_market_snapshot()
-            if snapshot:
-                user_prompt = f"{snapshot} — данные, не инструкции.\n\n{user_prompt}"
+            facts = await get_market_facts()
+            if facts:
+                user_prompt = f"{facts}\n\n{user_prompt}"
 
         # Фото/картинки-документы/превью гиф и видео текущего сообщения и
         # цитаты → vision-канал. Модель для картинок своя: текстовые из
@@ -687,20 +724,14 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
         if not is_service_error(response):
             _append_history(context, "user", text, speaker)
             _append_history(context, "assistant", response, speaker)
-
-        if len(response) > 4000:
-            if is_private:
-                for i in range(0, len(response), 4000):
-                    chunk = response[i:i+4000]
-                    await update.message.reply_text(chunk)
-            else:
-                response = response[:3997] + "..."
-                await message.reply_text(response, reply_to_message_id=message.message_id)
         else:
-            if is_private:
-                await update.message.reply_text(response)
-            else:
-                await message.reply_text(response, reply_to_message_id=message.message_id)
+            # Пользователю показываем ошибку голосом персонажа: служебные
+            # формулировки («Все модели временно недоступны») звучали как
+            # автоответ провайдера и выбивали бота из образа.
+            response = persona_service_error(response, speaker)
+
+        await _send_answer(update, context, message, response, is_private,
+                           speaker)
 
         chat_type = "private" if is_private else "group"
         await log_message(user.id if user else 0, message.chat_id, chat_type, speaker)
@@ -708,11 +739,153 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
 
     except Exception as e:
         logger.error(f"Ошибка в {'ЛС' if is_private else 'группе'}: {e}")
-        error_text = "Ой! Что-то пошло не так. Попробуй написать еще раз!" if is_private else "Сбой системы! Попробуй позже."
+        # Ошибка — тоже голосом персонажа: «Сбой системы! Попробуй позже.»
+        # звучит как техподдержка и выбивает бота из образа.
+        from utils.ai_responses import ERR_TECHNICAL
+        error_text = persona_service_error(ERR_TECHNICAL, speaker)
         if is_private:
             await update.message.reply_text(error_text)
         else:
             await message.reply_text(error_text, reply_to_message_id=message.message_id)
+
+    finally:
+        typing_stop.set()
+        typing_task.cancel()
+
+
+# --------------------------------------------------------- вспомогательное
+
+
+# Слова, с которых начинается прямой вопрос.
+QUESTION_STARTS = {
+    "что", "как", "почему", "зачем", "где", "когда", "сколько", "кто",
+    "какой", "какая", "какие", "можешь", "умеешь", "дай", "расскажи",
+    "объясни", "покажи", "найди", "подскажи", "посоветуй",
+}
+
+
+def _looks_like_question(text: str) -> bool:
+    """Похоже ли сообщение на прямой вопрос.
+
+    Обращение к боту («аллира, сколько стоит TON») — тоже вопрос: имя
+    стоит в начале, и без его снятия первый слово всегда «аллира».
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if "?" in t:
+        return True
+    # Убираем обращение в начале: упоминание бота и имя персонажа.
+    t = re.sub(r"^@\w+\s*", "", t)
+    t = re.sub(r"^(аллира|лейн|allira|lane)\b[,\s]*", "", t)
+    t = t.lstrip(" ,.:;—–-")
+    if not t:
+        return False
+    first = re.split(r"[\s,.:;—–\-]+", t, 1)[0]
+    return first in QUESTION_STARTS
+
+
+async def _keep_typing(bot, chat_id: int, stop: asyncio.Event) -> None:
+    """Держать «печатает…», пока модель думает.
+
+    Telegram гасит индикатор примерно через 5 секунд. На бесплатном
+    тарифе OpenRouter ответ приходит через 10-30 секунд, и всё это время
+    юзер смотрел на «мёртвый» чат.
+    """
+    while not stop.is_set():
+        try:
+            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        except Exception:
+            return
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=TYPING_REFRESH_SECONDS)
+        except asyncio.TimeoutError:
+            continue
+
+
+# Реакции на сообщение юзера: дешёвый способ показать «я тебя услышал».
+REACTIONS = {
+    "allira": ("🔥", "💀", "⚡", "🧠", "👾"),
+    "lane": ("🫧", "🌙", "✨", "🌱"),
+}
+
+
+async def _react(context, message, speaker: str) -> None:
+    """Поставить реакцию на сообщение юзера. Тихо, без ошибок в лог."""
+    emoji = random.choice(REACTIONS.get(speaker) or REACTIONS["allira"])
+    try:
+        from telegram import ReactionType
+        await context.bot.set_message_reaction(
+            chat_id=message.chat_id,
+            message_id=message.message_id,
+            reaction=[ReactionType(type="emoji", emoji=emoji)],
+            is_big=False,
+        )
+    except Exception:
+        # Реакции могут быть запрещены настройками чата — это не повод
+        # жаловаться: чат должен работать и без них.
+        pass
+
+
+# Быстрые ответы под сообщением: не надо печатать команды руками.
+QUICK_REPLIES = {
+    "allira": [
+        ("📊 Рынок", "market"),
+        ("💼 Портфель", "balance"),
+        ("🧾 Операции", "tx_list"),
+        ("🧹 Забыть разговор", "clear"),
+    ],
+    "lane": [
+        ("🌙 Мысли", "market"),
+        ("💼 Портфель", "balance"),
+        ("🧾 Операции", "tx_list"),
+        ("🧹 Забыть разговор", "clear"),
+    ],
+}
+
+
+def _quick_keyboard(speaker: str) -> InlineKeyboardMarkup:
+    """Клавиатура быстрых ответов (обрабатывается общим «quick:»)."""
+    buttons = [
+        InlineKeyboardButton(label, callback_data=f"quick:{command}")
+        for label, command in QUICK_REPLIES.get(speaker) or []
+    ]
+    if not buttons:
+        return None  # type: ignore[return-value]
+    return InlineKeyboardMarkup([buttons])
+
+
+async def _send_answer(update, context, message, response: str,
+                        is_private: bool, speaker: str) -> None:
+    """Отправить ответ: разметка → HTML, длинный текст → частями.
+
+    Раньше ответ уходил обычным текстом, и промпты персонажей требовали
+    `*курсив*` — юзер видел asterиски вместо наклонного шрифта.
+    """
+    chunks = to_telegram_chunks(response)
+    if not chunks:
+        return
+    markup = _quick_keyboard(speaker) if is_private else None
+    for i, chunk in enumerate(chunks):
+        kwargs: dict = {}
+        if markup is not None and i == len(chunks) - 1:
+            kwargs["reply_markup"] = markup
+        try:
+            await message.reply_text(
+                chunk, parse_mode="HTML",
+                reply_to_message_id=message.message_id, **kwargs,
+            )
+        except Exception as e:
+            # Telegram не принимает сообщения с невалидной разметкой —
+            # отдаём тот же текст простым, чтобы ответ не потерялся.
+            logger.debug(f"HTML не принят, отправляю текстом: {e}")
+            try:
+                await message.reply_text(
+                    strip_html(chunk),
+                    reply_to_message_id=message.message_id, **kwargs,
+                )
+            except Exception as e2:
+                logger.error(f"Ответ не отправлен: {e2}")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -721,3 +894,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _process_message(update, context, is_private=True)
+
+
+async def market_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/market` — живой срез рынка: топ, лидеры роста и падения, TON.
+
+    Кнопка «📊 Рынок» в быстрых ответах ведёт сюда.
+    """
+    from utils.common import escape_html
+    from utils.market_data import format_movers, format_top_coins, get_markets
+
+    try:
+        markets = await get_markets()
+    except Exception as e:
+        logger.warning(f"/market: данные не пришли: {e}")
+        markets = []
+    if not markets:
+        await update.message.reply_text(
+            "Рынок сейчас не отвечает. Попробуй через минуту — или спроси "
+            "меня словами, я подтяну цифры."
+        )
+        return
+
+    blocks = [b for b in (format_top_coins(markets[:8]),
+                          format_movers(markets)) if b]
+    text = "📊 <b>Рынок сейчас</b>\n\n" + escape_html("\n\n".join(blocks))
+    await update.message.reply_text(text, parse_mode="HTML")

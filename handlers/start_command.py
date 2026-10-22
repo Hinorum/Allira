@@ -40,6 +40,13 @@ HELP_TEXT = (
     "Просто напиши мне — я отвечу. Выбери тему, и я подстроюсь:\n"
     "    - Крипта, трейдинг, инвестиции -> Аллира\n"
     "    - Технологии, ИИ, философия -> Лэйн\n\n"
+    "ЖИВОЙ ЧАТ:\n"
+    "    - Пока думаю — висит «печатает…», так что не ищи меня в списке\n"
+    "    - На твоё сообщение ставлю реакцию: значит, я тебя услышал\n"
+    "    - Под каждым ответом — кнопки быстрых ответов (рынок, портфель,\n"
+    "      операции, сбросить память)\n"
+    "    - Про крипту говорю с живыми цифрами рынка, а не по памяти\n"
+    "    - /market — срез рынка: топ, лидеры роста и падения, TON\n\n"
     "ПАМЯТЬ:\n"
     "Я помню последние 8 реплик нашего разговора, так что можно не объяснять\n"
     "всё заново — просто продолжай. Лишние детали могу и забыть, извини.\n"
@@ -238,9 +245,13 @@ MENU_SECTIONS: dict[str, dict] = {
             "Удобства:\n"
             "    <code>/clear</code> — забыть наш разговор и начать заново\n"
             "    @AlliraCryptoQueen_bot <вопрос> — спросить из любого чата\n\n"
-            "Про память: помню последние 8 реплик, через сутки забываю."
+            "Про память: помню последние 8 реплик, через сутки забываю.\n\n"
+            "Пока думаю — висит «печатает…», а под ответом появляются\n"
+            "кнопки быстрых ответов. Про крипту говорю с живыми цифрами\n"
+            "рынка: <code>/market</code> — срез прямо сейчас."
         ),
         "buttons": [
+            ("📊 Рынок сейчас", "market"),
             ("📊 Статистика бота", "stats"),
             ("🧹 Забыть разговор", "clear"),
         ],
@@ -454,6 +465,7 @@ def _build_commands() -> dict:
     from handlers import (auto_import, crypto_ledger, crypto_tax, stats_command,
                           wallet_command)
     from handlers.dice_tournament import start_dice_tournament_registration
+    from handlers.message_handler import market_command as _market_command
 
     return {
         "balance": crypto_ledger.balance_command,
@@ -463,6 +475,7 @@ def _build_commands() -> dict:
         "addtx": crypto_ledger.addtx_command,
         "airdrop": crypto_ledger.airdrop_command,
         "autoimport": auto_import.auto_import_command,
+        "market": _market_command,
         "tax": crypto_tax.tax_command,
         "tax_cost": crypto_tax.tax_cost_command,
         "tax_pdf": crypto_tax.tax_pdf_command,

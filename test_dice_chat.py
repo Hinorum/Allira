@@ -366,7 +366,7 @@ async def main() -> int:
     import utils.ai_responses as ai
 
     original_llm = mh.get_llm_response
-    original_snapshot = mh.get_market_snapshot
+    original_snapshot = mh.get_market_facts
     original_rate = mh.check_rate_limit
     original_upsert = mh.upsert_user
     original_log = mh.log_message
@@ -391,7 +391,7 @@ async def main() -> int:
         return False
 
     mh.get_llm_response = fake_llm_error
-    mh.get_market_snapshot = fake_snapshot
+    mh.get_market_facts = fake_snapshot
     mh.check_rate_limit = fake_rate
     mh.upsert_user = fake_upsert
     mh.log_message = fake_log
@@ -403,7 +403,7 @@ async def main() -> int:
     finally:
         mh.RESPONSE_CHANCE = original_chance
         mh.get_llm_response = original_llm
-        mh.get_market_snapshot = original_snapshot
+        mh.get_market_facts = original_snapshot
         mh.check_rate_limit = original_rate
         mh.upsert_user = original_upsert
         mh.log_message = original_log
@@ -453,13 +453,13 @@ async def main() -> int:
     import utils.ai_responses as ai
 
     original_llm = mh.get_llm_response
-    original_snapshot = mh.get_market_snapshot
+    original_facts = mh.get_market_facts
     original_rate = mh.check_rate_limit
     original_upsert = mh.upsert_user
     original_log = mh.log_message
     original_ban = mh.is_user_banned
 
-    async def fake_snapshot():
+    async def fake_facts():
         return ""
 
     async def fake_rate(*args, **kwargs):
@@ -474,11 +474,8 @@ async def main() -> int:
     async def fake_ban(user_id):
         return False
 
-    async def fake_ban(user_id):
-        return False
-
     mh.get_llm_response = fake_llm
-    mh.get_market_snapshot = fake_snapshot
+    mh.get_market_facts = fake_facts
     mh.check_rate_limit = fake_rate
     mh.upsert_user = fake_upsert
     mh.log_message = fake_log
@@ -488,7 +485,7 @@ async def main() -> int:
         await mh._process_message(update, ctx, is_private=False)
     finally:
         mh.get_llm_response = original_llm
-        mh.get_market_snapshot = original_snapshot
+        mh.get_market_facts = original_facts
         mh.check_rate_limit = original_rate
         mh.upsert_user = original_upsert
         mh.log_message = original_log
@@ -511,7 +508,7 @@ async def main() -> int:
         return "Нормальный ответ"
 
     mh.get_llm_response = fake_llm_ok
-    mh.get_market_snapshot = fake_snapshot
+    mh.get_market_facts = fake_snapshot
     mh.check_rate_limit = fake_rate
     mh.upsert_user = fake_upsert
     mh.log_message = fake_log
@@ -522,7 +519,7 @@ async def main() -> int:
     finally:
         mh.RESPONSE_CHANCE = original_chance
         mh.get_llm_response = original_llm
-        mh.get_market_snapshot = original_snapshot
+        mh.get_market_facts = original_snapshot
         mh.check_rate_limit = original_rate
         mh.upsert_user = original_upsert
         mh.log_message = original_log

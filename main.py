@@ -43,6 +43,7 @@ from handlers.wallet_command import marketapprent_command, marketappgifts_comman
 from handlers.message_handler import (
     handle_message,
     handle_private_message,
+    market_command,
     _get_history,
     HISTORY_KEY,
     LAST_SEEN_KEY,
@@ -694,6 +695,7 @@ def build_application() -> Application:
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("market", market_command))
     application.add_handler(CommandHandler("start_tournament", start_dice_tournament_registration))
     application.add_handler(CommandHandler("stop_tournament", stop_tournament_command))
     application.add_handler(CommandHandler("stats", stats_command))
