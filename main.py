@@ -49,7 +49,7 @@ from handlers.message_handler import (
     LAST_SEEN_KEY,
 )
 from handlers.stats_command import stats_command, history_command, leaderboard_command
-from handlers.moderation import ban_command, unban_command
+from handlers.moderation import ban_command, kick_command, unban_command
 from handlers.dice_tournament import (
     restore_tournaments,
     start_persist_task,
@@ -365,6 +365,7 @@ BOT_COMMANDS: list[tuple[str, str]] = [
 ADMIN_COMMANDS: list[tuple[str, str]] = [
     ("ban", "Забанить юзера (реплаем или с его id)"),
     ("unban", "Разбанить юзера"),
+    ("kick", "Забанить навсегда и удалить все его сообщения"),
 ]
 
 
@@ -376,7 +377,7 @@ async def setup_bot_commands(bot) -> None:
     """Команды в меню "/" для всех чатов и отдельный список — для админов.
 
     Scope у Telegram подменяет список целиком, а не дополняет: у админов в
-    scope должен лежать общий список плюс /ban и /unban, иначе в личке с ботом
+    scope должен лежать общий список плюс /ban, /unban и /kick, иначе в личке с ботом
     они бы увидели только модерацию.
     """
     try:
@@ -486,7 +487,7 @@ async def post_init(application: Application):
     })
     if not config.admin_user_ids:
         logger.warning(
-            "ADMIN_USER_IDS не задан — команды /ban и /unban никому не доступны"
+            "ADMIN_USER_IDS не задан — команды /ban, /unban и /kick никому не доступны"
         )
     if not config.creator_user_ids and not config.creator_username:
         logger.warning(
@@ -714,6 +715,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("marketapptop", marketapptop_command))
     application.add_handler(CommandHandler("ban", ban_command))
     application.add_handler(CommandHandler("unban", unban_command))
+    application.add_handler(CommandHandler("kick", kick_command))
 
     # Крипто-бухгалтерия
     application.add_handler(CommandHandler("wallet_add", wallet_add_command))

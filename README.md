@@ -62,7 +62,8 @@ Telegram-бот с двумя ИИ-персонажами в крипто-тем
 | `/start_tournament` | Запустить турнир на кубиках |
 | `/stop_tournament` | Остановить турнир |
 | `/ban` | Забанить юзера (реплаем на его сообщение или `/ban <id>`). Только для `ADMIN_USER_IDS` |
-| `/unban` | Разбанить юзера — по тем же правилам |
+| `/unban` | Разбанить юзера — по тем же правилам; в группе также снимает бан в чате |
+| `/kick` | Перманентный бан в группе с удалением всех сообщений юзера (реплаем или `/kick <id>`). Только для `ADMIN_USER_IDS`, бот должен быть админом чата |
 
 ### Аренда NFT (Marketapp)
 
@@ -153,7 +154,7 @@ cp .env.example .env
 | `BOT_TOKEN` | да | Токен от [@BotFather](https://t.me/BotFather) |
 | `OPENROUTER_API_KEY` | да | Ключ [openrouter.ai](https://openrouter.ai/keys) |
 | `ADMIN_CHAT_ID` | нет | Числовой Telegram ID — сюда придут алерты об ошибках |
-| `ADMIN_USER_IDS` | нет | Числовые ID админов через запятую — им доступны `/ban` и `/unban` |
+| `ADMIN_USER_IDS` | нет | Числовые ID админов через запятую — им доступны `/ban`, `/unban` и `/kick` |
 | `NEWS_CHANNEL_ID` | нет | Канал для автопостинга. Без него автопостинг выключен |
 | `NFT_COLLECTIONS` | нет | NFT-коллекции TON для постов: `Имя:адрес,Имя2:адрес2`. Пусто — дефолт (Lost Dogs) |
 | `MARKETAPP_API_KEY` | нет | Токен Marketapp для отчётов по аренде и NFT-статистики в постах |
@@ -468,6 +469,8 @@ python test_dice_chat.py            # турнир на кубиках и чат
 python test_accounting_fixes.py     # учёт: валюта импорта, дедуп, шкала майнера,
                                     # валидация сумм, токен панели, guard меню
 python test_menu_queue.py           # очередь запросов (FIFO, лимиты) и меню бота
+python test_moderation.py           # модерация: /ban и /unban, /kick с
+                                    # перманентным баном и удалением сообщений
 python test_tax_journey.py          # путь «операция → отчёт»: мастер ввода,
                                     # разбор списка, сводка, настройка ФНС
 python test_statement_import.py     # выписки бирж: CSV/Excel, авто-разбор
