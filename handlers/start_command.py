@@ -45,6 +45,8 @@ HELP_TEXT = (
     "    - На твоё сообщение ставлю реакцию: значит, я тебя услышал\n"
     "    - Под каждым ответом — кнопки быстрых ответов (рынок, портфель,\n"
     "      операции, сбросить память)\n"
+    "    - Отвечаю по делу: на «привет» — две фразы, на «расскажи подробно»\n"
+    "      — развёрнуто. Никаких вступлений и «хочешь подробнее?» в конце\n"
     "    - Про крипту говорю с живыми цифрами рынка, а не по памяти\n"
     "    - /market — срез рынка: топ, лидеры роста и падения, TON\n\n"
     "ПАМЯТЬ:\n"
@@ -400,12 +402,15 @@ async def _clear_context_command(update: Update, context: ContextTypes.DEFAULT_T
     Отдельная копия логики из main.py: main импортирует этот модуль,
     поэтому импортировать main отсюда нельзя.
     """
-    from handlers.message_handler import HISTORY_KEY, _get_history
+    from handlers.message_handler import (ANSWER_OVERFLOW_KEY, HISTORY_KEY,
+                                         _get_history)
 
     turns = len(_get_history(context)) // 2
     # Чистим только память диалога: context.user_data.clear() затирал бы
     # и остальные ключи пользователя (включая метку активности).
     context.user_data.pop(HISTORY_KEY, None)
+    # Сбрасываем и режиссёрский счётчик: новая тема — новый ритм ответа.
+    context.user_data.pop(ANSWER_OVERFLOW_KEY, None)
     if turns:
         await update.message.reply_text(
             f"=> Контекст сброшен, забыто {turns} реплик. Начинай с чистого листа."

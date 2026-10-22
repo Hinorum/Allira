@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover
 from utils.ai_responses import (get_llm_response, decide_speaker,
                                 is_service_error, persona_service_error,
                                 ERR_RATE_LIMITED)
+from utils.answer_length import direct, plan_for
 from utils.market import get_market_facts, get_market_snapshot
 from utils.database import (
     check_rate_limit, upsert_user, log_message, is_user_banned
@@ -55,6 +56,10 @@ HISTORY_TTL = 24 * 3600
 # Метка последней активности — по ней фоновая задача в main.py чистит
 # user_data давно не писавших юзеров.
 LAST_SEEN_KEY = "_last_activity"
+
+# На сколько фраж прошлый ответ вышел за сценарий длины. Режиссёр
+# помнит: если модель растянула ответ, следующий раз жмём сильнее.
+ANSWER_OVERFLOW_KEY = "answer_overflow"
 
 # Сколько символов цитаты уносить в промпт. Дальше — модель отвечает
 # наугад, а токены бесплатного тарифа не бесконечны.
@@ -695,9 +700,16 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
         if images:
             model = bot_data.get("VISION_MODEL", model)
 
+        # Режиссура длины. Сценарий выбирается под характер запроса, и его
+        # цифра уходит в системный промпт: модель держит конкретное число
+        # куда лучше, чем «будь кратко». Если в прошлый раз ответ вылез за
+        # сценарий — следующий план жмём сильнее.
+        prev_overflow = int(context.user_data.get(ANSWER_OVERFLOW_KEY) or 0)
+        plan = plan_for(text, prev_overflow)
+
         response = await get_llm_response(
             user_prompt=user_prompt,
-            system_prompt=load_prompt(speaker),
+            system_prompt=f"{load_prompt(speaker)}\n\n{plan.directive}",
             model=model,
             api_key=bot_data["OPENROUTER_API_KEY"],
             history=_history_for_prompt(context, speaker),
@@ -722,6 +734,12 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
         # реплику «Технические неполадки! Попробуй ещё раз» и продолжала
         # её в том же духе.
         if not is_service_error(response):
+            # Режиссёрская склейка: вступление, хвост-вопрос и лишние
+            # фразы — по сценарию длины. В историю кладём именно то, что
+            # увидел юзер: иначе модель считает, что написала длинный
+            # ответ, и продолжает в том же духе.
+            response, overflow = direct(response, plan)
+            context.user_data[ANSWER_OVERFLOW_KEY] = overflow
             _append_history(context, "user", text, speaker)
             _append_history(context, "assistant", response, speaker)
         else:

@@ -572,15 +572,20 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     _inline_rate_limit[user_id] = now
 
     from utils.ai_responses import decide_speaker, get_llm_response, is_service_error
+    from utils.answer_length import direct, plan_for
     from prompts.loader import load_prompt
 
     speaker = decide_speaker(query)
     model = context.bot_data["LANE_MODEL"] if speaker == "lane" else context.bot_data["DEFAULT_MODEL"]
 
+    # Режиссура длины: инлайн-ответ — это одна реплика в чате, а не
+    # статья. Тот же сценарий и та же директива, что и в личке.
+    plan = plan_for(query)
+
     try:
         response = await get_llm_response(
             user_prompt=query,
-            system_prompt=load_prompt(speaker),
+            system_prompt=f"{load_prompt(speaker)}\n\n{plan.directive}",
             model=model,
             api_key=context.bot_data["OPENROUTER_API_KEY"]
         )
@@ -593,6 +598,8 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     if is_service_error(response):
         await inline.answer([], cache_time=0, is_personal=True)
         return
+
+    response, _overflow = direct(response, plan)
 
     if len(response) > 1000:
         response = response[:997] + "..."
