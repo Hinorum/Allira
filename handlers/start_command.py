@@ -183,6 +183,7 @@ MENU_SECTIONS: dict[str, dict] = {
         "buttons": [
             ("📊 Сводка за год", "tax"),
             ("📄 PDF для ФНС", "tax_pdf"),
+            ("🧾 Расходы (ст. 221)", "tax_cost"),
             ("⚙️ Настройки", "tax_setup_status"),
         ],
     },
@@ -463,6 +464,7 @@ def _build_commands() -> dict:
         "airdrop": crypto_ledger.airdrop_command,
         "autoimport": auto_import.auto_import_command,
         "tax": crypto_tax.tax_command,
+        "tax_cost": crypto_tax.tax_cost_command,
         "tax_pdf": crypto_tax.tax_pdf_command,
         "tax_setup_status": crypto_tax.tax_setup_status_command,
         "marketapptop": wallet_command.marketapptop_command,

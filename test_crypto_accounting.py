@@ -232,7 +232,87 @@ async def regression_market_quote() -> int:
     return 0 if not errors else 1
 
 
+async def regression_expenses() -> int:
+    """Прочие расходы уменьшают базу (ст. 221 НК РФ).
+
+    Раньше поле manual_costs в YearSummary было объявлено, но никогда не
+    заполнялось: расходы майнера (электричество) и комиссии не попадали
+    в базу вообще, и налог считался завышенным на всю их сумму.
+    """
+    import utils.database as db
+    db.DB_PATH = TEST_DB
+    db.init_db()
+
+    from utils.crypto_db import (
+        Chain, TxType, add_tax_expense, add_transaction, add_wallet,
+        ensure_asset, total_tax_expenses,
+    )
+    import utils.tax_calc as tax_calc
+
+    owner = 999003
+    year = 2026
+
+    ensure_asset("ETH", "Ethereum", chain=Chain.OTHER, decimals=18,
+                 coingecko_id="ethereum")
+    wallet = add_wallet(owner, Chain.OTHER, "0xexpenseaddress00000", "test")
+    ts = int(time.mktime(time.strptime("2026-04-01 12:00:00",
+                                        "%Y-%m-%d %H:%M:%S")))
+    add_transaction(
+        owner_id=owner, ts=ts, asset_symbol="ETH", tx_type=TxType.AIRDROP,
+        amount="1", wallet_id=wallet.id, fiat_value_rub="200000",
+        note="airdrop",
+    )
+
+    errors: list[str] = []
+    summary = await tax_calc.compute_year_report(owner, year)
+    if summary.manual_costs != 0:
+        errors.append(f"без расходов manual_costs должен быть 0, "
+                      f"а он {summary.manual_costs}")
+    base_without = summary.taxable_income_rub
+    if base_without != 200000:
+        errors.append(f"база без расходов должна быть 200 000, "
+                      f"а она {base_without}")
+
+    exp_id = add_tax_expense(owner, year, "50000", "электричество",
+                             "пул за апрель")
+    if total_tax_expenses(owner, year) != 50000:
+        errors.append("сумма расходов не посчиталась")
+
+    summary = await tax_calc.compute_year_report(owner, year)
+    if summary.manual_costs != 50000:
+        errors.append(f"расходы должны быть 50 000, а {summary.manual_costs}")
+    if summary.taxable_income_rub != 150000:
+        errors.append(f"база должна уменьшиться до 150 000, "
+                      f"а она {summary.taxable_income_rub}")
+    if not summary.expenses:
+        errors.append("расходы должны попасть в отчёт (расшифровка)")
+
+    print()
+    print("=" * 60)
+    print("Расходы, уменьшающие базу")
+    print("=" * 60)
+    print(f"Доход: {summary.total_income_rub} RUB")
+    print(f"Расходы: {summary.manual_costs} RUB")
+    print(f"База: {summary.taxable_income_rub} RUB")
+
+    if not errors:
+        print("✅ РАСХОДЫ УМЕНЬШАЮТ БАЗУ")
+    else:
+        print("❌ ОШИБКИ:")
+        for e in errors:
+            print(f"  - {e}")
+
+    from utils import database as _db
+    _db.close_all()
+    try:
+        os.unlink(TEST_DB)
+    except OSError:
+        pass
+    return 0 if not errors else 1
+
+
 if __name__ == "__main__":
     rc = asyncio.run(main())
     rc |= asyncio.run(regression_market_quote())
+    rc |= asyncio.run(regression_expenses())
     sys.exit(rc)

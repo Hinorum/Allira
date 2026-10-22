@@ -161,11 +161,19 @@ def crypto_stats(owner_id: int) -> dict:
         with get_db() as conn:
             rows = conn.execute(
                 "SELECT key, value FROM bot_stats "
-                "WHERE key LIKE 'cex_sync_ts:%' OR key LIKE 'jetton_sync_ts:%'"
+                "WHERE key LIKE 'cex_sync_ts:%' OR key LIKE 'chain_sync_ts:%'"
             ).fetchall()
             watermarks = {r["key"]: int(r["value"] or 0) for r in rows}
     except Exception:
         pass
+
+    # Прочие расходы по годам — уменьшают налоговую базу (ст. 221 НК).
+    expenses: list[dict] = []
+    try:
+        from utils.crypto_db import list_tax_expenses
+        expenses = list_tax_expenses(owner_id)
+    except Exception as e:
+        logger.warning(f"crypto_stats expenses: {e}")
 
     return {
         "enabled": True,
@@ -176,6 +184,7 @@ def crypto_stats(owner_id: int) -> dict:
         "last_tx_ts": last_tx_ts,
         "by_type": by_type,
         "balances": balances,
+        "expenses": expenses,
         "sync_watermarks": watermarks,
     }
 

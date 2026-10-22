@@ -240,6 +240,7 @@ async def main() -> int:
         ndfl_breakdown = []
         skipped = []
         manual_costs = 0
+        expenses = []
 
     async def fake_report(owner_id, year):
         return FakeSummary()

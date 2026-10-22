@@ -93,22 +93,35 @@ async def _is_owner_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def wallet_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """`/wallet_add <chain> <address> [label]`."""
+    """`/wallet_add [chain] <address> [label]`.
+
+    Сеть можно не указывать — бот определит её по виду адреса:
+    «0:…»/«EQ…» — TON, «0x…» — EVM, «T…» — TRON, «1…»/«bc1…» — Bitcoin.
+    """
     if not await _is_owner_chat(update, context):
         return
     args = context.args or []
-    if len(args) < 2:
+    if not args:
         await update.message.reply_text(
             "Использование:\n"
-            "<code>/wallet_add &lt;chain&gt; &lt;address&gt; [label]</code>\n\n"
-            f"<b>chain</b> ∈ {string_list_of(Chain.all())}\n"
-            "Для TON подходят EQ/UQ/raw-формы.",
+            "<code>/wallet_add &lt;адрес&gt; [подпись]</code>\n"
+            "<code>/wallet_add &lt;chain&gt; &lt;адрес&gt; [подпись]</code>\n\n"
+            f"<b>chain</b> ∈ {string_list_of(Chain.all())} "
+            "(можно не указывать — определится по адресу)\n"
+            "Пример: <code>/wallet_add 0xAbC…</code>",
             parse_mode="HTML",
         )
         return
-    chain = args[0].lower()
-    address = args[1]
-    label = " ".join(args[2:]) if len(args) > 2 else ""
+    if len(args) == 1:
+        chain, address, label = "", args[0], ""
+    else:
+        # Если первый аргумент — не адрес, а имя сети, читаем её.
+        first = args[0].strip().lower()
+        if first in Chain.all() or first in ("auto", "?"):
+            chain, address = first, args[1]
+            label = " ".join(args[2:]) if len(args) > 2 else ""
+        else:
+            chain, address, label = "", args[0], " ".join(args[1:])
     owner = _owner_id(context)
     try:
         wallet = add_wallet(owner, chain, address, label)

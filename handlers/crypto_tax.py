@@ -3,6 +3,8 @@
 Команды (только в ЛС создателя):
   /tax_setup                          — настроить ИНН/ФИО/статус
   /tax_setup_status                   — посмотреть текущие настройки
+  /tax_cost <сумма> [год] [категория] — расходы, уменьшающие базу
+  /tax_cost_del <id>                  — удалить расход
   /tax <год>                          — сводка за год + кнопки экспорта
   /tax_pdf <год>                      — PDF-отчёт 3-НДФЛ
   /tax_xlsx <год>                     — детальная XLSX-книга
@@ -27,7 +29,9 @@ from telegram import InputFile, InlineKeyboardButton, InlineKeyboardMarkup, Upda
 from telegram.ext import ApplicationHandlerStop, ContextTypes
 
 from utils.common import escape_html
-from utils.crypto_db import get_tax_settings, set_tax_settings
+from utils.crypto_db import (add_tax_expense, delete_tax_expense,
+                             get_tax_settings, list_tax_expenses,
+                             set_tax_settings)
 from utils.price_oracle import format_rub
 from utils.report_export import (render_disposal_csv, render_income_csv,
                                  render_pdf, render_xlsx)
@@ -128,6 +132,133 @@ async def tax_setup_status_command(update: Update, context: ContextTypes.DEFAULT
     if not await _is_owner_chat(update, context):
         return
     await _send_tax_status(update, context)
+
+
+# ------------------------------------------------- /tax_cost — расходы
+
+
+async def tax_cost_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/tax_cost <сумма> [год] [категория] [комментарий]`
+
+    Прочие расходы, уменьшающие налоговую базу: электричество у пула,
+    комиссии бирж, амортизация оборудования. Без них база считалась бы
+    завышенной (у майнера — на всю сумму добычи).
+
+    Без аргументов — список расходов.
+    """
+    if not await _is_owner_chat(update, context):
+        return
+    owner = _owner_id(context)
+    args = list(context.args or [])
+
+    if not args:
+        await _send_expense_list(update, context, owner)
+        return
+
+    amount_raw = ""
+    year = datetime.now().year
+    category = ""
+    note = ""
+
+    if "=" in args[0]:
+        # Форма с ключами: СУММА=50000 ГОД=2025 КАТЕГОРИЯ=электричество
+        fields: dict = {}
+        for a in args:
+            if "=" not in a:
+                continue
+            k, v = a.split("=", 1)
+            fields[k.strip().lower()] = v.strip()
+        amount_raw = fields.get("сумма") or fields.get("amount") or fields.get("sum") or ""
+        year_raw = fields.get("год") or fields.get("year") or ""
+        category = fields.get("категория") or fields.get("category") or ""
+        note = fields.get("заметка") or fields.get("note") or ""
+        if year_raw.isdigit():
+            year = int(year_raw)
+    else:
+        amount_raw = args[0]
+        if len(args) > 1 and args[1].isdigit() and len(args[1]) == 4:
+            year = int(args[1])
+            category = args[2] if len(args) > 2 else ""
+            note = " ".join(args[3:]) if len(args) > 3 else ""
+        else:
+            note = " ".join(args[1:])
+
+    amount = _parse_money(amount_raw)
+    if amount is None:
+        await update.message.reply_text(
+            "Сумма расхода не понята. Пример: "
+            "<code>/tax_cost 50000 2025 электричество за март</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        exp_id = add_tax_expense(owner, year, amount, category, note)
+    except Exception as e:
+        await update.message.reply_text(f"Не записал: {e}")
+        return
+
+    await update.message.reply_text(
+        f"✅ Расход #{exp_id} записан: <b>{format_rub(float(amount))}</b> "
+        f"({year}"
+        + (f", {escape_html(category)}" if category else "")
+        + "). База пересчитана при следующем /tax.",
+        parse_mode="HTML",
+    )
+    await _send_tax_summary(update.message.chat_id, context, year)
+
+
+async def tax_cost_del_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/tax_cost_del <id>` — удалить расход."""
+    if not await _is_owner_chat(update, context):
+        return
+    args = list(context.args or [])
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Нужен id расхода: <code>/tax_cost_del 3</code>",
+                                        parse_mode="HTML")
+        return
+    ok = delete_tax_expense(int(args[0]), _owner_id(context))
+    if ok:
+        await update.message.reply_text("✅ Расход удалён.")
+    else:
+        await update.message.reply_text("Такого расхода нет.")
+
+
+async def _send_expense_list(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                              owner: int) -> None:
+    expenses = list_tax_expenses(owner)
+    if not expenses:
+        await update.message.reply_text(
+            "Расходов пока нет.\n\n"
+            "Пример: <code>/tax_cost 50000 2025 электричество</code>\n"
+            "<i>Расходы уменьшают налоговую базу: ст. 221 НК РФ.</i>",
+            parse_mode="HTML",
+        )
+        return
+    lines = ["<b>Расходы, уменьшающие базу:</b>"]
+    for e in expenses:
+        cat = f" — {escape_html(e['category'])}" if e["category"] else ""
+        note = f" ({escape_html(e['note'][:60])})" if e["note"] else ""
+        lines.append(f"• #{e['id']} {e['year']} — "
+                     f"{format_rub(float(e['amount_rub']))}{cat}{note}")
+    lines.append("")
+    lines.append("Удалить: <code>/tax_cost_del &lt;id&gt;</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+def _parse_money(value: str):
+    """'50 000,50' → 50000.5; None, если не число."""
+    s = (value or "").strip().replace(" ", "").replace(" ", "")
+    s = s.replace(",", ".")
+    if not s:
+        return None
+    try:
+        num = float(s)
+    except ValueError:
+        return None
+    if num <= 0:
+        return None
+    return num
 
 
 # ------------------------------- форма настройки ФНС (по шагам)
@@ -320,6 +451,11 @@ async def _send_tax_summary(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
         f"Доход (аирдропы, майнинг…): <b>{format_rub(float(summary.total_income_rub))}</b>\n"
         f"Себестоимость реализованных: <b>{format_rub(float(summary.total_cost_rub))}</b>\n"
         f"Прибыль от реализации: <b>{format_rub(float(summary.realized_gain_rub))}</b>\n"
+    )
+    if summary.manual_costs:
+        text += (f"Прочие расходы (ст. 221 НК): "
+                 f"<b>−{format_rub(float(summary.manual_costs))}</b>\n")
+    text += (
         f"Налоговая база: <b>{format_rub(float(summary.taxable_income_rub))}</b>\n"
         f"<b>НДФЛ к уплате:</b> <b>{format_rub(float(summary.ndfl_total))}</b>\n\n"
         f"Доходов: {len(summary.income_events)} | Реализаций: {len(summary.disposal_events)}\n"

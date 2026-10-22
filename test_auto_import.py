@@ -74,8 +74,9 @@ async def main() -> int:
     db.init_db()
     _patch_prices()
 
-    from utils.auto_import import (classify_moves, import_statement,
-                                    persist_moves, rematch_transfers)
+    from utils.auto_import import (classify_moves, confirm_all, import_statement,
+                                    pending_reviews, persist_moves, reclassify,
+                                    rematch_transfers)
     from utils.chain_scan import ChainMove
     from utils.crypto_db import (TxType, add_transaction, add_wallet,
                                  list_transactions)
@@ -242,6 +243,96 @@ async def main() -> int:
     summary3 = await compute_year_report(owner3, year)
     check(summary3.total_income_rub == 0, "База обнулилась",
           str(summary3.total_income_rub))
+
+    # --- 9. Правка по кнопке: пользователь переопределяет классификацию.
+    owner4 = 777004
+    wallet4 = add_wallet(owner4, "ton", "0:mine4", "мой")
+    moves = [_move("TON", "5", "out", ts_may, "0:pool", group="s1")]
+    classified = await classify_moves(owner4, moves)
+    await persist_moves(owner4, classified, wallet_id=wallet4.id)
+    row = next(t for t in list_transactions(owner4, year=year)
+               if t.tx_type == TxType.SWAP_OUT)
+    ok, msg = await reclassify(owner4, row.id, "internal")
+    check(ok, "Правка «это перемещение» принята", msg)
+    rows = list_transactions(owner4, year=year)
+    check(rows[0].is_internal, "Проводка помечена внутренней")
+    check(rows[0].tx_type == TxType.TRANSFER_OUT, "Тип стал переводом",
+          rows[0].tx_type)
+    summary4 = await compute_year_report(owner4, year)
+    check(summary4.total_income_rub == 0, "Перемещение не дало дохода",
+          str(summary4.total_income_rub))
+    check(summary4.disposal_events == [], "Перемещение не дало реализации",
+          str(len(summary4.disposal_events)))
+
+    # Обратная правка: пользователь говорит, что это доход.
+    ok, msg = await reclassify(owner4, rows[0].id, "income")
+    check(ok, "Правка «это доход» принята", msg)
+    summary4 = await compute_year_report(owner4, year)
+    check(summary4.total_income_rub == 2500,
+          "Доход посчитан по рынку (5 TON × 500 ₽)",
+          str(summary4.total_income_rub))
+
+    # --- 10. Перевод между биржами: вывод с одной и ввод на другую.
+    owner5 = 777005
+    add_transaction(
+        owner_id=owner5, ts=ts_march, asset_symbol="USDT",
+        tx_type=TxType.TRANSFER_OUT, amount="500", note="вывод с Bybit",
+        source="bybit", external_id="bybit:w:1",
+    )
+    add_transaction(
+        owner_id=owner5, ts=ts_march + 3600, asset_symbol="USDT",
+        tx_type=TxType.TRANSFER_IN, amount="500", note="ввод на OKX",
+        source="okx", external_id="okx:d:1",
+    )
+    changed = rematch_transfers(owner5)
+    check(changed == 1, "Вывод и ввод на разных биржах сопоставлены",
+          str(changed))
+    rows = list_transactions(owner5, year=year)
+    check(all(t.is_internal for t in rows),
+          "Обе проводки стали перемещениями")
+    balances5 = {b.symbol: b.qty for b in compute_balances(owner5)}
+    check(not balances5.get("USDT"),
+          "Актив не посчитан дважды", str(balances5.get("USDT")))
+
+    # --- 11. Список на проверку и подтверждение разом.
+    owner6 = 777006
+    wallet6 = add_wallet(owner6, "ton", "0:mine6", "мой")
+    moves = [_move("TON", "3", "in", ts_may, "0:stranger6", group="r1")]
+    classified = await classify_moves(owner6, moves)
+    await persist_moves(owner6, classified, wallet_id=wallet6.id)
+    pending = pending_reviews(owner6)
+    check(len(pending) == 1, "Операция попала в список на проверку",
+          str(len(pending)))
+    check(pending and pending[0].kind == "airdrop",
+          "Тип замечания — аирдроп",
+          pending[0].kind if pending else "")
+    confirmed = confirm_all(owner6)
+    check(confirmed == 1, "Подтверждено разом", str(confirmed))
+    check(not pending_reviews(owner6),
+          "После подтверждения список пуст")
+    summary6 = await compute_year_report(owner6, year)
+    check(summary6.total_income_rub == 1500,
+          "Доход не изменился после подтверждения",
+          str(summary6.total_income_rub))
+
+    # --- 12. Сеть определяется по виду адреса — пользователю не надо
+    # помнить, в какой сети кошелёк.
+    from utils.crypto_db import detect_chain
+
+    cases = [
+        ("0:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+         "ton"),
+        ("EQAl_hUCAeEv-fKtGxYtITAS6PPxuMRaQwHj0QAHeWe6ZSD0", "ton"),
+        ("0x1234567890abcdef1234567890abcdef12345678", "evm"),
+        ("TXYZabc1234567890abcdefghijkLMNopq", "tron"),
+        ("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", "btc"),
+        ("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq", "btc"),
+        ("7EYnhQoR9YM3N7UoaKRoA44Uy8JeaZV3qyouov87awMs", "solana"),
+        ("мусор", "other"),
+    ]
+    for addr, want in cases:
+        got = detect_chain(addr)
+        check(got == want, f"Сеть по адресу {addr[:12]}… → {want}", got)
 
     print()
     if not FAILURES:

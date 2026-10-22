@@ -72,6 +72,7 @@ from handlers.crypto_tax import (
     tax_command, tax_export_callback,
     tax_pdf_command, tax_xlsx_command, tax_csv_command,
     tax_setup_callback, tax_setup_text_handler,
+    tax_cost_command, tax_cost_del_command,
 )
 from handlers.tx_wizard import bulk_callback, wizard_callback, wizard_text_handler
 from handlers.cex_command import cex_status_command, cex_sync_command
@@ -720,6 +721,8 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("tax", tax_command))
     application.add_handler(CommandHandler("tax_setup", tax_setup_command))
     application.add_handler(CommandHandler("tax_setup_status", tax_setup_status_command))
+    application.add_handler(CommandHandler("tax_cost", tax_cost_command))
+    application.add_handler(CommandHandler("tax_cost_del", tax_cost_del_command))
     application.add_handler(CommandHandler("tax_pdf", tax_pdf_command))
     application.add_handler(CommandHandler("tax_xlsx", tax_xlsx_command))
     application.add_handler(CommandHandler("tax_csv", tax_csv_command))

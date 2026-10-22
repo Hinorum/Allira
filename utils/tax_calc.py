@@ -40,7 +40,8 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 from typing import Optional
 
 from utils.crypto_db import (
-    Tx, TxType, _to_decimal, list_transactions,
+    Tx, TxType, _to_decimal, list_tax_expenses, list_transactions,
+    total_tax_expenses,
 )
 from utils.database import get_db
 from utils.price_oracle import get_asset_price_rub
@@ -234,6 +235,8 @@ class YearSummary:
     warnings: list[str] = field(default_factory=list)
     # Найденные расходы пользователя (если он их ввёл вручную).
     manual_costs: Decimal = Decimal(0)
+    # Список этих расходов — для расшифровки в PDF/XLSX.
+    expenses: list[dict] = field(default_factory=list)
     # Ошибки в данных: пропущенные котировки, отрицательный итог.
     skipped: list[dict] = field(default_factory=list)
 
@@ -533,6 +536,11 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
         sum((e.gain_rub for e in summary.disposal_events), Decimal(0))
     )
 
+    # Прочие расходы за год: электричество у пула, комиссии бирж,
+    # амортизация оборудования. Уменьшают базу (ст. 221 НК РФ).
+    summary.expenses = list_tax_expenses(owner_id, year)
+    summary.manual_costs = _round2(total_tax_expenses(owner_id, year))
+
     taxable = summary.realized_gain_rub + summary.total_income_rub - summary.manual_costs
     if taxable < 0:
         summary.warnings.append(
@@ -678,6 +686,8 @@ def summary_to_dict(summary: YearSummary) -> dict:
         "total_income_rub": str(summary.total_income_rub),
         "total_cost_rub": str(summary.total_cost_rub),
         "realized_gain_rub": str(summary.realized_gain_rub),
+        "manual_costs": str(summary.manual_costs),
+        "expenses": summary.expenses,
         "taxable_income_rub": str(summary.taxable_income_rub),
         "ndfl_total": str(summary.ndfl_total),
         "ndfl_breakdown": summary.ndfl_breakdown,

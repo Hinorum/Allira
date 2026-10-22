@@ -59,6 +59,15 @@ MATCH_WINDOW_S = 3 * 86400
 # Допуск по сумме при сопоставлении: комиссия биржи идёт из суммы вывода.
 AMOUNT_TOLERANCE = Decimal("0.01")
 
+# Сети EVM по умолчанию: Ethereum, BSC, Polygon, Base, Arbitrum, Optimism.
+DEFAULT_EVM_CHAIN_IDS = (1, 56, 137, 8453, 42161, 10)
+
+# Человеческие названия сетей EVM — для отчёта пользователю.
+EVM_CHAIN_NAMES = {
+    1: "Ethereum", 10: "Optimism", 56: "BSC", 137: "Polygon",
+    8453: "Base", 42161: "Arbitrum", 43114: "Avalanche",
+}
+
 
 # ------------------------------------------------------------- результаты
 
@@ -179,7 +188,7 @@ def _load_transfer_rows(owner_id: int) -> list[dict]:
     with get_db() as conn:
         rows = conn.execute(
             "SELECT t.id, t.ts, t.tx_type, t.amount_raw, t.is_internal, "
-            "       a.symbol, a.decimals "
+            "       t.source, a.symbol, a.decimals "
             "FROM crypto_transactions t "
             "JOIN crypto_assets a ON a.id = t.asset_id "
             "WHERE t.owner_id = ? AND t.tx_type IN (?, ?)",
@@ -194,6 +203,7 @@ def _load_transfer_rows(owner_id: int) -> list[dict]:
             "ts": int(r["ts"]),
             "tx_type": r["tx_type"],
             "symbol": r["symbol"],
+            "source": r["source"] or "",
             "amount": raw / (Decimal(10) ** decimals),
             "is_internal": bool(r["is_internal"]) if "is_internal" in r.keys()
             else False,
@@ -282,9 +292,151 @@ def rematch_transfers(owner_id: int) -> int:
                 )
         changed += 1
 
+    # Вывод с одной биржи ↔ ввод на другую: актив переехал внутри
+    # отслеживаемого периметра, и обе проводки — перемещения. Иначе ввод
+    # открывал бы второй лот на актив, который уже учтён лотом от покупки.
+    # Источники должны различаться: ввод с карты и вывод на ту же биржу —
+    # это разные движения, а не перенос.
+    for tr in transfer_rows:
+        if tr["is_internal"] or tr["tx_type"] != TxType.TRANSFER_IN:
+            continue
+        for out in transfer_rows:
+            if out["is_internal"] or out["tx_type"] != TxType.TRANSFER_OUT:
+                continue
+            if out["id"] == tr["id"] or out["source"] == tr["source"]:
+                continue
+            if out["symbol"] != tr["symbol"]:
+                continue
+            if abs(out["ts"] - tr["ts"]) > MATCH_WINDOW_S:
+                continue
+            if not _same_amount(out["amount"], tr["amount"]):
+                continue
+            with get_db() as conn:
+                conn.execute(
+                    "UPDATE crypto_transactions SET is_internal = 1 "
+                    "WHERE id IN (?, ?) AND owner_id = ?",
+                    (tr["id"], out["id"], owner_id),
+                )
+            changed += 1
+            break
+
     if changed:
         logger.info(f"auto_import: пересопоставлено {changed} переводов")
     return changed
+
+
+# Виды правки, которые может сделать пользователь по кнопке.
+FIX_KINDS = ("internal", "income", "disposal", "confirm")
+
+
+async def reclassify(owner_id: int, tx_id: int, kind: str) -> tuple[bool, str]:
+    """Переклассифицирует операцию по решению пользователя.
+
+    internal — перемещение внутри периметра: дохода/расхода нет, лот не
+    трогается (перевод между своими кошельками, вывод с биржи на свой
+    кошелёк, стейкинг);
+    income   — доход (аирдроп и прочие поступления по ст. 214 НК);
+    disposal — реализация (передача актива третьему лицу);
+    confirm  — оставить как есть, но снять с проверки.
+
+    Возвращает (получилось, текст для пользователя).
+    """
+    if kind not in FIX_KINDS:
+        return False, "неизвестный тип правки"
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT t.id, t.ts, t.tx_type, t.direction, t.amount_raw, "
+            "       t.note, t.source, a.symbol, a.decimals "
+            "FROM crypto_transactions t "
+            "JOIN crypto_assets a ON a.id = t.asset_id "
+            "WHERE t.id = ? AND t.owner_id = ?",
+            (tx_id, owner_id),
+        ).fetchone()
+    if not row:
+        return False, "операция не найдена"
+
+    symbol = row["symbol"]
+    decimals = int(row["decimals"] or 9)
+    amount = Decimal(row["amount_raw"] or 0) / (Decimal(10) ** decimals)
+    direction = row["direction"]
+    note = (row["note"] or "").strip()
+
+    if kind == "confirm":
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE crypto_transactions SET is_confirmed = 1 "
+                "WHERE id = ? AND owner_id = ?",
+                (tx_id, owner_id),
+            )
+        return True, (f"{_fmt_amount(amount)} {symbol} — подтверждено, "
+                      f"больше не спрашиваю")
+
+    if kind == "internal":
+        new_type = (TxType.TRANSFER_IN if direction == "in"
+                    else TxType.TRANSFER_OUT)
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE crypto_transactions "
+                "SET tx_type = ?, is_internal = 1, is_confirmed = 1, "
+                "    fiat_value_rub = NULL, note = ? "
+                "WHERE id = ? AND owner_id = ?",
+                (new_type, f"{note}; поправлено: перемещение".strip("; "),
+                 tx_id, owner_id),
+            )
+        return True, (f"{_fmt_amount(amount)} {symbol} → перемещение: "
+                      f"в налоговую базу не идёт")
+
+    # Доход или реализация — нужна рублёвая оценка на дату операции.
+    price = None
+    try:
+        price = await get_asset_price_rub(symbol, int(row["ts"]))
+    except Exception:
+        price = None
+    if price is None:
+        return False, (f"нет котировки {symbol} на дату операции — "
+                       f"оценку поставить нечем")
+    try:
+        rub = (amount * Decimal(str(price))).quantize(Decimal("0.01"))
+    except Exception:
+        return False, "не удалось посчитать рублёвую оценку"
+
+    new_type = TxType.AIRDROP if kind == "income" else TxType.SWAP_OUT
+    label = "доход" if kind == "income" else "реализация"
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE crypto_transactions "
+            "SET tx_type = ?, is_internal = 0, is_confirmed = 1, "
+            "    fiat_value_rub = ?, note = ? "
+            "WHERE id = ? AND owner_id = ?",
+            (new_type, f"{rub:.2f}",
+             f"{note}; поправлено: {label}".strip("; "), tx_id, owner_id),
+        )
+    return True, (f"{_fmt_amount(amount)} {symbol} → {label}: "
+                  f"{rub:.2f} ₽")
+
+
+def confirm_all(owner_id: int) -> int:
+    """Снять с проверки все спорные операции разом.
+
+    Обычно классификация по умолчанию верна (доход или реализация), и
+    пользователю нужно лишь подтвердить пару исключений. Подтверждать
+    каждую строку по отдельности — лишние действия.
+    """
+    with get_db() as conn:
+        cur = conn.execute(
+            "UPDATE crypto_transactions SET is_confirmed = 1 "
+            "WHERE owner_id = ? AND source = ? "
+            "AND (is_confirmed IS NULL OR is_confirmed = 0) "
+            "AND (is_internal IS NULL OR is_internal = 0)",
+            (owner_id, CHAIN_SOURCE),
+        )
+        return int(cur.rowcount or 0)
+
+
+def _fmt_amount(amount: Decimal) -> str:
+    """Количество без лишних нулей: 1.500000 → 1.5."""
+    return f"{amount.normalize():f}"
 
 
 def _same_amount(a: Decimal, b: Decimal) -> bool:
@@ -707,14 +859,18 @@ def _set_watermark(wallet_id: int, ts: int) -> None:
 
 
 def _evm_chain_ids(cfg) -> list[int]:
-    """Сети EVM, которые сканируем (из конфига)."""
+    """Сети EVM, которые сканируем (из конфига).
+
+    По умолчанию — основные сети: один адрес может оказаться в любой из
+    них, а проверить шесть сетей дешевле, чем гадать, в какой именно он.
+    """
     raw = getattr(cfg, "evm_chain_ids", "") or ""
     ids: list[int] = []
     for part in str(raw).replace(";", ",").split(","):
         part = part.strip()
         if part.isdigit() and int(part) not in ids:
             ids.append(int(part))
-    return ids or [1]
+    return ids or list(DEFAULT_EVM_CHAIN_IDS)
 
 
 def pending_reviews(owner_id: int) -> list[Review]:
@@ -733,6 +889,7 @@ def pending_reviews(owner_id: int) -> list[Review]:
             "JOIN crypto_assets a ON a.id = t.asset_id "
             "WHERE t.owner_id = ? AND t.source = ? "
             "AND (t.is_internal IS NULL OR t.is_internal = 0) "
+            "AND (t.is_confirmed IS NULL OR t.is_confirmed = 0) "
             "ORDER BY t.ts DESC LIMIT 50",
             (owner_id, CHAIN_SOURCE),
         ).fetchall()

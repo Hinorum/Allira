@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
@@ -65,6 +66,32 @@ def _menu_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def _review_keyboard(reviews) -> InlineKeyboardMarkup:
+    """Кнопки правки классификации — по одному тапу на операцию."""
+    rows = []
+    for r in reviews[:MAX_REVIEW_ROWS]:
+        if not r.tx_id:
+            continue
+        rows.append([
+            InlineKeyboardButton("↔️ Перемещение",
+                                 callback_data=f"ai:fix:{r.tx_id}:internal"),
+            InlineKeyboardButton("⬆️ Доход",
+                                 callback_data=f"ai:fix:{r.tx_id}:income"),
+            InlineKeyboardButton("⬇️ Реализация",
+                                 callback_data=f"ai:fix:{r.tx_id}:disposal"),
+        ])
+    rows.append([
+        InlineKeyboardButton("✅ Подтвердить всё",
+                             callback_data="ai:confirm_all"),
+    ])
+    rows.append([
+        InlineKeyboardButton("🔄 Сканировать кошельки",
+                             callback_data="ai:scan"),
+        InlineKeyboardButton("💰 Налог за год", callback_data="ai:tax"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
 # ------------------------------------------------------------- команда
 
 
@@ -89,17 +116,19 @@ async def auto_import_command(update: Update,
 
 async def _show_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Что сейчас в учёте: кошельки, операции, что требует проверки."""
-    from utils.auto_import import pending_reviews
+    from utils.auto_import import (DEFAULT_EVM_CHAIN_IDS, EVM_CHAIN_NAMES,
+                                    _evm_chain_ids, pending_reviews)
     from utils.crypto_db import list_wallets
 
     owner = _owner_id(context)
+    cfg = context.bot_data.get("BOT_CONFIG")
     wallets = list_wallets(owner)
     lines = ["<b>Автоимпорт</b>", ""]
 
     if not wallets:
         lines.append("Кошельков нет. Добавь адреса:")
-        lines.append("<code>/wallet_add ton 0:…</code>")
-        lines.append("<code>/wallet_add evm 0x…</code>")
+        lines.append("<code>/wallet_add 0:…</code>")
+        lines.append("<code>/wallet_add 0x…</code>")
     else:
         lines.append(f"Кошельков: <b>{len(wallets)}</b>")
         for w in wallets[:10]:
@@ -108,12 +137,30 @@ async def _show_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(wallets) > 10:
             lines.append(f"…и ещё {len(wallets) - 10}")
 
+    # Чем именно сканируем: без этого непонятно, почему по кошельку пусто.
+    ton_key = bool(getattr(cfg, "tonapi_api_key", ""))
+    evm_key = bool(getattr(cfg, "etherscan_api_key", ""))
+    chain_ids = _evm_chain_ids(cfg) if cfg else list(DEFAULT_EVM_CHAIN_IDS)
+    lines.append("")
+    if any(w.chain == "evm" for w in wallets):
+        if evm_key:
+            names = ", ".join(EVM_CHAIN_NAMES.get(c, str(c))
+                              for c in chain_ids)
+            lines.append(f"🌐 EVM-сети: {names}")
+        else:
+            lines.append("⚠️ EVM-кошельки есть, но <code>ETHERSCAN_API_KEY</code> "
+                         "не задан — их история не подтягивается")
+    if any(w.chain == "ton" for w in wallets):
+        lines.append("🌐 TON: TonAPI" + ("" if ton_key else " (без ключа)"))
+
     reviews = pending_reviews(owner)
     if reviews:
         lines.append("")
         lines.append(f"Требуют проверки: <b>{len(reviews)}</b>")
-        for r in reviews[:5]:
+        for r in reviews[:MAX_REVIEW_ROWS]:
             lines.append(f"• {escape_html(r.message[:110])}")
+        lines.append("")
+        lines.append("Поправить — один тап под операцией.")
     else:
         lines.append("")
         lines.append("✅ Неоднозначных операций нет")
@@ -122,8 +169,9 @@ async def _show_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("Пришли выписку биржи (CSV или Excel) реплаем на "
                  "<code>/autoimport</code> — разберу и запишу.")
 
+    markup = _review_keyboard(reviews) if reviews else _menu_keyboard()
     await update.message.reply_text("\n".join(lines), parse_mode="HTML",
-                                    reply_markup=_menu_keyboard())
+                                    reply_markup=markup)
 
 
 # ------------------------------------------------------------- импорт выписки
@@ -162,9 +210,15 @@ async def _import_document(update: Update, context: ContextTypes.DEFAULT_TYPE,
         lines.append("<b>Нужна проверка:</b>")
         for r in result.review[:MAX_REVIEW_ROWS]:
             lines.append(f"• {escape_html(r.message[:160])}")
+        lines.append("")
+        lines.append("Поправить — один тап под операцией.")
 
+    from utils.auto_import import pending_reviews
+
+    reviews = pending_reviews(_owner_id(context))
+    markup = _review_keyboard(reviews) if reviews else _menu_keyboard()
     await msg.reply_text("\n".join(lines), parse_mode="HTML",
-                         reply_markup=_menu_keyboard())
+                         reply_markup=markup)
 
     # Сразу сканируем кошельки: выписка нужна, чтобы отличить вывод с биржи
     # от аирдропа — иначе перевод станет ложным доходом.
@@ -181,6 +235,14 @@ async def auto_import_callback(update: Update,
     await query.answer()
     data = query.data or ""
 
+    if data.startswith("ai:fix:"):
+        await _handle_fix(query, context, data)
+        return
+
+    if data == "ai:confirm_all":
+        await _handle_confirm_all(query, context)
+        return
+
     if data == "ai:scan":
         await query.message.reply_text("Сканирую кошельки…")
         await _run_scan(context, query.message.chat_id)
@@ -191,6 +253,74 @@ async def auto_import_callback(update: Update,
         await _send_tax_summary(query.message.chat_id, context,
                                  _current_year())
         return
+
+
+async def _handle_confirm_all(query, context) -> None:
+    """Подтвердить все спорные операции разом."""
+    from utils.auto_import import confirm_all, pending_reviews
+
+    owner = _owner_id(context)
+    count = confirm_all(owner)
+    reviews = pending_reviews(owner)
+    lines = [f"✅ Подтверждено операций: <b>{count}</b>", ""]
+    if reviews:
+        lines.append(f"Осталось на проверку: <b>{len(reviews)}</b>")
+        for r in reviews[:MAX_REVIEW_ROWS]:
+            lines.append(f"• {escape_html(r.message[:110])}")
+    else:
+        lines.append("✅ Неоднозначных операций нет")
+    try:
+        await query.edit_message_text(
+            "\n".join(lines), parse_mode="HTML",
+            reply_markup=_review_keyboard(reviews) if reviews
+            else _menu_keyboard(),
+        )
+    except Exception as e:
+        if "message is not modified" not in str(e).lower():
+            raise
+
+
+async def _handle_fix(query, context, data: str) -> None:
+    """Правка классификации операции по кнопке."""
+    from utils.auto_import import reclassify
+
+    parts = data.split(":")
+    if len(parts) != 4:
+        return
+    try:
+        tx_id = int(parts[2])
+    except ValueError:
+        return
+    kind = parts[3]
+
+    ok, message = await reclassify(_owner_id(context), tx_id, kind)
+    if not ok:
+        await query.answer(f"Не получилось: {message}", show_alert=True)
+        return
+
+    # После правки перерисовываем список: операция уходит из проверки.
+    from utils.auto_import import pending_reviews
+    from utils.crypto_db import list_wallets
+
+    owner = _owner_id(context)
+    reviews = pending_reviews(owner)
+    lines = [f"✅ {escape_html(message)}", ""]
+    if reviews:
+        lines.append(f"Осталось на проверку: <b>{len(reviews)}</b>")
+        for r in reviews[:MAX_REVIEW_ROWS]:
+            lines.append(f"• {escape_html(r.message[:110])}")
+    else:
+        lines.append("✅ Неоднозначных операций нет")
+    lines.append("")
+    lines.append("Налоговая база пересчитана автоматически.")
+
+    try:
+        await query.edit_message_text("\n".join(lines), parse_mode="HTML",
+                                       reply_markup=_review_keyboard(reviews)
+                                       if reviews else _menu_keyboard())
+    except Exception as e:
+        if "message is not modified" not in str(e).lower():
+            raise
 
 
 async def _run_scan(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
@@ -227,9 +357,10 @@ async def _scan_task(bot, chat_id: int, bot_data: dict):
             for r in result.review[:MAX_REVIEW_ROWS]:
                 lines.append(f"• {escape_html(r.message[:160])}")
         lines.append("")
-        lines.append("Поправить классификацию: <code>/tx_list</code> → "
-                     "удалить строку и записать заново через <code>/addtx</code>")
+        lines.append("Поправить классификацию — один тап под операцией "
+                     "в списке <code>/autoimport</code>.")
         await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+        await _send_tax_digest(bot, chat_id, owner_id)
     except Exception as e:
         logger.error(f"auto_import scan failed: {e}", exc_info=True)
         try:
@@ -241,3 +372,34 @@ async def _scan_task(bot, chat_id: int, bot_data: dict):
 def _current_year() -> int:
     import time
     return time.localtime().tm_year
+
+
+async def _send_tax_digest(bot, chat_id: int, owner_id: int,
+                           year: Optional[int] = None):
+    """Короткая сводка по базе: сколько дохода, база и налог."""
+    from utils.price_oracle import format_rub
+    from utils.tax_calc import compute_year_report
+
+    year = year or _current_year()
+    if not owner_id:
+        return
+    try:
+        summary = await compute_year_report(owner_id, year)
+    except Exception as e:
+        logger.warning(f"auto_import: сводка не собралась: {e}")
+        return
+
+    lines = [
+        f"<b>База за {year} год:</b>",
+        f"• доход: {format_rub(float(summary.total_income_rub))}",
+        f"• расходы по реализации: {format_rub(float(summary.total_cost_rub))}",
+        f"• налоговая база: {format_rub(float(summary.taxable_income_rub))}",
+        f"• <b>НДФЛ: {format_rub(float(summary.ndfl_total))}</b>",
+    ]
+    if summary.warnings:
+        lines.append("")
+        lines.append("Замечания: " + escape_html(summary.warnings[0][:160]))
+    try:
+        await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        logger.warning(f"auto_import: сводка не отправлена: {e}")

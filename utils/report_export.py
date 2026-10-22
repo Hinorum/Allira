@@ -148,6 +148,13 @@ def render_pdf(summary: YearSummary, settings: dict) -> bytes:
          format_rub(float(summary.total_cost_rub))],
         ["Финансовый результат от реализации",
          format_rub(float(summary.realized_gain_rub))],
+    ]
+    if summary.manual_costs:
+        summary_rows.append(
+            ["Прочие расходы, уменьшающие базу (ст. 221 НК РФ)",
+             "−" + format_rub(float(summary.manual_costs))]
+        )
+    summary_rows += [
         ["Налоговая база",
          format_rub(float(summary.taxable_income_rub))],
         ["НДФЛ к уплате",
@@ -334,6 +341,9 @@ def render_xlsx(summary: YearSummary, settings: dict) -> bytes:
                float(summary.total_cost_rub)])
     ws.append(["Фин. результат реализации, RUB",
                float(summary.realized_gain_rub)])
+    if summary.manual_costs:
+        ws.append(["Прочие расходы, уменьшающие базу (ст. 221 НК), RUB",
+                   -float(summary.manual_costs)])
     ws.append(["Налоговая база, RUB",
                float(summary.taxable_income_rub)])
     ws.append(["НДФЛ к уплате, RUB", float(summary.ndfl_total)])
@@ -384,7 +394,26 @@ def render_xlsx(summary: YearSummary, settings: dict) -> bytes:
     for col, width in enumerate([12, 10, 16, 14, 14, 14, 40, 8], 1):
         ws.column_dimensions[get_column_letter(col)].width = width
 
-    # 4. НДФЛ
+    # 4. Расходы, уменьшающие базу
+    if summary.expenses:
+        ws = wb.create_sheet("Расходы")
+        ws.append(["Год", "Сумма, RUB", "Категория", "Комментарий", "ID"])
+        for cell in ws[1]:
+            cell.font = bold
+            cell.fill = header_fill
+        for e in summary.expenses:
+            ws.append([
+                e.get("year"),
+                float(e.get("amount_rub") or 0),
+                e.get("category") or "",
+                e.get("note") or "",
+                e.get("id"),
+            ])
+        ws.append(["Итого", float(summary.manual_costs), "", "", ""])
+        for col, width in enumerate([8, 16, 22, 44, 8], 1):
+            ws.column_dimensions[get_column_letter(col)].width = width
+
+    # 5. НДФЛ
     ws = wb.create_sheet("НДФЛ")
     ws.append(["Ступень", "База, RUB", "Ставка", "Налог, RUB"])
     for cell in ws[1]:

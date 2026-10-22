@@ -332,6 +332,40 @@ def normalize_address(chain: str, address: str) -> str:
     return addr
 
 
+def detect_chain(address: str) -> str:
+    """Определить сеть по виду адреса.
+
+    Нужно, чтобы пользователь отдавал только адреса: `/wallet_add 0x…`
+    без указания сети. Разбор по формату:
+      * «0:hex…» (raw) и «EQ…»/«UQ…» (friendly) — TON;
+      * «0x» + 40 hex — EVM (Ethereum, BSC, Polygon и прочие);
+      * «T» + 33 base58 — TRON;
+      * «1…»/«3…»/«bc1…» — Bitcoin;
+      * base58 32-44 символа — Solana.
+    """
+    addr = (address or "").strip()
+    if not addr:
+        return Chain.OTHER
+
+    if addr.startswith("0:"):
+        return Chain.TON
+    if addr.startswith("0x") and len(addr) == 42:
+        return Chain.EVM
+    if addr[:2].upper() in ("EQ", "UQ") and len(addr) >= 46:
+        return Chain.TON
+    if addr.startswith("T") and len(addr) == 34:
+        return Chain.TRON
+    if addr.lower().startswith("bc1"):
+        return Chain.BTC
+    if addr[0] in "13" and 25 <= len(addr) <= 35:
+        return Chain.BTC
+    if 32 <= len(addr) <= 44 and all(
+        c.isalnum() for c in addr
+    ) and not addr.isdigit():
+        return Chain.SOLANA
+    return Chain.OTHER
+
+
 def add_wallet(
     owner_id: int,
     chain: str,
@@ -339,7 +373,13 @@ def add_wallet(
     label: str = "",
     kind: str = "own",
 ) -> Wallet:
-    chain = (chain or Chain.OTHER).lower()
+    chain = (chain or "").strip().lower()
+    if chain in ("", "auto", "?"):
+        # Сеть не указана — определяем по виду адреса.
+        chain = detect_chain(address)
+    elif chain == Chain.OTHER:
+        # «other» — тоже автоопределение, но с откатом на other.
+        chain = detect_chain(address)
     if chain not in Chain.all():
         raise CryptoError(f"Неизвестный блокчейн: {chain!r}. Допустимо: {Chain.all()}")
     address = normalize_address(chain, address)
@@ -686,6 +726,79 @@ def set_tax_settings(owner_id: int, **fields) -> None:
 
 def _year_start(year: int) -> int:
     return int(time.mktime(time.strptime(f"{year}-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")))
+
+
+# ------------------------------------------------- расходы, уменьшающие базу
+
+
+def add_tax_expense(owner_id: int, year: int, amount_rub,
+                    category: str = "", note: str = "") -> int:
+    """Записать прочий расход за год (электричество, комиссии, амортизация).
+
+    Расходы уменьшают налоговую базу: ст. 221 НК РФ разрешает уменьшать
+    доходы на расходы. Без них база майнера считалась бы завышенной на всю
+    сумму добычи, а комиссии бирж и стоимость обслуживания кошельков не
+    попадали бы в расчёт вообще.
+    """
+    amount = _to_decimal(amount_rub)
+    if amount <= 0:
+        raise CryptoError("Сумма расхода должна быть больше нуля")
+    if not (2009 <= year <= 2100):
+        raise CryptoError("Год вне диапазона 2009-2100")
+    with get_db() as conn:
+        cur = conn.execute(
+            "INSERT INTO tax_expenses "
+            "(owner_id, year, amount_rub, category, note) VALUES (?, ?, ?, ?, ?)",
+            (owner_id, year, f"{amount:.2f}", category.strip()[:60],
+             note.strip()[:200]),
+        )
+        return int(cur.lastrowid)
+
+
+def list_tax_expenses(owner_id: int, year: Optional[int] = None) -> list[dict]:
+    """Расходы по годам (или за один год)."""
+    sql = ("SELECT id, year, amount_rub, category, note, created_at "
+           "FROM tax_expenses WHERE owner_id = ?")
+    args: list = [owner_id]
+    if year is not None:
+        sql += " AND year = ?"
+        args.append(year)
+    sql += " ORDER BY year DESC, id DESC"
+    with get_db() as conn:
+        rows = conn.execute(sql, args).fetchall()
+    return [
+        {
+            "id": int(r["id"]),
+            "year": int(r["year"]),
+            "amount_rub": r["amount_rub"] or "0",
+            "category": r["category"] or "",
+            "note": r["note"] or "",
+        }
+        for r in rows
+    ]
+
+
+def delete_tax_expense(expense_id: int, owner_id: int) -> bool:
+    """Удалить расход. True — удалён."""
+    with get_db() as conn:
+        cur = conn.execute(
+            "DELETE FROM tax_expenses WHERE id = ? AND owner_id = ?",
+            (expense_id, owner_id),
+        )
+        return bool(cur.rowcount)
+
+
+def total_tax_expenses(owner_id: int, year: int) -> Decimal:
+    """Сумма расходов за год — вычитается из налоговой базы."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT amount_rub FROM tax_expenses WHERE owner_id = ? AND year = ?",
+            (owner_id, year),
+        ).fetchall()
+    total = Decimal(0)
+    for r in row:
+        total += _to_decimal(r["amount_rub"])
+    return total
 
 
 def _year_end(year: int) -> int:

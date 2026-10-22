@@ -290,6 +290,16 @@ async def _etherscan_call(client, chain_id: int, action: str, address: str,
         except Exception as e:
             logger.warning(f"etherscan {action} сеть: {e}")
             break
+        if resp.status_code == 429:
+            # Бесплатный тариф: 5 запросов в секунду. Ждём и повторяем.
+            logger.warning("etherscan: 429 — пауза 3 с")
+            await asyncio.sleep(3.0)
+            try:
+                resp = await client.get(ETHERSCAN_API_URL, params=params,
+                                       timeout=25.0)
+            except Exception as e:
+                logger.warning(f"etherscan {action} сеть: {e}")
+                break
         if resp.status_code != 200:
             logger.warning(f"etherscan {action} {resp.status_code}")
             break

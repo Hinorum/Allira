@@ -322,12 +322,29 @@ def init_db():
             -- тысяч лотов).
             CREATE TABLE IF NOT EXISTS tax_reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_id INTEGER NOT NULL,
-                year INTEGER NOT NULL,
+                owner_id INTEGER NOT NULL, year INTEGER NOT NULL,
                 payload TEXT NOT NULL,
                 generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE (owner_id, year)
             );
+
+            -- Прочие документально подтверждённые расходы за год: электричество
+            -- у пула, комиссии бирж, амортизация оборудования. Уменьшают
+            -- налоговую базу (ст. 221 НК РФ — расходы, уменьшающие доход).
+            -- Сюда же попадают расходы майнера: без них база считалась бы
+            -- завышенной на всю сумму добычи.
+            CREATE TABLE IF NOT EXISTS tax_expenses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id INTEGER NOT NULL,
+                year INTEGER NOT NULL,
+                amount_rub TEXT NOT NULL,
+                category TEXT DEFAULT '',
+                note TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tax_expenses_owner_year
+                ON tax_expenses(owner_id, year);
 
             CREATE INDEX IF NOT EXISTS idx_crypto_tx_owner_ts
                 ON crypto_transactions(owner_id, ts);
@@ -365,6 +382,16 @@ def init_db():
             )
             logger.info(
                 "Миграция: добавлена колонка is_internal в crypto_transactions"
+            )
+        # Операция подтверждена пользователем: её вид и тип проверены
+        # глазами, в список на проверку она больше не попадает.
+        if "is_confirmed" not in tx_cols:
+            conn.execute(
+                "ALTER TABLE crypto_transactions "
+                "ADD COLUMN is_confirmed INTEGER DEFAULT 0"
+            )
+            logger.info(
+                "Миграция: добавлена колонка is_confirmed в crypto_transactions"
             )
 
         # Комментарий транзакции — единственный признак, по которому в отчёт
