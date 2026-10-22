@@ -142,6 +142,10 @@ MENU_SECTIONS: dict[str, dict] = {
             "<code>15.01 получил 0.5 BTC, 20.06 продал 0.3 BTC за 2.4 млн</code>\n\n"
             "<b>По одной операции</b> — по шагам, без синтаксиса: "
             "<code>/addtx</code>\n\n"
+            "<b>Полностью автоматически</b> — <code>/autoimport</code>: "
+            "отдай только адреса кошельков и (по возможности) выписку биржи, "
+            "бот сам соберёт историю переводов, разберёт покупки и продажи "
+            "и посчитает налог.\n\n"
             "<b>Точной командой</b>:\n"
             "<code>/tx_list</code> — история операций (по году, активу, типу)\n"
             "<code>/addtx &lt;тип&gt; &lt;актив&gt; &lt;количество&gt; "
@@ -153,6 +157,7 @@ MENU_SECTIONS: dict[str, dict] = {
             "transfer_in, transfer_out…"
         ),
         "buttons": [
+            ("📥 Автоимпорт", "autoimport"),
             ("📋 История операций", "tx_list"),
             ("➕ Записать операцию", "addtx"),
             ("🎁 Аирдроп", "airdrop"),
@@ -445,7 +450,8 @@ class _MenuUpdate:
 # Команды, доступные по кнопкам меню. Значение — обработчик с обычной
 # сигнатурой (update, context).
 def _build_commands() -> dict:
-    from handlers import crypto_ledger, crypto_tax, stats_command, wallet_command
+    from handlers import (auto_import, crypto_ledger, crypto_tax, stats_command,
+                          wallet_command)
     from handlers.dice_tournament import start_dice_tournament_registration
 
     return {
@@ -455,6 +461,7 @@ def _build_commands() -> dict:
         "tx_list": crypto_ledger.tx_list_command,
         "addtx": crypto_ledger.addtx_command,
         "airdrop": crypto_ledger.airdrop_command,
+        "autoimport": auto_import.auto_import_command,
         "tax": crypto_tax.tax_command,
         "tax_pdf": crypto_tax.tax_pdf_command,
         "tax_setup_status": crypto_tax.tax_setup_status_command,

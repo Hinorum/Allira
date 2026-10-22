@@ -142,6 +142,8 @@ def _load_txs(owner_id: int, year: int) -> list[Tx]:
             cost_basis_rub=r["cost_basis_rub"],
             note=r["note"] or "", source=r["source"] or "manual",
             external_id=r["external_id"],
+            is_internal=bool(r["is_internal"]) if "is_internal" in r.keys()
+            else False,
         ) for r in rows
     ]
 
@@ -304,6 +306,11 @@ def compute_balances(owner_id: int, up_to_ts: Optional[int] = None) -> list[Bala
         amount_raw = _to_decimal(r["amount_raw"])
         amount = amount_raw / scale  # human-единицы
         tx_type = r["tx_type"]
+        # Перемещение внутри периметра (свой кошелёк ↔ биржа) — актив учтён
+        # в месте покупки. Учитывать его здесь значит посчитать один актив
+        # дважды: и лот от покупки, и лот от зачисления.
+        if "is_internal" in r.keys() and r["is_internal"]:
+            continue
         # Себестоимость лота — по тем же правилам, что и в tax_calc:
         # явная cost_basis_rub приоритетна; для доходных типов
         # (аирдроп, майнинг...) fiat_value_rub — это оценка ДОХОДА, а не

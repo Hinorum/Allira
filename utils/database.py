@@ -350,6 +350,23 @@ def init_db():
             conn.execute("ALTER TABLE marketapp_rent_events ADD COLUMN wallet TEXT DEFAULT ''")
             logger.info("Миграция: добавлена колонка wallet в marketapp_rent_events")
 
+        # Перемещение активов ВНУТРИ отслеживаемого периметра: свой кошелёк ↔
+        # биржа, биржа ↔ биржа. Экономики нет — актив тот же самый, только
+        # лежит в другом месте. Такая проводка не открывает и не гасит
+        # FIFO-лот и не попадает в расчётный остаток, иначе один и тот же
+        # актив учитывался бы дважды (лот от покупки на бирже + лот от
+        # зачисления на кошелёк).
+        tx_cols = [row["name"] for row in conn.execute(
+            "PRAGMA table_info(crypto_transactions)")]
+        if "is_internal" not in tx_cols:
+            conn.execute(
+                "ALTER TABLE crypto_transactions "
+                "ADD COLUMN is_internal INTEGER DEFAULT 0"
+            )
+            logger.info(
+                "Миграция: добавлена колонка is_internal в crypto_transactions"
+            )
+
         # Комментарий транзакции — единственный признак, по которому в отчёт
         # попадает именно аренда: остальные входящие переводы сюда фильтруются
         # маркерами, а без текста разобраться, какие переводы лишние, нельзя.

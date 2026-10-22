@@ -1,17 +1,21 @@
 """Фоновые задачи крипто-бухгалтерии.
 
-crypto_sync_jobs(application) — фоновая джоба, которая для каждого
-отслеживаемого TON-кошелька через TonAPI подтягивает:
-  • Jetton Transfer (входящие и исходящие) — записываются как
-    transfer_in / transfer_out с автоценой через price_oracle.
-  • TON Transfer без комментария rent — могут быть аирдропы (без явного
-    маркера); пока оставляем только транзакции с известными Jetton-
-    переводами, TON без метки не пишем.
-  • Регулярно прогревает кэш котировок ЦБ за последние 7 дней.
+crypto_sync_jobs(application) — фоновая дода, которая:
+  • раз в 15 минут сканирует кошельки владельца (TON через TonAPI, EVM через
+    Etherscan V2) и записывает найденные переводы в бухгалтерию —
+    см. utils/chain_scan.py и utils/auto_import.py;
+  • раз в сутки прогревает кэш котировок ЦБ и CoinGecko.
+
+Классификация переводов (доход / реализация / обмен / перемещение) живёт в
+utils/auto_import.py — там же и сопоставление ончейн-переводов с выписками
+бирж. Раньше здесь был отдельный Jetton-сканер: он считал любой входящий
+перевод с неизвестного адреса аирдропом, из-за чего вывод с биржи попадал в
+налоговую базу как доход. Теперь переводы с бирж и между своими кошельками
+распознаются как перемещения и базу не трогают.
 
 Сделано отдельным модулем, чтобы не трогать marketapp_reports.py:
 там сложилась плотная логика NFT-аренды, и подмешивать сюда общий
-Jetton-скан было бы источником регрессий.
+сканер было бы источником регрессий.
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ from telegram.ext import Application
 
 from utils.config import BotConfig
 from utils.crypto_db import (Chain, TxType, add_transaction, ensure_asset,
-                            list_wallets)
+                             list_wallets)
 from utils.database import get_db
 from utils.http_client import get_client
 from utils.price_oracle import get_asset_price_rub
@@ -44,7 +48,7 @@ EXTERNAL_PREFIX = "jetton-sync"
 
 
 def setup_crypto_sync_jobs(application: Application) -> None:
-    """Подключает периодический Jetton-скан для каждого TON-кошелька."""
+    """Подключает периодический скан кошельков (TON + EVM)."""
     config: BotConfig = application.bot_data.get("BOT_CONFIG")  # type: ignore[assignment]
     if not config:
         logger.warning("setup_crypto_sync_jobs: BOT_CONFIG не найден")
@@ -62,8 +66,8 @@ def setup_crypto_sync_jobs(application: Application) -> None:
     application.job_queue.run_repeating(
         _sync_wallets_job,
         interval=900,    # раз в 15 минут
-        name="crypto_jetton_sync",
-        data={"owner_id": owner_id, "api_key": config.tonapi_api_key},
+        name="crypto_chain_sync",
+        data={"owner_id": owner_id, "config": config},
     )
     application.job_queue.run_repeating(
         _warm_rate_cache_job,
@@ -71,217 +75,49 @@ def setup_crypto_sync_jobs(application: Application) -> None:
         name="crypto_rate_warm",
         data={"owner_id": owner_id},
     )
-    logger.info(f"Крипто-скан: owner_id={owner_id}, jetton_sync каждые 15 мин")
+    logger.info(f"Крипто-скан: owner_id={owner_id}, скан кошельков каждые 15 мин")
 
 
 # --------------------------------------------------------- Jetton-скан
 
 
 async def _sync_wallets_job(context) -> None:
+    """Фоновый скан кошельков: переводы → бухгалтерия."""
+    from utils.auto_import import run
+
     owner_id = int(context.job.data.get("owner_id") or 0)
-    api_key = context.job.data.get("api_key") or ""
     if not owner_id:
         return
-    wallets = list_wallets(owner_id, chain=Chain.TON)
-    if not wallets:
-        logger.debug("crypto_sync: нет TON-кошельков")
+    cfg: BotConfig = context.job.data.get("config")  # type: ignore[assignment]
+    try:
+        result = await run(owner_id, cfg)
+    except Exception as e:
+        logger.error(f"crypto_sync: скан не удался: {e}", exc_info=True)
         return
-    for wallet in wallets:
-        try:
-            saved = await sync_jetton_transfers(wallet, api_key)
-            logger.info(
-                f"crypto_sync: {wallet.address[:8]}… → {saved} переводов"
-            )
-        except Exception as e:
-            logger.error(
-                f"crypto_sync: ошибка для {wallet.address}: {e}",
-                exc_info=True,
-            )
-        await asyncio.sleep(2.0)
+    if result.saved or result.review:
+        logger.info(
+            f"crypto_sync: +{result.saved} операций, "
+            f"{result.duplicates} дублей, на проверку {len(result.review)}"
+        )
 
 
 async def sync_jetton_transfers(wallet, api_key: str) -> int:
-    """Сканер Jetton-переводов одного TON-кошелька.
+    """Скан переводов одного TON-кошелька.
 
-    Использует /v2/accounts/{addr}/jettons/history — пагинированный список
-    переводов всех Jetton'ов на кошельке. Каждый перевод — отдельная
-    запись в crypto_transactions с source='jetton-sync' и уникальным
-    external_id (дедупликация встроена в add_transaction).
-
-    Классификация (умная):
-      * обе стороны перевода — мои кошельки → TRANSFER_IN/OUT (не доход)
-      * в одном событии есть и входящий, и исходящий JettonTransfer →
-        оба SWAP (обмен через DEX типа STON.fi)
-      * входящий без пары и не от своего → AIRDROP (доход по НК)
-      * исходящий без пары и не своему → SWAP_OUT (расход по НК)
+    Оставлен как обёртка над общим конвейером (chain_scan + auto_import):
+    админ-панель вызывает его по кнопке «Скан TON». Классификация — общая,
+    поэтому вывод с биржи и переводы между своими кошельками больше не
+    попадают в базу как доход.
     """
-    from utils.crypto_db import list_wallets
+    from utils.auto_import import classify_moves, persist_moves
+    from utils.chain_scan import scan_ton
 
-    # Свои адреса для детекции «перевод себе» — в одном user_data может
-    # быть несколько TON-кошельков.
-    my_addresses: set[str] = {
-        wallet.address.lower(),
-        *(w.address.lower() for w in list_wallets(wallet.owner_id, chain=Chain.TON)),
-    }
-
-    client = await get_client()
-    headers = {"User-Agent": "AlliraBot/1.0"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    last_ts = _get_watermark(wallet.id)
-    saved = 0
-
-    before_lt: Optional[int] = None
-    while True:
-        params = {"limit": 100}
-        if before_lt:
-            params["before_lt"] = before_lt
-        try:
-            resp = await client.get(
-                f"{TONAPI_API_URL}/accounts/{wallet.address}/jettons/history",
-                params=params,
-                headers=headers,
-                timeout=20.0,
-            )
-        except Exception as e:
-            logger.warning(f"jetton history сеть: {e}")
-            await asyncio.sleep(2.0)
-            return saved
-
-        if resp.status_code == 429:
-            await asyncio.sleep(5.0)
-            return saved
-        if resp.status_code != 200:
-            logger.warning(f"jetton history {resp.status_code}: {resp.text[:120]}")
-            return saved
-        try:
-            data = resp.json()
-        except Exception:
-            return saved
-
-        events = (data or {}).get("events") or []
-        if not events:
-            break
-
-        stop = False
-        for ev in events:
-            ts = int(ev.get("timestamp", 0) or 0)
-            if ts and last_ts and ts <= last_ts:
-                stop = True
-                break
-
-            actions = ev.get("actions") or []
-            # Классификация уровня события:
-            # собираем только JettonTransfer-действия этого аккаунта.
-            jet_actions: list[tuple[str, dict]] = []  # ("in"|"out", action)
-            for action in actions:
-                if action.get("type") != "JettonTransfer":
-                    continue
-                jt = action.get("JettonTransfer", {}) or {}
-                sender = (jt.get("sender") or {}).get("address", "").lower()
-                recipient = (jt.get("recipient") or {}).get("address", "").lower()
-                if recipient in my_addresses:
-                    jet_actions.append(("in", action))
-                elif sender in my_addresses:
-                    jet_actions.append(("out", action))
-                # иначе: транзакция касается третьих лиц (skip)
-
-            # Если в событии есть и входящий, и исходящий — это обмен.
-            has_in = any(d == "in" for d, _ in jet_actions)
-            has_out = any(d == "out" for d, _ in jet_actions)
-            is_swap = has_in and has_out
-
-            for direction, action in jet_actions:
-                jt = action.get("JettonTransfer", {}) or {}
-                jetton = jt.get("jetton") or {}
-                symbol = (jetton.get("symbol") or "").upper()
-                if not symbol:
-                    continue
-                decimals = int(jetton.get("decimals") or 9)
-                raw_amount = jt.get("amount")
-                if not raw_amount:
-                    continue
-                try:
-                    amount_int = int(raw_amount)
-                except (TypeError, ValueError):
-                    continue
-                if amount_int == 0:
-                    continue
-
-                sender = (jt.get("sender") or {}).get("address", "").lower()
-                recipient = (jt.get("recipient") or {}).get("address", "").lower()
-
-                # Умная классификация:
-                if direction == "in" and sender in my_addresses:
-                    tx_type = TxType.TRANSFER_IN
-                elif direction == "out" and recipient in my_addresses:
-                    tx_type = TxType.TRANSFER_OUT
-                elif is_swap:
-                    tx_type = TxType.SWAP_OUT if direction == "out" else TxType.AIRDROP
-                elif direction == "in":
-                    tx_type = TxType.AIRDROP
-                else:
-                    tx_type = TxType.SWAP_OUT
-
-                # Сумма в минимальных единицах (Jetton отдаёт «нано»).
-                # add_transaction ждёт ЧЕЛОВЕЧЕСКОЕ количество и сам
-                # умножает его на 10**decimals. Раньше сюда передавался
-                # amount_int — то есть 1 TON записывался как 1 000 000 000 TON,
-                # а рублёвая оценка считалась по правильному числу. Итог:
-                # в отчёте для ФНС абсурдные количества при правдоподобных
-                # суммах, и вечный «расхват» в /reconcile.
-                human_amount = (Decimal(amount_int) / (Decimal(10) ** decimals))
-                human_amount_str = f"{human_amount:f}"
-
-                # Получить котировку для авто-цены (если возможно).
-                fiat = ""
-                try:
-                    market = await get_asset_price_rub(symbol, ts)
-                    if market:
-                        fiat = str(round(
-                            human_amount * Decimal(str(market)), 2,
-                        ))
-                except Exception:
-                    pass
-
-                ext_id = f"{EXTERNAL_PREFIX}:{ev.get('event_id', '')}:{symbol}:{direction}"
-                try:
-                    ensure_asset(
-                        symbol=symbol,
-                        name=jetton.get("name") or symbol,
-                        chain=Chain.TON,
-                        decimals=decimals,
-                        coingecko_id="",
-                        contract=(jetton.get("address") or ""),
-                        kind="jetton",
-                    )
-                    add_transaction(
-                        owner_id=wallet.owner_id,
-                        ts=ts,
-                        wallet_id=wallet.id,
-                        asset_symbol=symbol,
-                        tx_type=tx_type,
-                        amount=human_amount_str,
-                        fiat_value_rub=fiat or None,
-                        note=(f"auto jetton-sync; "
-                              f"op_hash={ev.get('event_id', '')[:20]}"),
-                        source="jetton-sync",
-                        external_id=ext_id,
-                    )
-                    saved += 1
-                except Exception as e:
-                    logger.info(f"jetton-sync: пропуск {symbol} {tx_type}: {e}")
-
-            if ts:
-                _set_watermark(wallet.id, max(last_ts, ts))
-        if stop:
-            break
-        # Следующая страница — по последнему lt.
-        before_lt = events[-1].get("lt")
-        if not before_lt:
-            break
-        await asyncio.sleep(0.6)
+    moves = await scan_ton(wallet.address, api_key)
+    if not moves:
+        return 0
+    classified = await classify_moves(wallet.owner_id, moves)
+    saved, _dups, _review = await persist_moves(
+        wallet.owner_id, classified, wallet_id=wallet.id)
     return saved
 
 

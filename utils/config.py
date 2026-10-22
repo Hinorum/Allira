@@ -84,6 +84,11 @@ class BotConfig:
     okx_api_key: str = ""
     okx_api_secret: str = ""
     okx_passphrase: str = ""
+    # Etherscan V2: один ключ на много сетей. Пусто — EVM-кошельки не
+    # сканируются. EVM_CHAIN_IDS — через запятую: 1 (Ethereum), 56 (BSC),
+    # 137 (Polygon), 8453 (Base), 42161 (Arbitrum), 10 (Optimism).
+    etherscan_api_key: str = ""
+    evm_chain_ids: str = ""
     # Токен веб-панели управления (/admin). Пусто — панель отключена.
     admin_panel_token: str = ""
 
@@ -136,5 +141,7 @@ class BotConfig:
             okx_api_key=os.getenv("OKX_API_KEY", "").strip(),
             okx_api_secret=os.getenv("OKX_API_SECRET", "").strip(),
             okx_passphrase=os.getenv("OKX_PASSPHRASE", "").strip(),
+            etherscan_api_key=os.getenv("ETHERSCAN_API_KEY", "").strip(),
+            evm_chain_ids=os.getenv("EVM_CHAIN_IDS", "").strip(),
             admin_panel_token=os.getenv("ADMIN_PANEL_TOKEN", "").strip(),
         )

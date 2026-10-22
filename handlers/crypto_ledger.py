@@ -40,11 +40,10 @@ from utils.crypto_db import (
     add_transaction, add_wallet, ensure_asset, get_asset, humanize_amount,
     list_transactions, list_wallets,
 )
-from utils.csv_import import parse_csv
+from utils.statement_import import parse_statement
 from utils.database import get_db
 from utils.price_oracle import format_rub, get_asset_price_rub
 from utils.tax_calc import rebuild_lots
-from tasks.cex_sync import persist_cex_rows
 from handlers.tx_wizard import (
     normalize_type, start_bulk_flow, start_wizard,
 )
@@ -721,23 +720,31 @@ async def rate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """`/import` — реплай на CSV-файл. Парсим и заливаем."""
+    """`/import` — реплай на CSV/XLSX-файл выписки. Парсим и заливаем."""
     if not await _is_owner_chat(update, context):
         return
     msg = update.message
+    # Файл может прийти двумя способами: приложением к команде (подпись
+    # «/import») или реплаем на уже отправленный файл.
     document = msg.document if msg else None
+    if not document and msg and msg.reply_to_message:
+        document = msg.reply_to_message.document
     if not document:
         await msg.reply_text(
-            "Пришли CSV-файл выписки биржи <b>реплаем</b> на сообщение "
+            "Пришли файл выписки биржи <b>реплаем</b> на сообщение "
             "с командой <code>/import</code>.\n\n"
-            "Поддерживаются: Bybit (trades), OKX (orders history), "
-            "а также внутренний формат с колонками: "
-            "<code>ts, asset, type, amount, fiat_rub, cost_basis_rub, note</code>",
+            "Формат: CSV или Excel (.xlsx). Заголовки распознаются сами — "
+            "Bybit, OKX, Binance и русские («Дата», «Торговая пара», "
+            "«Тип операции», «Количество», «Цена»).\n"
+            "Поддерживаются покупки, продажи, вводы и выводы.\n"
+            "Подробный режим со сверкой и сопоставлением переводов — "
+            "<code>/autoimport</code>.",
             parse_mode="HTML",
         )
         return
-    if not (document.file_name or "").lower().endswith(".csv"):
-        await msg.reply_text("Ожидался .csv-файл.")
+    name = (document.file_name or "").lower()
+    if not name.endswith((".csv", ".xlsx", ".xlsm")):
+        await msg.reply_text("Ожидался .csv или .xlsx-файл.")
         return
     try:
         file = await context.bot.get_file(document.file_id)
@@ -748,39 +755,42 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"Не удалось скачать файл: {e}")
         return
 
-    parsed, errors = parse_csv(buf.getvalue())
-
-    if errors and not parsed:
-        await msg.reply_text(
-            "Не удалось распознать файл:\n" +
-            "\n".join(f"• {escape_html(e)}" for e in errors[:10])
-        )
-        return
-
     owner = _owner_id(context)
-    # Импорт идёт через persist_cex_rows — тем же путём, что и API-синк.
+    # Импорт идёт через import_statement — тем же путём, что и API-синк.
     # Раньше CSV-строки писались напрямую, и quote-сумма (USDT) попадала
     # в рублёвые поля: покупка 0.5 BTC по 60000 USDT давала себестоимость
     # 30 000 ₽ вместо ~2.4 млн ₽, и отчёт 3-НДФЛ был занижен в ~80 раз.
     # Здесь quote переводится в рубли по курсу на дату сделки, а если
     # котировки нет — сделка пишется без рублевой оценки и попадает в
     # отчёт как «нет котировки», а не как неверное число.
-    saved, dups = await persist_cex_rows(owner, parsed, "csv")
-    skipped = dups
-    fail = 0
+    #
+    # Дополнительно: вводам проставляется себестоимость (рынок на дату
+    # ввода), а уже записанные ончейн-переводы пересопоставляются с
+    # выпиской: вывод с биржи перестаёт считаться доходом.
+    from utils.auto_import import import_statement
+
+    result = await import_statement(owner, buf.getvalue(),
+                                    document.file_name or "")
 
     msg_lines = [
         "<b>Импорт завершён:</b>",
-        f"• распознано строк: {len(parsed)}",
-        f"• сохранено проводок: {saved}",
+        f"• распознано строк: {result.rows}",
+        f"• сохранено проводок: {result.saved}",
     ]
-    if skipped:
-        msg_lines.append(f"• пропущено (дубли/ошибки): {skipped}")
-    if fail:
-        msg_lines.append(f"• сбой: {fail}")
-    if errors:
+    if result.duplicates:
+        msg_lines.append(f"• пропущено (дубли/ошибки): {result.duplicates}")
+    if result.rematched:
+        msg_lines.append(
+            f"• переведено в перемещения: {result.rematched} "
+            f"(вывод с биржи перестал быть доходом)"
+        )
+    if result.review:
+        msg_lines.append("\n<b>Нужна проверка:</b>")
+        for r in result.review[:10]:
+            msg_lines.append(f"• {escape_html(r.message[:160])}")
+    if result.errors:
         msg_lines.append("\n<b>Что не удалось:</b>")
-        msg_lines.extend(f"• {escape_html(e)}" for e in errors[:10])
+        msg_lines.extend(f"• {escape_html(e)}" for e in result.errors[:10])
     await msg.reply_text("\n".join(msg_lines), parse_mode="HTML")
 
 

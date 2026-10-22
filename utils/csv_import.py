@@ -24,8 +24,6 @@ cost_basis_rub, а эти поля во всём проекте считаютс
 
 from __future__ import annotations
 
-import csv
-import io
 import logging
 import time
 from dataclasses import dataclass
@@ -77,25 +75,15 @@ def detect_format(headers: list[str]) -> str:
 
 
 def parse_csv(content: bytes, source_hint: str = "") -> tuple[list[ParsedRow], list[str]]:
-    """Распарсить CSV-файл в список ParsedRow.
+    """Разобрать CSV-файл в список ParsedRow.
 
-    Возвращает (rows, errors). errors — список сообщений для пользователя
-    (например, «строка 5: неизвестный символ»).
+    Оставлено как совместимая обёртка над utils/statement_import.py —
+    там же разбор Excel и авто-определение колонок. Свои позиционные
+    парсеры Bybit/OKX используются, только если заголовки не распознались.
     """
-    text = content.decode("utf-8-sig", errors="replace")
-    reader = csv.reader(io.StringIO(text))
-    rows: list[list[str]] = list(reader)
-    if not rows:
-        return [], ["пустой файл"]
-    headers = rows[0]
-    fmt = source_hint or detect_format(headers)
-    if fmt == "bybit":
-        return _parse_bybit(rows[1:])
-    if fmt == "okx":
-        return _parse_okx(rows[1:])
-    if fmt == "internal":
-        return _parse_internal(rows[1:])
-    return [], [f"не удалось определить формат (заголовки: {headers!r})"]
+    from utils.statement_import import parse_statement
+
+    return parse_statement(content, "", source_hint)
 
 
 def _parse_bybit(body: Iterable[list[str]]) -> tuple[list[ParsedRow], list[str]]:

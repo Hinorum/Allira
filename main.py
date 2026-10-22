@@ -75,6 +75,7 @@ from handlers.crypto_tax import (
 )
 from handlers.tx_wizard import bulk_callback, wizard_callback, wizard_text_handler
 from handlers.cex_command import cex_status_command, cex_sync_command
+from handlers.auto_import import auto_import_command, auto_import_callback
 from handlers.reconcile_command import reconcile_command, reconcile_xlsx_command
 from handlers.admin_menu import admin_command, admin_menu_callback
 from utils import bot_admin, web_panel
@@ -724,6 +725,10 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("tax_csv", tax_csv_command))
     application.add_handler(CommandHandler("cex_status", cex_status_command))
     application.add_handler(CommandHandler("cex_sync", cex_sync_command))
+    application.add_handler(CommandHandler("autoimport", auto_import_command))
+    application.add_handler(CallbackQueryHandler(
+        auto_import_callback, pattern="^ai:"
+    ))
     application.add_handler(CommandHandler("reconcile", reconcile_command))
     application.add_handler(CommandHandler("reconcile_xlsx", reconcile_xlsx_command))
 

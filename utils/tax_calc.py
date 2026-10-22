@@ -293,6 +293,12 @@ def _walk_fifo(
         cost_basis = _to_decimal(row["cost_basis_rub"]) if row["cost_basis_rub"] else Decimal(0)
         fiat_value = _to_decimal(row["fiat_value_rub"]) if row["fiat_value_rub"] else Decimal(0)
 
+        # Перемещение внутри отслеживаемого периметра: актив уже учтён
+        # лотом в месте покупки. Лот здесь открывать нельзя — иначе один
+        # актив будет учтён дважды (лот от покупки и лот от зачисления).
+        if "is_internal" in row.keys() and row["is_internal"]:
+            continue
+
         if tx_type in TxType.lot_in_types():
             # Себестоимость прихода (за 1 единицу актива):
             cost_total = _lot_cost_total(tx_type, cost_basis, fiat_value)
@@ -387,6 +393,8 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
             cost_basis_rub=r["cost_basis_rub"],
             note=r["note"] or "", source=r["source"] or "manual",
             external_id=r["external_id"],
+            is_internal=(bool(r["is_internal"])
+                         if "is_internal" in r.keys() else False),
         ) for r in rows
     ]
     txs.sort(key=lambda t: (t.ts, t.id))
@@ -415,6 +423,11 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
         amount_raw = _to_decimal(tx.amount_raw)
         amount_human = amount_raw / scale
         tx_year = tx.ts >= year_start_ts
+
+        if tx.is_internal:
+            # Перемещение внутри отслеживаемого периметра: актив уже учтён
+            # лотом в месте покупки. Ни лота, ни дохода, ни расхода.
+            continue
 
         if tx.tx_type in TxType.lot_in_types():
             # Лот открываем всегда — даже без котировки. Иначе FIFO

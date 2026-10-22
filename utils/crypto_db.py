@@ -221,6 +221,9 @@ class Tx:
     note: str
     source: str
     external_id: Optional[str]
+    # Перемещение внутри отслеживаемого периметра (свой кошелёк ↔ биржа).
+    # Не открывает и не гасит лот, не влияет на остаток.
+    is_internal: bool = False
 
     def amount_human(self, decimals: int) -> Decimal:
         return _to_decimal(self.amount_raw) / (Decimal(10) ** decimals)
@@ -455,6 +458,7 @@ def add_transaction(
     note: str = "",
     source: str = "manual",
     external_id: str = "",
+    is_internal: bool = False,
 ) -> Tx:
     """Создать запись об операции.
 
@@ -463,6 +467,10 @@ def add_transaction(
       * amount > 0 в абсолютной величине; знак выводится из tx_type;
       * кошелёк (если указан) принадлежит owner_id;
       * ts в пределах разумного (после 2009 — год появления BTC).
+
+    is_internal=True — перемещение внутри отслеживаемого периметра (свой
+    кошелёк ↔ биржа). Такая проводка не открывает и не гасит FIFO-лот и не
+    влияет на расчётный остаток: актив учтён там, где он acquired.
     """
     if tx_type not in TxType.all():
         raise CryptoError(f"Неизвестный тип операции: {tx_type!r}")
@@ -503,11 +511,13 @@ def add_transaction(
             """
             INSERT INTO crypto_transactions
                 (owner_id, ts, wallet_id, asset_id, tx_type, direction,
-                 amount_raw, fiat_value_rub, cost_basis_rub, note, source, external_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 amount_raw, fiat_value_rub, cost_basis_rub, note, source,
+                 external_id, is_internal)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (owner_id, ts, wallet_id, asset.id, tx_type, direction,
-             amount_raw, fv, cb, note.strip()[:500], source, external_id[:200]),
+             amount_raw, fv, cb, note.strip()[:500], source, external_id[:200],
+             1 if is_internal else 0),
         )
         return get_transaction(cur.lastrowid)  # type: ignore[arg-type]
 
@@ -618,6 +628,8 @@ def _tx_from_row(row) -> Tx:
         note=row["note"] or "",
         source=row["source"] or "manual",
         external_id=row["external_id"],
+        is_internal=bool(row["is_internal"]) if "is_internal" in row.keys()
+        else False,
     )
 
 
