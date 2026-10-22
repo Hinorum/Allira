@@ -15,6 +15,8 @@
     контроля check_negative_balances: USDT «пришёл» бы откуда-то ещё,
     если бы это была реальная история.
   * Остаточная себестоимость BTC = 150 000 RUB (FIFO: продан старый лот).
+  * Недоступный источник (упавший API биржи) даёт issue source_unavailable,
+    а не молчаливую «сверку, которая прошла».
 """
 
 import asyncio
@@ -146,6 +148,86 @@ async def main() -> int:
     if btc_row and btc_row.cost_rub != 150000:
         errors.append(f"остаточная себестоимость BTC должна быть 150000, "
                       f"не {btc_row.cost_rub}")
+
+    # --- Недоступный источник — это НЕ «сверка прошла».
+    # Раньше упавший Bybit просто исчезал из сверки, и отчёт оставался
+    # зелёным, хотя сверки по бирже не было вовсе.
+    import utils.reconciliation as rec
+
+    class _FakeResp:
+        def __init__(self, status):
+            self.status_code = status
+
+        def json(self):
+            return {}
+
+    class _FakeClient:
+        async def get(self, *args, **kwargs):
+            return _FakeResp(503)
+
+    class _Cfg:
+        tonapi_api_key = ""
+        bybit_api_key = "key"
+        bybit_api_secret = "secret"
+        okx_api_key = "key"
+        okx_api_secret = "secret"
+        okx_passphrase = "pass"
+
+    orig_get_client = rec.get_client
+
+    async def _fake_get_client():
+        return _FakeClient()
+
+    rec.get_client = _fake_get_client
+    try:
+        actual, unavailable = await rec.fetch_actual_balances(owner, _Cfg())
+    finally:
+        rec.get_client = orig_get_client
+    print(f"\nИсточники недоступны: {unavailable}")
+    if unavailable != ["Bybit", "OKX"]:
+        errors.append(f"недоступные источники должны быть ['Bybit', 'OKX'], "
+                      f"а не {unavailable}")
+    if actual:
+        errors.append(f"при упавшем API фактических балансов быть не должно, "
+                      f"получено {actual}")
+
+    # TON без кошельков — сверять нечего, это не ошибка.
+    actual_ton, unavailable_ton = await rec.fetch_actual_balances(owner, None)
+    if unavailable_ton:
+        errors.append(f"пустой список TON-кошельков — не недоступность, "
+                      f"получено {unavailable_ton}")
+    if actual_ton:
+        errors.append(f"без кошельков фактических балансов быть не должно, "
+                      f"получено {actual_ton}")
+
+    # reconcile превращает недоступность источника в issue.
+    orig_fetch = rec.fetch_actual_balances
+
+    async def _fake_fetch_ok(owner_id, config=None):
+        return [], []
+
+    async def _fake_fetch_broken(owner_id, config=None):
+        return [], ["Bybit"]
+
+    try:
+        rec.fetch_actual_balances = _fake_fetch_ok
+        report_ok = await rec.reconcile(owner, year, config=None,
+                                        with_actual=True)
+        rec.fetch_actual_balances = _fake_fetch_broken
+        report_broken = await rec.reconcile(owner, year, config=None,
+                                             with_actual=True)
+    finally:
+        rec.fetch_actual_balances = orig_fetch
+
+    clean = [i for i in report_ok.issues if i.kind == "source_unavailable"]
+    if clean:
+        errors.append(f"без недоступных источников issues быть не должно, "
+                      f"получено {[i.message for i in clean]}")
+    broken = [i for i in report_broken.issues if i.kind == "source_unavailable"]
+    if len(broken) != 1:
+        errors.append(f"ожидался 1 issue source_unavailable, получено {len(broken)}")
+    elif "Bybit" not in broken[0].message:
+        errors.append(f"в issue должно быть имя источника: {broken[0].message}")
 
     print()
     if not errors:

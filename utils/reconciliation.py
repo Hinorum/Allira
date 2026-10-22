@@ -83,7 +83,7 @@ class ActualBalance:
 
 @dataclass
 class ReconciliationIssue:
-    kind: str              # unpaired / negative_balance / drift / no_quote
+    kind: str              # unpaired / negative_balance / drift / no_quote / source_unavailable
     message: str
     tx_ids: list[int] = field(default_factory=list)
     symbol: str = ""
@@ -351,33 +351,59 @@ def check_negative_balances(balances: list[BalanceRow]) -> list[ReconciliationIs
     return issues
 
 
-async def fetch_actual_balances(owner_id: int, config=None) -> list[ActualBalance]:
+async def fetch_actual_balances(owner_id: int,
+                               config=None) -> tuple[list[ActualBalance], list[str]]:
     """Фактические балансы: TON-кошельки (TonAPI), Bybit, OKX.
 
     config — BotConfig (опционально; нужен для ключей CEX). Ошибки сети
-    не фейлят сверку — источник просто не попадает в отчёт.
+    не фейлят сверку — источник просто не попадает в балансы, НО его
+    имя возвращается вторым элементом, чтобы `reconcile` превратил
+    недоступность в issues. Без этого упавший или заблокированный API
+    Bybit выглядел бы как «сверка пройдена», хотя сверки по нему не
+    было вовсе.
+
+    Возвращает: (балансы, имена недоступных источников).
     """
     actual: list[ActualBalance] = []
-    actual += await _fetch_ton_balances(owner_id,
-                                        (config.tonapi_api_key if config else ""))
+    unavailable: list[str] = []
+
+    ton, ton_broken = await _fetch_ton_balances(
+        owner_id, (config.tonapi_api_key if config else "")
+    )
+    actual += ton
+    if ton_broken:
+        unavailable.append("TonAPI")
+
     if config is not None:
-        actual += await _fetch_bybit_balances(config.bybit_api_key,
-                                              config.bybit_api_secret)
-        actual += await _fetch_okx_balances(config.okx_api_key,
-                                            config.okx_api_secret,
-                                            config.okx_passphrase)
-    return actual
+        bybit, bybit_broken = await _fetch_bybit_balances(
+            config.bybit_api_key, config.bybit_api_secret
+        )
+        actual += bybit
+        if bybit_broken:
+            unavailable.append("Bybit")
+
+        okx, okx_broken = await _fetch_okx_balances(
+            config.okx_api_key, config.okx_api_secret, config.okx_passphrase
+        )
+        actual += okx
+        if okx_broken:
+            unavailable.append("OKX")
+
+    return actual, unavailable
 
 
-async def _fetch_ton_balances(owner_id: int, api_key: str) -> list[ActualBalance]:
+async def _fetch_ton_balances(owner_id: int,
+                              api_key: str) -> tuple[list[ActualBalance], bool]:
+    """Балансы TON-кошельков. Второй элемент — источник не ответил."""
     wallets = list_wallets(owner_id, chain=Chain.TON)
     if not wallets:
-        return []
+        return [], False  # кошельков нет — сверять нечего, это не ошибка
     client = await get_client()
     headers = {"User-Agent": "AlliraBot/1.0"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     out: list[ActualBalance] = []
+    ok = True
     for w in wallets:
         try:
             resp = await client.get(
@@ -386,6 +412,7 @@ async def _fetch_ton_balances(owner_id: int, api_key: str) -> list[ActualBalance
             )
             if resp.status_code != 200:
                 logger.warning(f"ton balance {w.address}: {resp.status_code}")
+                ok = False
                 continue
             data = resp.json() or {}
             balances = data.get("balances") or []
@@ -402,12 +429,15 @@ async def _fetch_ton_balances(owner_id: int, api_key: str) -> list[ActualBalance
                 ))
         except Exception as e:
             logger.warning(f"ton balance fetch {w.address}: {e}")
-    return out
+            ok = False
+    return out, not ok
 
 
-async def _fetch_bybit_balances(api_key: str, api_secret: str) -> list[ActualBalance]:
+async def _fetch_bybit_balances(api_key: str,
+                                api_secret: str) -> tuple[list[ActualBalance], bool]:
+    """Пустой список без недоступности — это настоящее «на бирже пусто»."""
     if not (api_key and api_secret):
-        return []
+        return [], False  # ключи не заданы — сверять нечего
     from utils.cex_api import _bybit_sign  # переиспользуем подпись
     client = await get_client()
     params = {"accountType": "SPOT"}
@@ -418,10 +448,10 @@ async def _fetch_bybit_balances(api_key: str, api_secret: str) -> list[ActualBal
             params=params, headers=headers, timeout=20.0,
         )
         if resp.status_code != 200:
-            return []
+            return [], True
         payload = resp.json() or {}
         if payload.get("retCode") != 0:
-            return []
+            return [], True
         out: list[ActualBalance] = []
         for acct in (payload.get("result") or {}).get("list") or []:
             for coin in acct.get("coin") or []:
@@ -429,16 +459,16 @@ async def _fetch_bybit_balances(api_key: str, api_secret: str) -> list[ActualBal
                 qty = _to_decimal(coin.get("walletBalance") or "0")
                 if symbol and qty > 0:
                     out.append(ActualBalance(symbol=symbol, qty=qty, where="bybit"))
-        return out
+        return out, False
     except Exception as e:
         logger.warning(f"bybit balance fetch: {e}")
-        return []
+        return [], True
 
 
 async def _fetch_okx_balances(api_key: str, api_secret: str,
-                              passphrase: str) -> list[ActualBalance]:
+                              passphrase: str) -> tuple[list[ActualBalance], bool]:
     if not (api_key and api_secret and passphrase):
-        return []
+        return [], False  # ключи не заданы — сверять нечего
     from utils.cex_api import _okx_sign
     client = await get_client()
     params = {"ccy": ""}
@@ -450,10 +480,10 @@ async def _fetch_okx_balances(api_key: str, api_secret: str,
             params=params, headers=headers, timeout=20.0,
         )
         if resp.status_code != 200:
-            return []
+            return [], True
         payload = resp.json() or {}
         if payload.get("code") != "0":
-            return []
+            return [], True
         out: list[ActualBalance] = []
         for acct in payload.get("data") or []:
             for detail in acct.get("details") or []:
@@ -461,10 +491,10 @@ async def _fetch_okx_balances(api_key: str, api_secret: str,
                 qty = _to_decimal(detail.get("bal") or "0")
                 if symbol and qty > 0:
                     out.append(ActualBalance(symbol=symbol, qty=qty, where="okx"))
-        return out
+        return out, False
     except Exception as e:
         logger.warning(f"okx balance fetch: {e}")
-        return []
+        return [], True
 
 
 def compare_balances(calculated: list[BalanceRow],
@@ -511,16 +541,26 @@ async def reconcile(owner_id: int, year: int, config=None,
         (e.rub for e in entries if e.kind in ("income", "buy", "sell", "spend")),
         Decimal(0),
     )
-    # Dr и Cr каждой проводки равны по построению (одна RUB-оценка на
-    # пару), поэтому итог Дт = итог Кт; ненулевая разница означает ошибку
-    # в данных.
+    # JournalEntry хранит одну RUB-оценку на проводку: Дт и Кт равны по
+    # построению, поэтому итог Кт = итог Дт и delta_dr_cr всегда ноль.
+    # Численного допуска на расхождение Дт/Кт здесь нет и быть не может —
+    # для него JournalEntry пришлось бы разнести на dr_rub и cr_rub.
+    # Фактический контроль парности делает check_pairing: он ловит
+    # проводки без парной ноги, а не рассогласование копеек.
     report.total_cr_rub = report.total_dr_rub
 
     report.balances = compute_balances(owner_id)
     report.issues.extend(check_negative_balances(report.balances))
 
     if with_actual:
-        report.actual = await fetch_actual_balances(owner_id, config)
+        report.actual, unavailable = await fetch_actual_balances(owner_id, config)
+        for src in unavailable:
+            report.issues.append(ReconciliationIssue(
+                kind="source_unavailable",
+                message=(f"{src}: фактический баланс получить не удалось — "
+                         f"сверка по этому источнику НЕ выполнена, "
+                         f"отсутствие расхождений здесь ничего не значит"),
+            ))
         if report.actual:
             report.issues.extend(compare_balances(report.balances, report.actual))
             # Дозаполняем рыночные цены для оценки расчётного портфеля.
