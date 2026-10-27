@@ -102,14 +102,15 @@ async def wallet_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     args = context.args or []
     if not args:
+        # Без аргументов — не справка, а режим приёма списка: человеку
+        # проще вставить адреса из кошелька, чем набирать команду на каждый.
+        from utils.sources import AWAIT_WALLETS_KEY
+        from handlers.auto_import import _wait_keyboard, _wallets_prompt
+
+        context.user_data[AWAIT_WALLETS_KEY] = True
         await update.message.reply_text(
-            "Использование:\n"
-            "<code>/wallet_add &lt;адрес&gt; [подпись]</code>\n"
-            "<code>/wallet_add &lt;chain&gt; &lt;адрес&gt; [подпись]</code>\n\n"
-            f"<b>chain</b> ∈ {string_list_of(Chain.all())} "
-            "(можно не указывать — определится по адресу)\n"
-            "Пример: <code>/wallet_add 0xAbC…</code>",
-            parse_mode="HTML",
+            _wallets_prompt(), parse_mode="HTML",
+            reply_markup=_wait_keyboard(),
         )
         return
     if len(args) == 1:
@@ -136,6 +137,18 @@ async def wallet_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"  id: <b>#{wallet.id}</b>",
         parse_mode="HTML",
     )
+
+    # Один адрес — тот же путь, что и пакет: сразу тянем историю, чтобы
+    # не требовался отдельный заход в /autoimport.
+    try:
+        from handlers.auto_import import start_sync
+
+        await start_sync(
+            context, update.message.chat_id,
+            "🔄 Подтягиваю историю по кошельку… Это может занять минуту.",
+        )
+    except Exception as e:
+        logger.warning(f"wallet_add: автосинк не запущен: {e}")
 
 
 async def wallet_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

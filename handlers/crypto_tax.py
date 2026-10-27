@@ -393,6 +393,11 @@ async def tax_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     owner = _owner_id(context)
     settings = get_tax_settings(owner)
 
+    from utils.sources import sources_snapshot
+
+    snapshot = sources_snapshot(owner, context.bot_data.get("BOT_CONFIG"),
+                                year)
+
     # Без ИНН и ФИО отчёт для ФНС неполон. Не молчим: прямо говорим, чего
     # не хватает, и даём кнопку — до настройки был отдельный заход через
     # /tax_setup с синтаксисом ИНН=… ИМЯ=…, о котором надо было помнить.
@@ -401,11 +406,14 @@ async def tax_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚠️ <b>Для отчёта не хватает данных</b>\n\n"
             f"ИНН: {escape_html(settings.get('taxpayer_inn') or '—')}\n"
             f"Плательщик: {escape_html(settings.get('taxpayer_name') or '—')}\n\n"
+            f"{escape_html(snapshot.summary_line)}\n\n"
             "Заполни — и отчёт будет готов к подаче. Считаю за это время.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✍️ Заполнить ИНН и ФИО",
                                       callback_data="taxsetup:start")],
+                [InlineKeyboardButton("📥 Источники",
+                                      callback_data="ai:status")],
             ]),
         )
 
@@ -441,11 +449,18 @@ async def _send_tax_summary(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
                                  callback_data=f"taxrecon:{year}"),
         ],
         [
+            InlineKeyboardButton("📥 Источники", callback_data="ai:status"),
+        ],
+        [
             InlineKeyboardButton(f"📅 {years[0]}", callback_data=f"taxyear:{years[0]}"),
             InlineKeyboardButton(f"📅 {years[1]}", callback_data=f"taxyear:{years[1]}"),
         ],
     ])
 
+    from utils.sources import sources_snapshot
+
+    snapshot = sources_snapshot(owner, context.bot_data.get("BOT_CONFIG"),
+                                year)
     text = (
         f"<b>Сводка 3-НДФЛ за {year}:</b>\n\n"
         f"Доход (аирдропы, майнинг…): <b>{format_rub(float(summary.total_income_rub))}</b>\n"
@@ -459,6 +474,7 @@ async def _send_tax_summary(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
         f"Налоговая база: <b>{format_rub(float(summary.taxable_income_rub))}</b>\n"
         f"<b>НДФЛ к уплате:</b> <b>{format_rub(float(summary.ndfl_total))}</b>\n\n"
         f"Доходов: {len(summary.income_events)} | Реализаций: {len(summary.disposal_events)}\n"
+        f"{escape_html(snapshot.summary_line)}\n"
     )
     if not summary.income_events and not summary.disposal_events:
         text += (

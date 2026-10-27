@@ -78,7 +78,8 @@ from handlers.crypto_tax import (
 )
 from handlers.tx_wizard import bulk_callback, wizard_callback, wizard_text_handler
 from handlers.cex_command import cex_status_command, cex_sync_command
-from handlers.auto_import import auto_import_command, auto_import_callback
+from handlers.auto_import import (auto_import_command, auto_import_callback,
+                                  wallet_bulk_text)
 from handlers.reconcile_command import reconcile_command, reconcile_xlsx_command
 from handlers.admin_menu import admin_command, admin_menu_callback
 from utils import bot_admin, web_panel
@@ -821,10 +822,15 @@ def build_application() -> Application:
     # свои caption_entities, но команды в подписи никто не шлёт.
     content = (filters.TEXT | filters.CAPTION | filters.ATTACHMENT) & ~filters.COMMAND
 
-    # Мастера (запись операции, настройка ФНС) перехватывают обычный текст
-    # до того, как он уйдёт в ИИ-чат. Группы -2 и -1 — раньше основной:
-    # в одной группе срабатывает только первый подходящий обработчик, а
-    # мастера два и оба должны получить шанс.
+    # Мастера (запись операции, настройка ФНС, список адресов) перехватывают
+    # обычный текст до того, как он уйдёт в ИИ-чат. Группы -3, -2 и -1 —
+    # раньше основной: в одной группе срабатывает только первый подходящий
+    # обработчик, а мастеров несколько, и все должны получить шанс. Тот,
+    # кто действительно принял текст, поднимает ApplicationHandlerStop.
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        wallet_bulk_text,
+    ), group=-3)
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
         wizard_text_handler,

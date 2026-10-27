@@ -393,6 +393,13 @@ def add_wallet(
             (chain, address),
         ).fetchone()
         if existing:
+            # Адрес уникален в схеме, но возвращать чужую запись как свою
+            # нельзя: второй владелец видел «кошелёк добавлен», а в его
+            # списке адрес не появлялся.
+            if int(existing["owner_id"]) != int(owner_id):
+                raise CryptoError(
+                    "Кошелёк уже привязан к другому владельцу учёта"
+                )
             return _wallet_from_row(existing)
         cur = conn.execute(
             """
