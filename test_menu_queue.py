@@ -14,6 +14,7 @@
    7. Раздел открывается и показывает команды.
    8. Быстрое действие вызывает нужную команду с пустыми аргументами.
    9. В меню «/» команды отсортированы: полезное вперёд.
+  10. В групповом чате меню «/» короткое: без налогов, кошельков и админки.
 """
 
 import asyncio
@@ -273,6 +274,51 @@ async def main() -> int:
     for name, desc in main_module.BOT_COMMANDS:
         check(len(name) <= 32, f"имя команды {name} в лимите")
         check(len(desc) <= 256, f"описание команды {name} в лимите")
+
+    print("10. Меню «/» в групповом чате")
+    from telegram import BotCommandScopeAllGroupChats
+
+    group_names = [name for name, _ in main_module.GROUP_COMMANDS]
+    check(len(group_names) == len(set(group_names)),
+          "в групповом списке нет повторов", str(group_names))
+    check(set(group_names) <= set(names),
+          "групповые команды есть в общем списке", str(group_names))
+    check(len(group_names) < len(names),
+          "групповой список короче общего",
+          f"{len(group_names)} из {len(names)}")
+    for forbidden in ("tax", "tax_pdf", "tax_xlsx", "wallet_add", "addtx",
+                      "autoimport", "reconcile", "admin", "ban", "unban",
+                      "kick"):
+        check(forbidden not in group_names,
+              f"/{forbidden} не всплывает в группе")
+    for name, desc in main_module.GROUP_COMMANDS:
+        check(len(name) <= 32, f"имя команды {name} в лимите")
+        check(len(desc) <= 256, f"описание команды {name} в лимите")
+
+    class _MenuBot:
+        def __init__(self):
+            self.calls = []
+
+        async def set_my_commands(self, commands, scope=None):
+            self.calls.append((commands, scope))
+
+    menu_bot = _MenuBot()
+    await main_module.setup_bot_commands(menu_bot)
+
+    group_calls = [c for c, s in menu_bot.calls
+                   if isinstance(s, BotCommandScopeAllGroupChats)]
+    check(len(group_calls) == 1, "для групп задан отдельный scope",
+          str([type(s).__name__ for _, s in menu_bot.calls]))
+    if group_calls:
+        sent = [cmd.command for cmd in group_calls[0]]
+        check(sent == group_names, "в группе — только короткий список",
+              str(sent))
+
+    default_calls = [c for c, s in menu_bot.calls if s is None]
+    check(bool(default_calls), "список по умолчанию задан")
+    if default_calls:
+        sent = [cmd.command for cmd in default_calls[0]]
+        check(sent == names, "в личке — полный список", str(sent[:5]))
 
     print()
     if FAILURES:

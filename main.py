@@ -11,6 +11,7 @@ from telegram import (
     InlineQueryResultArticle,
     InputTextMessageContent,
     BotCommand,
+    BotCommandScopeAllGroupChats,
     BotCommandScopeChat,
 )
 from telegram.error import Conflict
@@ -322,6 +323,7 @@ BOT_COMMANDS: list[tuple[str, str]] = [
     # Главное
     ("start", "Меню: портфель, операции, отчёты, игра"),
     ("help", "Как мной пользоваться"),
+    ("market", "Срез рынка: топ, рост, падение, TON"),
     ("clear", "Забыть контекст разговора"),
     # Портфель и деньги
     ("balance", "Портфель: что есть и сколько заработано"),
@@ -331,6 +333,7 @@ BOT_COMMANDS: list[tuple[str, str]] = [
     ("wallet_add", "Добавить кошелёк"),
     ("wallet_del", "Архивировать кошелёк"),
     # Операции
+    ("autoimport", "Автоимпорт: кошельки и выписки"),
     ("tx_list", "История операций"),
     ("addtx", "Записать операцию"),
     ("airdrop", "Быстрый ввод аирдропа"),
@@ -343,6 +346,8 @@ BOT_COMMANDS: list[tuple[str, str]] = [
     ("tax_csv", "CSV доходов/реализаций"),
     ("tax_setup", "Настроить ИНН/ФИО/статус"),
     ("tax_setup_status", "Текущие настройки ФНС"),
+    ("tax_cost", "Расходы по ст. 221 НК"),
+    ("tax_cost_del", "Удалить расход"),
     # Аренда подарков
     ("marketapptop", "ТОП подарков: сумма и доходность (TON/сут)"),
     ("marketappgifts", "Доход по каждому подарку отдельно"),
@@ -368,20 +373,38 @@ ADMIN_COMMANDS: list[tuple[str, str]] = [
     ("kick", "Забанить навсегда и удалить все его сообщения"),
 ]
 
+# Меню «/» в групповом чате. Здесь только то, что уместно при всех:
+# поговорить, глянуть рынок, сыграть. Бухгалтерия, налоги, кошельки и
+# модерация — личные вещи, в общем чате они засоряли подсказки при наборе
+# «/», а часть из них ещё и не работает без данных владельца.
+GROUP_COMMANDS: list[tuple[str, str]] = [
+    ("start", "Меню и знакомство"),
+    ("help", "Как мной пользоваться"),
+    ("market", "Срез рынка: топ, рост, падение, TON"),
+    ("clear", "Забыть контекст разговора"),
+    ("history", "Последние турниры"),
+    ("leaderboard", "Таблица лидеров"),
+]
+
 
 def _as_bot_commands(pairs: list[tuple[str, str]]) -> list[BotCommand]:
     return [BotCommand(name, description) for name, description in pairs]
 
 
 async def setup_bot_commands(bot) -> None:
-    """Команды в меню "/" для всех чатов и отдельный список — для админов.
+    """Команды в меню "/": полный список в личке, короткий — в группах.
 
-    Scope у Telegram подменяет список целиком, а не дополняет: у админов в
-    scope должен лежать общий список плюс /ban, /unban и /kick, иначе в личке с ботом
-    они бы увидели только модерацию.
+    Telegram выбирает самый конкретный scope, а не складывает их: у групп
+    свой список, у лички админа — полный плюс /ban, /unban и /kick. Без
+    этого в общем чате при наборе "/" всплывали все три десятка команд —
+    от /tax_pdf до /marketapptop.
     """
     try:
         await bot.set_my_commands(_as_bot_commands(BOT_COMMANDS))
+        await bot.set_my_commands(
+            _as_bot_commands(GROUP_COMMANDS),
+            scope=BotCommandScopeAllGroupChats(),
+        )
     except Exception as e:
         logger.warning(f"Не удалось задать команды меню: {e}")
         return
