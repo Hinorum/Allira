@@ -110,12 +110,14 @@ async def main() -> int:
     buy_row = by_type.get("BTC:buy")
     check(buy_row is not None, "покупка записана")
     if buy_row:
-        check(buy_row["cost_basis_rub"] == "2400000.00",
-              "себестоимость в рублях (0.5×60000×80)", str(buy_row["cost_basis_rub"]))
+        check(buy_row["cost_basis_rub"] == "2400800.00",
+              "себестоимость с комиссией (0.5×60000×80 + 10×80)",
+              str(buy_row["cost_basis_rub"]))
     sell_row = by_type.get("BTC:sell")
     if sell_row:
-        check(sell_row["fiat_value_rub"] == "3200000.00",
-              "выручка в рублях (0.5×80000×80)", str(sell_row["fiat_value_rub"]))
+        check(sell_row["fiat_value_rub"] == "3199040.00",
+              "выручка с комиссией (0.5×80000×80 − 12×80)",
+              str(sell_row["fiat_value_rub"]))
     check("USDT:trade_out" in by_type, "парная нога quote-валюты на покупке")
     check("USDT:trade_in" in by_type, "парная нога quote-валюты на продаже")
     check(all(r["source"] == "bybit" for r in tx_rows),

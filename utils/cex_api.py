@@ -226,7 +226,13 @@ def _bybit_row_to_parsed(r: dict) -> ParsedRow | None:
         if not base:
             return None
         quote_amount = _fmt_amount(float(qty) * float(price))
-        exec_id = r.get("execId", "")
+        exec_id = str(r.get("execId") or "").strip()
+        fee = _positive_amount(r.get("execFee"))
+        fee_asset = str(r.get("feeCurrency") or "").strip().upper()
+        if fee and not fee_asset:
+            # Bybit списывает комиссию в получаемом активе: при покупке
+            # это base, при продаже — quote.
+            fee_asset = base if side == "buy" else quote
 
         if side == "buy":
             return ParsedRow(
@@ -236,6 +242,7 @@ def _bybit_row_to_parsed(r: dict) -> ParsedRow | None:
                 note=f"bybit buy {symbol}",
                 external_id=f"bybit:{exec_id}",
                 quote_asset=quote, quote_amount=quote_amount,
+                fee=fee, fee_asset=fee_asset,
             )
         elif side == "sell":
             return ParsedRow(
@@ -245,6 +252,7 @@ def _bybit_row_to_parsed(r: dict) -> ParsedRow | None:
                 note=f"bybit sell {symbol}",
                 external_id=f"bybit:{exec_id}",
                 quote_asset=quote, quote_amount=quote_amount,
+                fee=fee, fee_asset=fee_asset,
             )
         return None
     except Exception as e:
@@ -473,6 +481,17 @@ def _positive_amount(value) -> str:
     return text
 
 
+def _signed_amount(value) -> str:
+    """Вернуть ненулевую сумму со знаком (комиссия может быть ребейтом)."""
+    text = str(value or "").strip()
+    try:
+        if not text or float(text) == 0:
+            return ""
+    except (TypeError, ValueError):
+        return ""
+    return text
+
+
 def _timestamp_ms(value) -> int:
     """Timestamp в миллисекундах; секунды из старых полей тоже понимаем."""
     try:
@@ -658,6 +677,15 @@ def _okx_row_to_parsed(r: dict) -> ParsedRow | None:
             trade_id = f"{ts_ms}:{inst_id}:{side}:{qty}:{price}"
         quote_amount = _fmt_amount(float(qty) * float(price))
 
+        # OKX присылает fee отрицательным, когда комиссия списана, и
+        # положительным, когда начислен ребейт. В ParsedRow знак обратный:
+        # плюс — расход, минус — возврат.
+        raw_fee = _signed_amount(r.get("fee"))
+        fee = _fmt_amount(-float(raw_fee)) if raw_fee else ""
+        fee_asset = str(r.get("feeCcy") or "").strip().upper()
+        if fee and not fee_asset:
+            fee_asset = base if side == "buy" else quote
+
         if side == "buy":
             return ParsedRow(
                 ts=ts, asset=base, tx_type=TxType.BUY,
@@ -666,6 +694,7 @@ def _okx_row_to_parsed(r: dict) -> ParsedRow | None:
                 note=f"okx buy {inst_id}",
                 external_id=f"okx:{trade_id}",
                 quote_asset=quote, quote_amount=quote_amount,
+                fee=fee, fee_asset=fee_asset,
             )
         elif side == "sell":
             return ParsedRow(
@@ -675,6 +704,7 @@ def _okx_row_to_parsed(r: dict) -> ParsedRow | None:
                 note=f"okx sell {inst_id}",
                 external_id=f"okx:{trade_id}",
                 quote_asset=quote, quote_amount=quote_amount,
+                fee=fee, fee_asset=fee_asset,
             )
         return None
     except Exception as e:

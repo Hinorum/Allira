@@ -15,6 +15,7 @@ import os
 import sys
 import tempfile
 import time
+from decimal import Decimal
 
 TEST_DB = tempfile.mktemp(suffix=".db")
 os.environ["DB_PATH"] = TEST_DB
@@ -243,6 +244,100 @@ async def main() -> int:
     check(len(time_result.rows) == 101, "100 + 1 сделка по времени",
           str(len(time_result.rows)))
     check(not time_result.errors, "ошибок нет", str(time_result.errors))
+
+    # ------------------------------------------------- 4. комиссии
+    print("4. Комиссии Bybit/OKX и запись в рубли")
+    by = cex_api._bybit_row_to_parsed({
+        "execId": "fee-buy", "symbol": "BTCUSDT", "side": "Buy",
+        "execQty": "0.5", "execPrice": "50000",
+        "execTime": str(now_ms), "execFee": "10",
+        "feeCurrency": "USDT",
+    })
+    check(by is not None and by.fee == "10" and by.fee_asset == "USDT",
+          "Bybit execFee и валюта комиссии", str(by))
+    okx_fee = cex_api._okx_row_to_parsed({
+        "instId": "BTC-USDT", "side": "sell", "fillSz": "0.5",
+        "fillPx": "60000", "ts": str(now_ms), "tradeId": "fee-sell",
+        "fee": "-0.0005", "feeCcy": "BTC",
+    })
+    check(okx_fee is not None and okx_fee.fee == "0.0005",
+          "OKX отрицательная комиссия стала расходом", str(okx_fee))
+    check(okx_fee is not None and okx_fee.fee_asset == "BTC",
+          "OKX feeCcy сохранён", str(okx_fee))
+
+    from utils.csv_import import ParsedRow
+    from utils.statement_import import parse_statement
+
+    csv_body = (
+        "utcTime,symbol,side,qty,price,fee,feeCurrency\n"
+        "2026-10-01 10:00:00,BTCUSDT,Buy,0.5,50000,10,USDT\n"
+    ).encode("utf-8")
+    csv_rows, csv_errors = parse_statement(csv_body, "", "bybit")
+    check(len(csv_rows) == 1 and csv_rows[0].fee == "10"
+          and csv_rows[0].fee_asset == "USDT",
+          "CSV Bybit: комиссия разобрана", str(csv_rows))
+    check(not csv_errors, "CSV без ошибок", str(csv_errors))
+
+    from tasks.cex_sync import persist_cex_rows
+    import tasks.cex_sync as cex_sync
+
+    owner = 7001
+    buy_ts = now_ms // 1000 - 7200
+    sell_ts = buy_ts + 3600
+    buy_row = ParsedRow(
+        ts=buy_ts, asset="BTC", tx_type=TxType.BUY, amount="0.5",
+        fiat_value_rub="", cost_basis_rub="",
+        note="bybit buy BTCUSDT", external_id="bybit:fee-buy-1",
+        quote_asset="USDT", quote_amount="25000",
+        source="bybit", fee="10", fee_asset="USDT",
+    )
+    sell_row = ParsedRow(
+        ts=sell_ts, asset="BTC", tx_type=TxType.SELL, amount="0.5",
+        fiat_value_rub="", cost_basis_rub="",
+        note="bybit sell BTCUSDT", external_id="bybit:fee-sell-1",
+        quote_asset="USDT", quote_amount="30000",
+        source="bybit", fee="0.0005", fee_asset="BTC",
+    )
+
+    original_price = cex_sync.get_asset_price_rub
+
+    async def fake_price(asset, ts):
+        return {"USDT": 80.0, "BTC": 4_000_000.0}.get(asset)
+
+    cex_sync.get_asset_price_rub = fake_price
+    try:
+        saved, dups = await persist_cex_rows(
+            owner, [buy_row, sell_row], "bybit",
+        )
+    finally:
+        cex_sync.get_asset_price_rub = original_price
+
+    check(saved == 4 and dups == 0, "сделка и quote-ноги записаны",
+          f"saved={saved}, dups={dups}")
+    with db.get_db() as conn:
+        rows = conn.execute(
+            "SELECT external_id, fiat_value_rub, cost_basis_rub, note "
+            "FROM crypto_transactions WHERE owner_id = ? "
+            "AND external_id IN (?, ?) ORDER BY external_id",
+            (owner, "bybit:fee-buy-1", "bybit:fee-sell-1"),
+        ).fetchall()
+    by_id = {r["external_id"]: r for r in rows}
+    buy_db = by_id.get("bybit:fee-buy-1")
+    sell_db = by_id.get("bybit:fee-sell-1")
+    expected_cost = Decimal("2000800.00")
+    expected_fiat = Decimal("2398000.00")
+    check(buy_db is not None
+          and Decimal(buy_db["cost_basis_rub"]) == expected_cost,
+          "комиссия покупки добавлена к себестоимости",
+          str(dict(buy_db)) if buy_db else "нет")
+    check(sell_db is not None
+          and Decimal(sell_db["fiat_value_rub"]) == expected_fiat,
+          "комиссия продажи вычтена из выручки",
+          str(dict(sell_db)) if sell_db else "нет")
+    check(buy_db is not None and "комиссия 10 USDT" in buy_db["note"],
+          "комиссия покупки в примечании", str(dict(buy_db)))
+    check(sell_db is not None and "комиссия 0.0005 BTC" in sell_db["note"],
+          "комиссия продажи в примечании", str(dict(sell_db)))
 
     print()
     if FAILURES:

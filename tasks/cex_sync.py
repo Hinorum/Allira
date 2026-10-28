@@ -282,6 +282,44 @@ async def _fill_transfer_in_cost(rows: list) -> None:
         row.note += " (себестоимость — по рынку на дату ввода)"
 
 
+async def _fee_rub(row, quote_price: float | None) -> tuple[Decimal, str]:
+    """Перевести комиссию сделки в рубли и собрать примечание.
+
+    Комиссия может быть в quote-валюте пары, в base-активе или в третьем
+    активе (например, BNB). Для quote берём уже полученный курс, для
+    остальных — цену на дату сделки. Если котировки нет, комиссия не
+    выдумывается: в примечании остаётся её сырое значение.
+    """
+    fee_text = str(getattr(row, "fee", "") or "").strip()
+    if not fee_text:
+        return Decimal(0), ""
+    try:
+        fee = Decimal(fee_text)
+    except (InvalidOperation, ValueError):
+        return Decimal(0), ""
+    if fee == 0:
+        return Decimal(0), ""
+
+    fee_asset = str(getattr(row, "fee_asset", "") or "").strip().upper()
+    quote_asset = str(getattr(row, "quote_asset", "") or "").strip().upper()
+    price = None
+    if fee_asset and fee_asset == quote_asset and quote_price is not None:
+        price = quote_price
+    elif fee_asset:
+        try:
+            price = await get_asset_price_rub(fee_asset, row.ts)
+        except Exception:
+            price = None
+
+    label = "комиссия" if fee > 0 else "ребейт"
+    raw = f"{abs(fee)} {fee_asset or '?'}"
+    if price is None:
+        return Decimal(0), f", {label} {raw} (без котировки)"
+
+    rub = (fee * Decimal(str(price))).quantize(Decimal("0.01"))
+    return rub, f", {label} {raw}"
+
+
 async def persist_cex_rows(owner_id: int, rows: list,
                            exchange: str) -> tuple[int, int]:
     """Записывает строки сделок и переводов.
@@ -304,6 +342,8 @@ async def persist_cex_rows(owner_id: int, rows: list,
         try:
             fiat = row.fiat_value_rub or ""
             cost = row.cost_basis_rub or ""
+            quote_asset = getattr(row, "quote_asset", "")
+            quote_amount = getattr(row, "quote_amount", "")
             # Источник строки: CSV-импорт несёт свой (bybit/okx/csv), API —
             # общий на биржу. Без этого импорт CSV помечался бы как
             # источник биржи и дедупликация склеивала бы разные данные.
@@ -317,17 +357,35 @@ async def persist_cex_rows(owner_id: int, rows: list,
                 continue
 
             # RUB-оценка quote-ветки сделки — если она ещё не задана.
-            if not fiat and not cost and getattr(row, "quote_asset", ""):
+            q_price = None
+            if quote_asset:
                 try:
-                    q_price = await get_asset_price_rub(row.quote_asset, row.ts)
+                    q_price = await get_asset_price_rub(quote_asset, row.ts)
                 except Exception:
                     q_price = None
-                if q_price is not None:
-                    rub_total = float(row.quote_amount) * q_price
+            if (not fiat and not cost and quote_asset and quote_amount
+                    and q_price is not None):
+                try:
+                    rub_total = float(quote_amount) * q_price
+                except (TypeError, ValueError):
+                    rub_total = 0.0
+                if rub_total:
                     if row.tx_type == TxType.BUY:
                         cost = f"{rub_total:.2f}"
                     else:
                         fiat = f"{rub_total:.2f}"
+
+            # Комиссия уменьшает выручку продажи или увеличивает
+            # себестоимость покупки. Для остальных типов (переводы,
+            # доходы) она остаётся только в примечании.
+            fee_rub, fee_note = await _fee_rub(row, q_price)
+            if fee_note:
+                row.note = f"{row.note}{fee_note}"
+            if fee_rub:
+                if row.tx_type == TxType.BUY and cost:
+                    cost = f"{Decimal(str(cost)) + fee_rub:.2f}"
+                elif row.tx_type == TxType.SELL and fiat:
+                    fiat = f"{max(Decimal(0), Decimal(str(fiat)) - fee_rub):.2f}"
 
             add_transaction(
                 owner_id=owner_id,
@@ -344,8 +402,6 @@ async def persist_cex_rows(owner_id: int, rows: list,
             saved += 1
 
             # Парная проводка quote-валюты (дебет-кредит).
-            quote_asset = getattr(row, "quote_asset", "")
-            quote_amount = getattr(row, "quote_amount", "")
             if quote_asset and quote_amount and float(quote_amount) > 0:
                 leg_type = (TxType.TRADE_OUT if row.tx_type == TxType.BUY
                             else TxType.TRADE_IN)

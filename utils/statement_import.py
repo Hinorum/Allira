@@ -91,8 +91,8 @@ COLUMN_SYNONYMS: dict[str, tuple[str, ...]] = {
         "комиссия (base)", "комиссия (quote)",
     ),
     "fee_asset": (
-        "fee coin", "fee currency", "fee asset", "fee symbol",
-        "комиссия (валюта)", "валюта комиссии",
+        "fee coin", "fee currency", "fee asset", "fee symbol", "feeccy",
+        "feecurrency", "fee ccy", "комиссия (валюта)", "валюта комиссии",
     ),
     "asset": (
         "coin", "currency", "asset", "token", "symbol(asset)", "ticker(asset)",
@@ -287,6 +287,30 @@ def _decimal_str(value: str) -> str:
     return s
 
 
+def _parse_fee_cell(value: str) -> tuple[str, str]:
+    """«0.001», «-0.001», «0.001 BTC» → (сумма без знака, валюта).
+
+    Выписки OKX присылают комиссию отрицательной, Bybit — положительной.
+    В ParsedRow комиссия всегда расход (положительное число); ребейт
+    встречается редко и в CSV неотличим от обычной комиссии.
+    """
+    s = str(value or "").strip().replace(" ", "")
+    if not s:
+        return "", ""
+    match = re.match(r"^(-?[0-9.,]+)([A-Za-zА-Яа-я]+)?$", s)
+    if not match:
+        return "", ""
+    amount = _decimal_str(match.group(1))
+    if not amount:
+        return "", ""
+    try:
+        if Decimal(amount) < 0:
+            amount = str(abs(Decimal(amount)))
+    except (InvalidOperation, ValueError):
+        return "", ""
+    return amount, (match.group(2) or "").strip().upper()
+
+
 def _safe_mul(a: str, b: str) -> str:
     """Произведение двух чисел-строк через Decimal (без артефактов float)."""
     try:
@@ -479,6 +503,14 @@ def _parse_generic(headers: list[str], body: Iterable[list[str]],
         price = _decimal_str(cell(r, "price"))
         quote_amount = _decimal_str(cell(r, "quote_amount"))
         quote_asset = cell(r, "quote_asset").strip().upper() or quote
+        fee, fee_inline_asset = _parse_fee_cell(cell(r, "fee"))
+        fee_asset = (cell(r, "fee_asset").strip().upper()
+                     or fee_inline_asset)
+        if fee and not fee_asset:
+            # В выписке нет отдельной колонки валюты комиссии. Берём
+            # quote-валюту пары: в CSV Bybit/OKX комиссия обычно выражена
+            # в ней, а не в base-активе.
+            fee_asset = quote_asset or asset
 
         if not amount:
             errors.append(f"строка {i}: пустое количество")
@@ -503,6 +535,7 @@ def _parse_generic(headers: list[str], body: Iterable[list[str]],
             external_id=ext_id,
             quote_asset=quote_asset, quote_amount=quote_amount,
             source=exchange,
+            fee=fee, fee_asset=fee_asset,
         ))
     if skipped:
         errors.append(f"пропущено строк со статусом «отменено/не исполнено»: {skipped}")
