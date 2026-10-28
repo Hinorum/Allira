@@ -273,6 +273,9 @@ async def main() -> int:
 
     original_watermark = cex_sync.get_cex_watermark
     original_trades = cex_sync.sync_bybit_trades
+    original_transfers = cex_sync.sync_bybit_transfers
+    original_transfer_watermark = cex_sync.get_cex_transfer_watermark
+    original_set_transfer_watermark = cex_sync.set_cex_transfer_watermark
 
     from utils.cex_api import CexSyncResult
 
@@ -281,13 +284,25 @@ async def main() -> int:
         captured["until"] = until_ts
         return CexSyncResult(exchange="bybit", rows=[])
 
+    async def fake_transfers(key, secret, since_ts=None, until_ts=None):
+        captured["transfer_since"] = since_ts
+        return CexSyncResult(exchange="bybit", rows=[])
+
     cex_sync.get_cex_watermark = lambda name: 0
     cex_sync.sync_bybit_trades = fake_trades
+    cex_sync.sync_bybit_transfers = fake_transfers
+    cex_sync.get_cex_transfer_watermark = lambda name: 0
+    cex_sync.set_cex_transfer_watermark = (
+        lambda name, ts: captured.__setitem__("transfer_wm", ts)
+    )
     try:
         report = await cex_sync.sync_cex(owner, cfg)
     finally:
         cex_sync.get_cex_watermark = original_watermark
         cex_sync.sync_bybit_trades = original_trades
+        cex_sync.sync_bybit_transfers = original_transfers
+        cex_sync.get_cex_transfer_watermark = original_transfer_watermark
+        cex_sync.set_cex_transfer_watermark = original_set_transfer_watermark
 
     expected = int((time.time() - 365 * 86400) * 1000)
     since = captured.get("since") or 0
@@ -297,6 +312,8 @@ async def main() -> int:
           "since_ms — примерно год назад", f"{since} vs {expected}")
     check((captured.get("until") or 0) > since,
           "until_ms позже since_ms", str(captured))
+    check((captured.get("transfer_wm") or 0) > 1_000_000_000_000,
+          "водяной знак переводов сдвинут", str(captured.get("transfer_wm")))
     check(len(report.exchanges) == 1 and report.exchanges[0].name == "bybit",
           "отчёт по одной бирже", str(report.exchanges))
     check(report.saved == 0, "пустой ответ не даёт записей", str(report.saved))
@@ -307,11 +324,19 @@ async def main() -> int:
 
     cex_sync.get_cex_watermark = lambda name: 0
     cex_sync.sync_bybit_trades = failing_trades
+    cex_sync.sync_bybit_transfers = fake_transfers
+    cex_sync.get_cex_transfer_watermark = lambda name: 0
+    cex_sync.set_cex_transfer_watermark = (
+        lambda name, ts: captured.__setitem__("transfer_wm2", ts)
+    )
     try:
         report = await cex_sync.sync_cex(owner, cfg)
     finally:
         cex_sync.get_cex_watermark = original_watermark
         cex_sync.sync_bybit_trades = original_trades
+        cex_sync.sync_bybit_transfers = original_transfers
+        cex_sync.get_cex_transfer_watermark = original_transfer_watermark
+        cex_sync.set_cex_transfer_watermark = original_set_transfer_watermark
     check(report.errors == ["boom"], "ошибка биржи в отчёте",
           str(report.errors))
 

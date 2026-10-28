@@ -1,8 +1,9 @@
 """Синхронизация CEX (Bybit + OKX): единая функция для джобы и команд.
 
-Раз в час фоновая задача тянет сделки через read-only API и пишет их в БД
-с защитой от дублей по external_id. Ошибки (429, ключ отозван) логируются,
-но не блокируют бота — следующий прогон повторит попытку.
+Раз в час фоновая задача тянет сделки и ончейн-переводы через read-only API
+и пишет их в БД с защитой от дублей по external_id. Ошибки (429, ключ
+отозван) логируются, но не блокируют бота — следующий прогон повторит
+попытку.
 
 `sync_cex()` — единственный вход и для фоновой джобы, и для `/cex_sync`,
 и для кнопки «Обновить всё». Возвращает отчёт, а не печатает в чат: так
@@ -15,11 +16,17 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 
 from telegram.ext import Application
 
-from utils.cex_api import (get_cex_watermark, set_cex_watermark,
-                           sync_bybit_trades, sync_okx_trades)
+from utils.cex_api import (
+    TRANSFER_OVERLAP_MS,
+    get_cex_transfer_watermark, get_cex_watermark,
+    set_cex_transfer_watermark, set_cex_watermark,
+    sync_bybit_trades, sync_bybit_transfers,
+    sync_okx_trades, sync_okx_transfers,
+)
 from utils.crypto_db import (
     add_transaction, find_duplicate, CryptoError, TxType,
 )
@@ -39,6 +46,8 @@ class ExchangeSync:
     name: str
     saved: int = 0
     duplicates: int = 0
+    transfers_saved: int = 0
+    transfers_duplicates: int = 0
     errors: list[str] = field(default_factory=list)
 
     @property
@@ -55,6 +64,8 @@ class CexSyncReport:
     """Итог синка по всем настроенным биржам."""
 
     exchanges: list[ExchangeSync] = field(default_factory=list)
+    rematched: int = 0
+    rematch_error: str = ""
 
     @property
     def saved(self) -> int:
@@ -65,8 +76,15 @@ class CexSyncReport:
         return sum(e.duplicates for e in self.exchanges)
 
     @property
+    def transfers_saved(self) -> int:
+        return sum(e.transfers_saved for e in self.exchanges)
+
+    @property
     def errors(self) -> list[str]:
-        return [err for e in self.exchanges for err in e.errors]
+        errs = [err for e in self.exchanges for err in e.errors]
+        if self.rematch_error:
+            errs.append(self.rematch_error)
+        return errs
 
     @property
     def configured(self) -> bool:
@@ -115,9 +133,13 @@ async def _sync_job(context) -> None:
     report = await sync_cex(owner_id, cfg)
     for ex in report.exchanges:
         if ex.saved:
-            logger.info(f"cex_sync {ex.name}: +{ex.saved} сделок")
+            logger.info(f"cex_sync {ex.name}: +{ex.saved} записей")
+        if ex.transfers_saved:
+            logger.info(f"cex_sync {ex.name}: +{ex.transfers_saved} переводов")
         for err in ex.errors[:3]:
             logger.warning(f"cex_sync {ex.name}: {err}")
+    if report.rematched:
+        logger.info(f"cex_sync: сопоставлено переводов — {report.rematched}")
 
 
 async def sync_cex(owner_id: int, cfg) -> CexSyncReport:
@@ -140,11 +162,22 @@ async def sync_cex(owner_id: int, cfg) -> CexSyncReport:
 
     if not report.exchanges:
         logger.info("sync_cex: ни одна биржа не настроена — пропуск")
+        return report
+
+    # После депозитов/выводов обязательно сопоставляем их с ончейн-строками:
+    # иначе вывод с биржи останется «доходом» до следующего /autoimport.
+    # Это же покрывает ручной /cex_sync и часовую джобу.
+    try:
+        from utils.auto_import import rematch_transfers
+        report.rematched = rematch_transfers(owner_id)
+    except Exception as e:
+        logger.error(f"sync_cex: сопоставление: {e}", exc_info=True)
+        report.rematch_error = f"сопоставление: {e}"
     return report
 
 
 async def _sync_exchange(owner_id: int, cfg, name: str) -> ExchangeSync:
-    """Одна биржа: запрос → запись → сдвиг водяного знака."""
+    """Одна биржа: сделки + переводы → запись → сдвиг водяных знаков."""
     ex = ExchangeSync(name=name)
     try:
         since_ms = get_cex_watermark(name) or int(
@@ -163,27 +196,90 @@ async def _sync_exchange(owner_id: int, cfg, name: str) -> ExchangeSync:
                 since_ts=since_ms, until_ts=until_ms,
             )
 
-        ex.saved, ex.duplicates = await persist_cex_rows(
-            owner_id, result.rows, name
-        )
+        saved, dups = await persist_cex_rows(owner_id, result.rows, name)
+        ex.saved += saved
+        ex.duplicates += dups
         timestamps = [int(r.ts) for r in result.rows
                       if getattr(r, "ts", 0)]
         if timestamps:
             set_cex_watermark(name, max(timestamps) * 1000)
         ex.errors.extend(result.errors)
+
+        # Переводы качаем своим водяным знаком с перекрытием: подтверждение
+        # вывода может появиться позже, чем закончится прошлое окно.
+        transfer_since = get_cex_transfer_watermark(name)
+        if transfer_since:
+            transfer_since = max(0, transfer_since - TRANSFER_OVERLAP_MS)
+        else:
+            transfer_since = int(
+                (time.time() - LOOKBACK_DAYS[name] * 86400) * 1000
+            )
+
+        if name == "bybit":
+            transfers = await sync_bybit_transfers(
+                cfg.bybit_api_key, cfg.bybit_api_secret,
+                since_ts=transfer_since, until_ts=until_ms,
+            )
+        else:
+            transfers = await sync_okx_transfers(
+                cfg.okx_api_key, cfg.okx_api_secret, cfg.okx_passphrase,
+                since_ts=transfer_since, until_ts=until_ms,
+            )
+
+        await _fill_transfer_in_cost(transfers.rows)
+        saved, dups = await persist_cex_rows(owner_id, transfers.rows, name)
+        ex.transfers_saved = saved
+        ex.transfers_duplicates = dups
+        ex.saved += saved
+        ex.duplicates += dups
+        ex.errors.extend(transfers.errors)
+        if not transfers.errors:
+            # Сдвигаем только после полного успеха: иначе непрочитанное
+            # окно (429/сеть) выпадет из следующего прогона.
+            set_cex_transfer_watermark(name, until_ms)
     except Exception as e:
         logger.error(f"cex_sync {name}: {e}", exc_info=True)
         ex.errors.append(str(e))
     return ex
 
 
+async def _fill_transfer_in_cost(rows: list) -> None:
+    """Оценить внешний ввод в рублях по рынку на дату зачисления.
+
+    Свой перевод после rematch станет is_internal, и лот не откроется.
+    Для ввода с карты или с неотслеживаемого кошелька это лучше нулевой
+    себестоимости: иначе вся будущая прибыль попадёт в налоговую базу.
+    """
+    for row in rows:
+        if row.tx_type != TxType.TRANSFER_IN:
+            continue
+        if row.cost_basis_rub or row.fiat_value_rub:
+            continue
+        try:
+            price = await get_asset_price_rub(row.asset, row.ts)
+        except Exception:
+            price = None
+        if price is None:
+            continue
+        try:
+            rub = Decimal(str(row.amount)) * Decimal(str(price))
+        except (InvalidOperation, ValueError):
+            continue
+        row.cost_basis_rub = f"{rub:.2f}"
+        row.note += " (себестоимость — по рынку на дату ввода)"
+
+
 async def persist_cex_rows(owner_id: int, rows: list,
                            exchange: str) -> tuple[int, int]:
-    """Записывает сделки с двойной записью «дебет-кредит».
+    """Записывает строки сделок и переводов.
 
     Возвращает (saved, duplicates). Каждая сделка — ДВЕ проводки:
       покупка  BTC/USDT → Дт BTC (BUY, себестоимость) / Кт USDT (TRADE_OUT)
       продажа  BTC/USDT → Дт USDT (TRADE_IN, выручка) / Кт BTC (SELL)
+
+    Перевод (TRANSFER_IN/TRANSFER_OUT) пишется одной проводкой. После
+    сопоставления он помечается is_internal и лоты не трогает; несопостав-
+    ленный внешний ввод остаётся лотом с себестоимостью по рынку.
 
     RUB-стоимость quote-ветки берётся из price_oracle (для стейблкоинов —
     курс ЦБ на дату сделки). Если котировки нет, обе ноги пишутся без

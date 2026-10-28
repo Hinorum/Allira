@@ -230,28 +230,24 @@ def full_status(application, config, start_time: float) -> dict:
 
 
 async def manual_cex_sync(config, owner_id: int) -> dict:
-    """Ручной запуск синка бирж (тот же код, что у фоновой джобы)."""
-    from utils.cex_api import sync_bybit_trades, sync_okx_trades
-    from tasks.cex_sync import persist_cex_rows
+    """Ручной запуск синка бирж — тот же код, что у фоновой джобы.
 
+    Через `sync_cex`, а не отдельные клиенты: так ручной запуск тоже
+    подтягивает депозиты/выводы и сопоставляет переводы.
+    """
+    from tasks.cex_sync import sync_cex
+
+    report = await sync_cex(owner_id, config)
     result: dict = {"bybit": None, "okx": None}
-    if config.bybit_api_key and config.bybit_api_secret:
-        try:
-            sync = await sync_bybit_trades(config.bybit_api_key,
-                                           config.bybit_api_secret)
-            saved, dups = await persist_cex_rows(owner_id, sync.rows, "bybit")
-            result["bybit"] = {"saved": saved, "dups": dups,
-                               "errors": sync.errors}
-        except Exception as e:
-            result["bybit"] = {"saved": 0, "dups": 0, "errors": [str(e)]}
-    if config.okx_api_key and config.okx_api_secret and config.okx_passphrase:
-        try:
-            sync = await sync_okx_trades(config.okx_api_key, config.okx_api_secret,
-                                         config.okx_passphrase)
-            saved, dups = await persist_cex_rows(owner_id, sync.rows, "okx")
-            result["okx"] = {"saved": saved, "dups": dups, "errors": sync.errors}
-        except Exception as e:
-            result["okx"] = {"saved": 0, "dups": 0, "errors": [str(e)]}
+    for ex in report.exchanges:
+        result[ex.name] = {
+            "saved": ex.saved,
+            "dups": ex.duplicates,
+            "transfers": ex.transfers_saved,
+            "errors": list(ex.errors),
+        }
+    if report.rematch_error:
+        result["rematch_error"] = report.rematch_error
     return result
 
 

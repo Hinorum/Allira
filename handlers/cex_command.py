@@ -17,7 +17,7 @@ import time
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from utils.cex_api import get_cex_watermark
+from utils.cex_api import get_cex_transfer_watermark, get_cex_watermark
 from utils.common import escape_html
 from utils.sources import cex_connections
 
@@ -59,7 +59,8 @@ def cex_status_text(cfg) -> str:
                         "<code>OKX_PASSPHRASE</code>")
             lines.append(f"⚪ <b>{name}</b> — ключи не заданы ({keys})")
             continue
-        ts_ms = get_cex_watermark(name.lower())
+        ts_ms = max(get_cex_watermark(name.lower()),
+                    get_cex_transfer_watermark(name.lower()))
         if ts_ms:
             when = time.strftime("%d.%m.%Y %H:%M", time.localtime(ts_ms / 1000))
             lines.append(f"✅ <b>{name}</b> — последний синк: {when}")
@@ -68,7 +69,8 @@ def cex_status_text(cfg) -> str:
 
     lines.append("")
     lines.append("Ключи read-only хранятся только в ENV, в чат их присылать "
-                 "не нужно. Сделки подтягиваются сами — выписка не требуется.")
+                 "не нужно. Сделки, депозиты и выводы подтягиваются сами — "
+                 "выписка не требуется.")
     return "\n".join(lines)
 
 
@@ -119,6 +121,9 @@ async def _cex_sync_task(bot, chat_id: int, cfg) -> None:
     for ex in report.exchanges:
         summary_lines.append(f"\n<b>{ex.title}</b>")
         summary_lines.append(f"  • новых: {ex.saved}, дублей: {ex.duplicates}")
+        transfers_saved = getattr(ex, "transfers_saved", 0)
+        if transfers_saved:
+            summary_lines.append(f"  • из них переводов: {transfers_saved}")
         if ex.errors:
             summary_lines.append("  • ошибки:")
             for e in ex.errors[:5]:
@@ -127,6 +132,10 @@ async def _cex_sync_task(bot, chat_id: int, cfg) -> None:
     summary_lines.append(
         f"\nИтого: <b>{report.saved}</b> новых, {report.duplicates} дублей."
     )
+    if report.rematched:
+        summary_lines.append(
+            f"Сопоставлено переводов: <b>{report.rematched}</b>."
+        )
     try:
         await bot.send_message(chat_id, "\n".join(summary_lines),
                                parse_mode="HTML")

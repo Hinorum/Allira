@@ -1,6 +1,7 @@
-"""Клиенты CEX (Bybit, OKX) для авто-импорта сделок.
+"""Клиенты CEX (Bybit, OKX) для авто-импорта сделок и переводов.
 
-Только read-only: ключи дают доступ к истории сделок, но не к выводу.
+Только read-only: ключи дают доступ к истории сделок, депозитов и выводов,
+но не к выводу средств.
 Перед созданием ключа в аккаунте биржи выбери:
   • Bybit: Account → API Management → permissions только Read.
   • OKX: Trade → API → permissions только Read.
@@ -35,6 +36,17 @@ OKX_API = "https://www.okx.com"
 # через OKX-плагин). На текущий момент ограничиваемся этими окнами.
 BYBIT_LOOKBACK_S = 365 * 86400
 OKX_LOOKBACK_S = 90 * 86400
+
+# Bybit отдаёт историю депозитов и выводов окнами строго меньше 30 дней.
+# Берём 29 суток с запасом на inclusive-границы.
+BYBIT_TRANSFER_WINDOW_MS = 29 * 86400 * 1000
+
+# Повторный скан переводов перекрывает прошлый водяной знак: подтверждение
+# вывода может появиться через несколько дней после запроса.
+TRANSFER_OVERLAP_MS = 7 * 86400 * 1000
+
+# Пауза между страницами и окнами asset-эндпоинтов, чтобы не ловить 429.
+TRANSFER_PAUSE_S = 0.5
 
 
 @dataclass
@@ -218,6 +230,229 @@ def _split_symbol(symbol: str) -> tuple[str, str]:
     return "", ""
 
 
+# ------------------------------------------------ Bybit: переводы
+
+
+async def _bybit_transfer_pages(
+    client, path: str, api_key: str, api_secret: str,
+    since_ms: int, until_ms: int, result: CexSyncResult,
+    extra: dict | None = None,
+):
+    """Страницы Bybit asset-API: окна < 30 дней и cursor внутри окна.
+
+    Bybit не отдаёт депозиты/выводы одним запросом за год: окно запроса
+    должно быть меньше 30 дней. Внутри окна история листается курсором.
+    """
+    start = int(since_ms)
+    end_limit = int(until_ms)
+    while start < end_limit:
+        end = min(start + BYBIT_TRANSFER_WINDOW_MS, end_limit)
+        cursor: str | None = None
+        while True:
+            params = {
+                "startTime": str(start),
+                "endTime": str(end),
+                "limit": "50",
+            }
+            if extra:
+                params.update(extra)
+            if cursor:
+                params["cursor"] = cursor
+
+            headers = _bybit_sign(api_key, api_secret, params)
+            try:
+                resp = await client.get(
+                    f"{BYBIT_API}{path}",
+                    params=params,
+                    headers=headers,
+                    timeout=20.0,
+                )
+            except Exception as e:
+                result.errors.append(f"bybit сеть: {e}")
+                return
+
+            if resp.status_code == 429:
+                await asyncio.sleep(5.0)
+                result.errors.append("bybit 429 (лимит)")
+                return
+            if resp.status_code != 200:
+                result.errors.append(f"bybit {resp.status_code}: {resp.text[:120]}")
+                return
+
+            try:
+                payload = resp.json()
+            except Exception:
+                result.errors.append("bybit: невалидный JSON")
+                return
+
+            if payload.get("retCode") != 0:
+                result.errors.append(
+                    f"bybit retCode {payload.get('retCode')}: "
+                    f"{payload.get('retMsg', '')[:120]}"
+                )
+                return
+
+            data = payload.get("result") or {}
+            for row in data.get("rows") or []:
+                yield row
+
+            cursor = data.get("nextPageCursor")
+            if not cursor:
+                break
+            await asyncio.sleep(TRANSFER_PAUSE_S)
+
+        start = end + 1
+        await asyncio.sleep(TRANSFER_PAUSE_S)
+
+
+async def sync_bybit_transfers(
+    api_key: str, api_secret: str,
+    since_ts: int | None = None, until_ts: int | None = None,
+) -> CexSyncResult:
+    """Подтянуть ончейн-депозиты и выводы Bybit.
+
+    Успешный депозит становится TRANSFER_IN, вывод — TRANSFER_OUT. Дальше
+    rematch_transfers сопоставит их с ончейн-переводами кошельков: ввод на
+    биржу ↔ исходящий перевод, вывод с биржи ↔ входящий перевод.
+    """
+    result = CexSyncResult(exchange="bybit")
+    if since_ts is None:
+        since_ts = int((time.time() - BYBIT_LOOKBACK_S) * 1000)
+    if until_ts is None:
+        until_ts = int(time.time() * 1000)
+    if since_ts >= until_ts:
+        return result
+
+    client = await get_client()
+
+    async for raw in _bybit_transfer_pages(
+        client, "/v5/asset/deposit/query-record",
+        api_key, api_secret, since_ts, until_ts, result,
+    ):
+        row = _bybit_deposit_to_parsed(raw)
+        if row:
+            result.saved += 1
+            setattr(row, "_exchange", "bybit")
+            yield_row(row, result)
+
+    # withdrawType=0 — только ончейн-выводы. Внутренние (off-chain) переводы
+    # между биржами не являются блокчейн-движением и здесь не нужны.
+    async for raw in _bybit_transfer_pages(
+        client, "/v5/asset/withdraw/query-record",
+        api_key, api_secret, since_ts, until_ts, result,
+        extra={"withdrawType": "0"},
+    ):
+        row = _bybit_withdraw_to_parsed(raw)
+        if row:
+            result.saved += 1
+            setattr(row, "_exchange", "bybit")
+            yield_row(row, result)
+
+    return result
+
+
+def _bybit_deposit_to_parsed(r: dict) -> ParsedRow | None:
+    """Ончейн-депозит Bybit → TRANSFER_IN.
+
+    Успех — status 3 (final success), 10012 (credited to funding pool) или
+    70012 (депозит остался успешным после проверки rollback). Промежуточные
+    и отменённые статусы пропускаем: иначе на балансе появится актив,
+    который ещё не зачислен.
+    """
+    try:
+        status = int(r.get("status") or -1)
+    except (TypeError, ValueError):
+        return None
+    if status not in (3, 10012, 70012):
+        return None
+
+    coin = str(r.get("coin") or "").strip().upper()
+    amount = _positive_amount(r.get("amount"))
+    ts = _timestamp_s(r.get("successAt") or r.get("blockTime")
+                      or r.get("txTime"))
+    dep_id = str(r.get("id") or r.get("txID") or "").strip()
+    if not coin or not amount or not ts or not dep_id:
+        return None
+
+    chain = str(r.get("chain") or "").strip()
+    note = f"bybit deposit {coin}"
+    if chain:
+        note += f" ({chain})"
+    return ParsedRow(
+        ts=ts, asset=coin, tx_type=TxType.TRANSFER_IN,
+        amount=amount, fiat_value_rub="", cost_basis_rub="",
+        note=note, external_id=f"bybit:deposit:{dep_id}",
+        source="bybit",
+    )
+
+
+def _bybit_withdraw_to_parsed(r: dict) -> ParsedRow | None:
+    """Ончейн-вывод Bybit → TRANSFER_OUT.
+
+    success и BlockchainConfirmed — финальные успешные статусы. Pending,
+    SecurityCheck, Fail и отмены пропускаем. Комиссию не вычитаем из
+    суммы: в учёте остаётся движение, которое биржа списала со счёта;
+    допуск rematch_transfers (1%) покрывает разницу с зачислением.
+    """
+    status = str(r.get("status") or "").strip()
+    if status not in ("success", "BlockchainConfirmed"):
+        return None
+    try:
+        withdraw_type = int(r.get("withdrawType") or 0)
+    except (TypeError, ValueError):
+        withdraw_type = 0
+    if withdraw_type != 0:
+        return None
+
+    coin = str(r.get("coin") or "").strip().upper()
+    amount = _positive_amount(r.get("amount"))
+    ts = _timestamp_s(r.get("createTime") or r.get("updateTime"))
+    withdraw_id = str(r.get("withdrawId") or r.get("txID") or "").strip()
+    if not coin or not amount or not ts or not withdraw_id:
+        return None
+
+    chain = str(r.get("chain") or "").strip()
+    note = f"bybit withdraw {coin}"
+    if chain:
+        note += f" ({chain})"
+    fee = _positive_amount(r.get("withdrawFee"))
+    if fee:
+        note += f", fee {fee} {coin}"
+    return ParsedRow(
+        ts=ts, asset=coin, tx_type=TxType.TRANSFER_OUT,
+        amount=amount, fiat_value_rub="", cost_basis_rub="",
+        note=note, external_id=f"bybit:withdraw:{withdraw_id}",
+        source="bybit",
+    )
+
+
+def _positive_amount(value) -> str:
+    """Вернуть сумму строкой, если она положительная, иначе пустую строку."""
+    text = str(value or "").strip()
+    try:
+        if not text or float(text) <= 0:
+            return ""
+    except (TypeError, ValueError):
+        return ""
+    return text
+
+
+def _timestamp_ms(value) -> int:
+    """Timestamp в миллисекундах; секунды из старых полей тоже понимаем."""
+    try:
+        ts = int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
+    if 0 < ts < 10_000_000_000:
+        ts *= 1000
+    return ts
+
+
+def _timestamp_s(value) -> int:
+    ts = _timestamp_ms(value)
+    return ts // 1000 if ts else 0
+
+
 # Хранилище «yielded» строк внутри CexSyncResult.saved (счётчик) и
 # списке rows_external для последующей записи caller'ом.
 def yield_row(row: ParsedRow, result: CexSyncResult) -> None:
@@ -360,21 +595,204 @@ def _okx_row_to_parsed(r: dict) -> ParsedRow | None:
         return None
 
 
+# ------------------------------------------------- OKX: переводы
+
+
+async def _okx_transfer_pages(
+    client, path: str, api_key: str, api_secret: str, passphrase: str,
+    since_ms: int, until_ms: int, result: CexSyncResult, id_key: str,
+):
+    """Страницы OKX asset-API через after/before.
+
+    OKX отдаёт историю в обратном хронологическом порядке. after — «раньше
+    указанного ts», before — «позже указанного ts». Поэтому забираем
+    диапазон [since, until], а затем сдвигаем after к последней строке.
+    """
+    seen: set[str] = set()
+    # after/before эксклюзивны: +1/−1 включают граничные ts. Повторно
+    # попавшие на стык страниц строки отсекаются по id.
+    after = str(_timestamp_ms(until_ms) + 1)
+    before = str(max(0, _timestamp_ms(since_ms) - 1))
+
+    while True:
+        params = {
+            "limit": "100",
+            "after": after,
+            "before": before,
+        }
+        headers = _okx_sign(api_key, api_secret, passphrase,
+                            "GET", path, params)
+        try:
+            resp = await client.get(
+                f"{OKX_API}{path}",
+                params=params,
+                headers=headers,
+                timeout=20.0,
+            )
+        except Exception as e:
+            result.errors.append(f"okx сеть: {e}")
+            return
+
+        if resp.status_code == 429:
+            await asyncio.sleep(5.0)
+            result.errors.append("okx 429 (лимит)")
+            return
+        if resp.status_code != 200:
+            result.errors.append(f"okx {resp.status_code}: {resp.text[:120]}")
+            return
+
+        try:
+            payload = resp.json()
+        except Exception:
+            result.errors.append("okx: невалидный JSON")
+            return
+
+        if payload.get("code") != "0":
+            result.errors.append(f"okx {payload.get('code')}: "
+                                 f"{payload.get('msg', '')[:120]}")
+            return
+
+        data = payload.get("data") or []
+        if not data:
+            break
+
+        for row in data:
+            row_id = str(row.get(id_key) or "").strip()
+            if row_id and row_id in seen:
+                continue
+            if row_id:
+                seen.add(row_id)
+            yield row
+
+        # Неполная страница — история закончилась.
+        if len(data) < 100:
+            break
+        last_ts = _timestamp_ms(data[-1].get("ts"))
+        if not last_ts:
+            break
+        next_after = last_ts + 1
+        if next_after >= int(after):
+            # Строки с тем же ts не дают сдвинуться — дальше не уйдём.
+            break
+        after = str(next_after)
+        await asyncio.sleep(TRANSFER_PAUSE_S)
+
+
+async def sync_okx_transfers(
+    api_key: str, api_secret: str, passphrase: str,
+    since_ts: int | None = None, until_ts: int | None = None,
+) -> CexSyncResult:
+    """Подтянуть ончейн-депозиты и выводы OKX.
+
+    type=4 — ончейн-операция; type=3 (внутренний перевод внутри OKX) не
+    берём, чтобы не считать один и тот же перевод дважды. Депозит
+    засчитывается со state 1 (credited) или 2 (success), вывод — только
+    state 2 (success).
+    """
+    result = CexSyncResult(exchange="okx")
+    if since_ts is None:
+        since_ts = int((time.time() - OKX_LOOKBACK_S) * 1000)
+    if until_ts is None:
+        until_ts = int(time.time() * 1000)
+    if since_ts >= until_ts:
+        return result
+
+    client = await get_client()
+
+    async for raw in _okx_transfer_pages(
+        client, "/api/v5/asset/deposit-history",
+        api_key, api_secret, passphrase,
+        since_ts, until_ts, result, id_key="depId",
+    ):
+        row = _okx_deposit_to_parsed(raw)
+        if row:
+            result.saved += 1
+            setattr(row, "_exchange", "okx")
+            yield_row(row, result)
+
+    async for raw in _okx_transfer_pages(
+        client, "/api/v5/asset/withdrawal-history",
+        api_key, api_secret, passphrase,
+        since_ts, until_ts, result, id_key="wdId",
+    ):
+        row = _okx_withdraw_to_parsed(raw)
+        if row:
+            result.saved += 1
+            setattr(row, "_exchange", "okx")
+            yield_row(row, result)
+
+    return result
+
+
+def _okx_deposit_to_parsed(r: dict) -> ParsedRow | None:
+    """Ончейн-депозит OKX → TRANSFER_IN (state 1/2)."""
+    if str(r.get("type") or "").strip() != "4":
+        return None
+    if str(r.get("state") or "").strip() not in ("1", "2"):
+        return None
+
+    coin = str(r.get("ccy") or "").strip().upper()
+    amount = _positive_amount(r.get("amt"))
+    ts = _timestamp_s(r.get("ts"))
+    dep_id = str(r.get("depId") or r.get("txId") or "").strip()
+    if not coin or not amount or not ts or not dep_id:
+        return None
+
+    chain = str(r.get("chain") or "").strip()
+    note = f"okx deposit {coin}"
+    if chain:
+        note += f" ({chain})"
+    return ParsedRow(
+        ts=ts, asset=coin, tx_type=TxType.TRANSFER_IN,
+        amount=amount, fiat_value_rub="", cost_basis_rub="",
+        note=note, external_id=f"okx:deposit:{dep_id}",
+        source="okx",
+    )
+
+
+def _okx_withdraw_to_parsed(r: dict) -> ParsedRow | None:
+    """Ончейн-вывод OKX → TRANSFER_OUT (state 2)."""
+    if str(r.get("type") or "").strip() != "4":
+        return None
+    if str(r.get("state") or "").strip() != "2":
+        return None
+
+    coin = str(r.get("ccy") or "").strip().upper()
+    amount = _positive_amount(r.get("amt"))
+    ts = _timestamp_s(r.get("ts"))
+    withdraw_id = str(r.get("wdId") or r.get("txId") or "").strip()
+    if not coin or not amount or not ts or not withdraw_id:
+        return None
+
+    chain = str(r.get("chain") or "").strip()
+    note = f"okx withdraw {coin}"
+    if chain:
+        note += f" ({chain})"
+    fee = _positive_amount(r.get("fee"))
+    fee_ccy = str(r.get("feeCcy") or coin).strip().upper()
+    if fee:
+        note += f", fee {fee} {fee_ccy}"
+    return ParsedRow(
+        ts=ts, asset=coin, tx_type=TxType.TRANSFER_OUT,
+        amount=amount, fiat_value_rub="", cost_basis_rub="",
+        note=note, external_id=f"okx:withdraw:{withdraw_id}",
+        source="okx",
+    )
+
+
 # ----------------------------------------------------------- watermark
 
 
-def get_cex_watermark(exchange: str) -> int:
-    """Последний обработанный ts (миллисекунды) для биржи — для инкремента."""
+def _get_stat(key: str) -> int:
     from utils.database import get_db
     with get_db() as conn:
         row = conn.execute(
-            "SELECT value FROM bot_stats WHERE key = ?",
-            (f"cex_sync_ts:{exchange}",),
+            "SELECT value FROM bot_stats WHERE key = ?", (key,),
         ).fetchone()
     return int(row["value"]) if row else 0
 
 
-def set_cex_watermark(exchange: str, ts_ms: int) -> None:
+def _set_stat(key: str, ts_ms: int) -> None:
     from utils.database import get_db
     with get_db() as conn:
         conn.execute(
@@ -384,5 +802,27 @@ def set_cex_watermark(exchange: str, ts_ms: int) -> None:
                 value = MAX(CAST(value AS INTEGER), ?),
                 updated_at = CURRENT_TIMESTAMP
             """,
-            (f"cex_sync_ts:{exchange}", str(ts_ms), ts_ms),
+            (key, str(ts_ms), ts_ms),
         )
+
+
+def get_cex_watermark(exchange: str) -> int:
+    """Последний обработанный ts (миллисекунды) сделок — для инкремента."""
+    return _get_stat(f"cex_sync_ts:{exchange}")
+
+
+def set_cex_watermark(exchange: str, ts_ms: int) -> None:
+    _set_stat(f"cex_sync_ts:{exchange}", ts_ms)
+
+
+def get_cex_transfer_watermark(exchange: str) -> int:
+    """Последний скан депозитов/выводов (ms).
+
+    Отдельный ключ, чтобы не сдвигать инкремент сделок: у переводов своё
+    перекрытие и свои статусы (позднее подтверждение).
+    """
+    return _get_stat(f"cex_transfer_ts:{exchange}")
+
+
+def set_cex_transfer_watermark(exchange: str, ts_ms: int) -> None:
+    _set_stat(f"cex_transfer_ts:{exchange}", ts_ms)

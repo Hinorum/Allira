@@ -71,6 +71,10 @@ async def sync_all(owner_id: int, cfg) -> SyncReport:
         report.cex_saved = cex.saved
         report.cex_duplicates = cex.duplicates
         report.cex_exchanges = cex.exchanges
+        # sync_cex сам сопоставляет переводы после депозитов/выводов;
+        # сохраняем его счётчик, чтобы сводка не показывала 0.
+        report.rematched = getattr(cex, "rematched", 0)
+        report.errors.extend(getattr(cex, "errors", []))
     except Exception as e:
         logger.error(f"sync_all: биржи: {e}", exc_info=True)
         report.errors.append(f"биржи: {e}")
@@ -78,7 +82,7 @@ async def sync_all(owner_id: int, cfg) -> SyncReport:
     # Сопоставление обязательно после любого источника: оно переводит
     # ложные «доходы» в перемещения, если появилась вторая сторона перевода.
     try:
-        report.rematched = rematch_transfers(owner_id)
+        report.rematched += rematch_transfers(owner_id)
     except Exception as e:
         logger.error(f"sync_all: сопоставление: {e}", exc_info=True)
         report.errors.append(f"сопоставление: {e}")
