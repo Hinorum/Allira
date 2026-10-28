@@ -437,6 +437,9 @@ async def main() -> int:
     check((captured.get("trade_wm") or 0) == captured.get("trade_until"),
           "водяной знак сделок сдвинут к концу окна",
           str(captured.get("trade_wm")))
+    covered = cex_api.get_cex_coverage("bybit")
+    check(covered > 0 and covered < trade_ts * 1000,
+          "покрытие истории записано от начала окна", str(covered))
     check((captured.get("transfer_wm") or 0) > trade_ts * 1000,
           "водяной знак переводов сдвинут", str(captured.get("transfer_wm")))
 

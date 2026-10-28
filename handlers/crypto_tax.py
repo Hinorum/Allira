@@ -476,6 +476,13 @@ async def _send_tax_summary(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
         f"Доходов: {len(summary.income_events)} | Реализаций: {len(summary.disposal_events)}\n"
         f"{escape_html(snapshot.summary_line)}\n"
     )
+    if snapshot.coverage_line:
+        text += (f"Покрытие истории: "
+                 f"{escape_html(snapshot.coverage_line)}\n")
+    if snapshot.coverage_warnings:
+        text += "\n<b>Покрытие истории неполное:</b>\n"
+        for warn in snapshot.coverage_warnings[:4]:
+            text += f"• {escape_html(warn)}\n"
     if not summary.income_events and not summary.disposal_events:
         text += (
             "\n<i>Операций за этот год нет. Записать первую: "

@@ -174,6 +174,8 @@ def _build_status(context: ContextTypes.DEFAULT_TYPE,
         lines.append("👛 Кошельков нет")
 
     lines.append(f"🔌 Биржи: {snap.cex_line}")
+    if snap.coverage_line:
+        lines.append(f"🗓 Покрытие: {escape_html(snap.coverage_line)}")
     lines.append(f"🧾 Операций за {snap.year}: <b>{snap.ops_year}</b>")
     lines.append(f"⚠️ Ждут проверки: <b>{snap.pending}</b>")
 

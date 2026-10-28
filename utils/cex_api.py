@@ -943,3 +943,28 @@ def get_cex_transfer_watermark(exchange: str) -> int:
 
 def set_cex_transfer_watermark(exchange: str, ts_ms: int) -> None:
     _set_stat(f"cex_transfer_ts:{exchange}", ts_ms)
+
+
+def get_cex_coverage(exchange: str) -> int:
+    """С какой даты (ms) API реально покрывает историю биржи."""
+    return _get_stat(f"cex_covered_from:{exchange}")
+
+
+def set_cex_coverage(exchange: str, ts_ms: int) -> None:
+    """Запомнить начало покрытия, не сдвигая его вперёд.
+
+    Если первый синк покрывал год, а следующий стартовал позже (водяной
+    знак или ограничение API), старое начало не должно потеряться:
+    иначе предупреждение «история только с …» станет ложным.
+    """
+    from utils.database import get_db
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO bot_stats (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = MIN(CAST(value AS INTEGER), ?),
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (f"cex_covered_from:{exchange}", str(ts_ms), ts_ms),
+        )

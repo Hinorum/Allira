@@ -213,6 +213,51 @@ async def main() -> int:
     check(snap2.pending == 2, "внутренние перемещения не считаются спорными",
           str(snap2.pending))
 
+    # ------------------------------------------- 3b. покрытие истории
+    print("3b. Покрытие истории бирж")
+    from utils.cex_api import get_cex_coverage, set_cex_coverage
+
+    check(snap2.coverage_line == "Bybit — ещё не загружена",
+          "без синка покрытие неизвестно", snap2.coverage_line)
+    check(any("история ещё не загружена" in m for m in snap2.missing),
+          "подсказка загрузить историю", str(snap2.missing))
+
+    early_ms = int(time.mktime(time.strptime("2024-03-01 00:00:00",
+                                             "%Y-%m-%d %H:%M:%S"))) * 1000
+    set_cex_coverage("bybit", early_ms)
+    check(get_cex_coverage("bybit") == early_ms, "покрытие записано",
+          str(get_cex_coverage("bybit")))
+
+    later_ms = int(time.mktime(time.strptime("2025-06-01 00:00:00",
+                                             "%Y-%m-%d %H:%M:%S"))) * 1000
+    set_cex_coverage("bybit", later_ms)
+    check(get_cex_coverage("bybit") == early_ms,
+          "покрытие не сдвигается вперёд", str(get_cex_coverage("bybit")))
+
+    snap3 = sources_snapshot(owner, bybit_cfg, year=2025)
+    check("Bybit — с 01.03.2024" in snap3.coverage_line,
+          "дата покрытия в строке", snap3.coverage_line)
+    check(not snap3.coverage_warnings,
+          "начало 2025 покрыто — предупреждений нет",
+          str(snap3.coverage_warnings))
+
+    okx_mid = int(time.mktime(time.strptime("2025-06-01 00:00:00",
+                                            "%Y-%m-%d %H:%M:%S"))) * 1000
+    set_cex_coverage("okx", okx_mid)
+    both_cfg = make_cfg(crypto_owner_id=owner,
+                        bybit_api_key="key", bybit_api_secret="secret",
+                        okx_api_key="k", okx_api_secret="s",
+                        okx_passphrase="p")
+    snap4 = sources_snapshot(owner, both_cfg, year=2025)
+    check(any("OKX" in w and "не покрыто" in w
+              for w in snap4.coverage_warnings),
+          "OKX не дотягивает до начала года", str(snap4.coverage_warnings))
+    check(not any("Bybit" in w for w in snap4.coverage_warnings),
+          "предупреждение только про неполную биржу",
+          str(snap4.coverage_warnings))
+    check(any("OKX" in m and "не покрыто" in m for m in snap4.missing),
+          "предупреждение попало в «что дальше»", str(snap4.missing))
+
     # ---------------------------------------------------- 4. sync_all
     print("4. Единый прогон sync_all")
     owner = 4001

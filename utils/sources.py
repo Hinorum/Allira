@@ -56,6 +56,11 @@ class BulkWalletResult:
         return not (self.added or self.duplicates or self.invalid)
 
 
+def _coverage_date(ts_ms: int) -> str:
+    """Дата начала покрытия для человека: 12.03.2024."""
+    return datetime.fromtimestamp(int(ts_ms) / 1000).strftime("%d.%m.%Y")
+
+
 @dataclass
 class SourcesSnapshot:
     """Что уже отдано боту и чего не хватает до отчёта."""
@@ -65,6 +70,9 @@ class SourcesSnapshot:
     cex: list[tuple[str, bool]]
     pending: int
     ops_year: int
+    # С какой даты API каждой настроенной биржи реально отдаёт историю:
+    # [(«Bybit», ts_ms), …]. 0 — синка ещё не было.
+    coverage: list[tuple[str, int]] = field(default_factory=list)
 
     @property
     def has_sources(self) -> bool:
@@ -85,12 +93,49 @@ class SourcesSnapshot:
                 f"{self.cex_line}; спорных — {self.pending}")
 
     @property
+    def coverage_line(self) -> str:
+        """С какой даты загружена история бирж — одной строкой."""
+        if not self.coverage:
+            return ""
+        parts = []
+        for name, since_ms in self.coverage:
+            if since_ms:
+                parts.append(f"{name} — с {_coverage_date(since_ms)}")
+            else:
+                parts.append(f"{name} — ещё не загружена")
+        return "; ".join(parts)
+
+    @property
+    def coverage_warnings(self) -> list[str]:
+        """Биржи, чья история не дотягивает до 1 января отчётного года.
+
+        API Bybit хранит сделки два года, OKX — три месяца. Если начало
+        года старше этого окна, честнее сказать об этом сразу: иначе
+        отчёт выглядит полным, хотя часть сделок в нём отсутствует.
+        """
+        start_ms = int(datetime(self.year, 1, 1).timestamp() * 1000)
+        out: list[str] = []
+        for name, since_ms in self.coverage:
+            if not since_ms:
+                out.append(
+                    f"{name}: история ещё не загружена — нажми «Обновить всё»."
+                )
+            elif since_ms > start_ms:
+                out.append(
+                    f"{name}: API отдаёт историю только с "
+                    f"{_coverage_date(since_ms)} — начало {self.year} "
+                    f"не покрыто. Импортируй выписку за остаток года."
+                )
+        return out
+
+    @property
     def missing(self) -> list[str]:
         out: list[str] = []
         if not self.has_sources:
             out.append(
                 "Нет источников: пришли адрес кошелька или выписку биржи."
             )
+        out.extend(self.coverage_warnings)
         if self.pending:
             out.append(
                 f"{self.pending} операций ждут проверки — от них зависит база."
@@ -203,6 +248,8 @@ def cex_connections(cfg) -> list[tuple[str, bool]]:
 
 def sources_snapshot(owner_id: int, cfg, year: int | None = None) -> SourcesSnapshot:
     """Собрать состояние источников за год — без сетевых вызовов."""
+    from utils.cex_api import get_cex_coverage
+
     year = int(year or datetime.now().year)
     start = int(datetime(year, 1, 1).timestamp())
     end = int(datetime(year + 1, 1, 1).timestamp())
@@ -221,10 +268,17 @@ def sources_snapshot(owner_id: int, cfg, year: int | None = None) -> SourcesSnap
             (owner_id,),
         ).fetchone()
 
+    cex = cex_connections(cfg)
+    coverage = [
+        (name, get_cex_coverage(name.lower()))
+        for name, ok in cex if ok
+    ]
+
     return SourcesSnapshot(
         year=year,
         wallets=list_wallets(owner_id),
-        cex=cex_connections(cfg),
+        cex=cex,
         pending=int(pending["n"] or 0),
         ops_year=int(ops["n"] or 0),
+        coverage=coverage,
     )

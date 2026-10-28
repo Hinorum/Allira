@@ -22,8 +22,8 @@ from telegram.ext import Application
 
 from utils.cex_api import (
     TRADE_OVERLAP_MS, TRANSFER_OVERLAP_MS,
-    get_cex_transfer_watermark, get_cex_watermark,
-    set_cex_transfer_watermark, set_cex_watermark,
+    get_cex_coverage, get_cex_transfer_watermark, get_cex_watermark,
+    set_cex_coverage, set_cex_transfer_watermark, set_cex_watermark,
     sync_bybit_trades, sync_bybit_transfers,
     sync_okx_trades, sync_okx_transfers,
 )
@@ -182,11 +182,16 @@ async def _sync_exchange(owner_id: int, cfg, name: str) -> ExchangeSync:
     ex = ExchangeSync(name=name)
     try:
         watermark = get_cex_watermark(name)
-        if watermark:
+        coverage = get_cex_coverage(name)
+        if watermark and coverage:
             # Перекрытие ловит сделку, которая появилась в истории позже
             # фактического времени исполнения.
             since_ms = max(0, watermark - TRADE_OVERLAP_MS)
         else:
+            # Нет отметки покрытия (первый синк или обновление со старой
+            # версии) — читаем всё доступное окно заново. Дедупликация по
+            # external_id сделает повтор безопасным, зато мы будем точно
+            # знать, с какой даты история действительно загружена.
             since_ms = int(
                 (time.time() - LOOKBACK_DAYS[name] * 86400) * 1000
             )
@@ -212,6 +217,9 @@ async def _sync_exchange(owner_id: int, cfg, name: str) -> ExchangeSync:
             # Полный проход без ошибок: следующий синк начнётся от конца
             # окна с суточным перекрытием, даже если сделок не было.
             set_cex_watermark(name, until_ms)
+            # Запоминаем, с какой даты история реально прочитана. MIN
+            # внутри set_cex_coverage не даст сдвинуть её вперёд.
+            set_cex_coverage(name, since_ms)
         elif timestamps:
             # Часть окон уже прочитана. Ставим знак на последнюю
             # сохранённую сделку, чтобы не потерять более новые окна.
