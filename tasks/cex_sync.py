@@ -21,7 +21,7 @@ from decimal import Decimal, InvalidOperation
 from telegram.ext import Application
 
 from utils.cex_api import (
-    TRANSFER_OVERLAP_MS,
+    TRADE_OVERLAP_MS, TRANSFER_OVERLAP_MS,
     get_cex_transfer_watermark, get_cex_watermark,
     set_cex_transfer_watermark, set_cex_watermark,
     sync_bybit_trades, sync_bybit_transfers,
@@ -35,8 +35,9 @@ from utils.price_oracle import get_asset_price_rub
 logger = logging.getLogger(__name__)
 
 # Сколько дней истории брать при первом синке. Дальше окно сужается
-# водяным знаком. OKX отдаёт спот-сделки только за 90 дней.
-LOOKBACK_DAYS = {"bybit": 365, "okx": 90}
+# водяным знаком. Bybit хранит сделки два года, OKX — только 90 дней.
+# Двухлетнее окно покрывает и текущий, и прошлый налоговый год.
+LOOKBACK_DAYS = {"bybit": 730, "okx": 90}
 
 
 @dataclass
@@ -180,9 +181,15 @@ async def _sync_exchange(owner_id: int, cfg, name: str) -> ExchangeSync:
     """Одна биржа: сделки + переводы → запись → сдвиг водяных знаков."""
     ex = ExchangeSync(name=name)
     try:
-        since_ms = get_cex_watermark(name) or int(
-            (time.time() - LOOKBACK_DAYS[name] * 86400) * 1000
-        )
+        watermark = get_cex_watermark(name)
+        if watermark:
+            # Перекрытие ловит сделку, которая появилась в истории позже
+            # фактического времени исполнения.
+            since_ms = max(0, watermark - TRADE_OVERLAP_MS)
+        else:
+            since_ms = int(
+                (time.time() - LOOKBACK_DAYS[name] * 86400) * 1000
+            )
         until_ms = int(time.time() * 1000)
 
         if name == "bybit":
@@ -201,7 +208,13 @@ async def _sync_exchange(owner_id: int, cfg, name: str) -> ExchangeSync:
         ex.duplicates += dups
         timestamps = [int(r.ts) for r in result.rows
                       if getattr(r, "ts", 0)]
-        if timestamps:
+        if not result.errors:
+            # Полный проход без ошибок: следующий синк начнётся от конца
+            # окна с суточным перекрытием, даже если сделок не было.
+            set_cex_watermark(name, until_ms)
+        elif timestamps:
+            # Часть окон уже прочитана. Ставим знак на последнюю
+            # сохранённую сделку, чтобы не потерять более новые окна.
             set_cex_watermark(name, max(timestamps) * 1000)
         ex.errors.extend(result.errors)
 

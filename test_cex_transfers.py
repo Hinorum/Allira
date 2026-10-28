@@ -389,6 +389,7 @@ async def main() -> int:
     captured: dict = {}
 
     async def fake_trades(key, secret, since_ts=None, until_ts=None):
+        captured["trade_until"] = until_ts
         return cex_api.CexSyncResult(exchange="bybit", rows=[trade])
 
     async def fake_transfers(key, secret, since_ts=None, until_ts=None):
@@ -433,8 +434,9 @@ async def main() -> int:
           str(report.transfers_saved))
     check(report.rematched == 4, "rematch запущен внутри sync_cex",
           str(report.rematched))
-    check((captured.get("trade_wm") or 0) == trade_ts * 1000,
-          "водяной знак сделок сдвинут", str(captured.get("trade_wm")))
+    check((captured.get("trade_wm") or 0) == captured.get("trade_until"),
+          "водяной знак сделок сдвинут к концу окна",
+          str(captured.get("trade_wm")))
     check((captured.get("transfer_wm") or 0) > trade_ts * 1000,
           "водяной знак переводов сдвинут", str(captured.get("transfer_wm")))
 

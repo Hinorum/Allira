@@ -304,12 +304,12 @@ async def main() -> int:
         cex_sync.get_cex_transfer_watermark = original_transfer_watermark
         cex_sync.set_cex_transfer_watermark = original_set_transfer_watermark
 
-    expected = int((time.time() - 365 * 86400) * 1000)
+    expected = int((time.time() - 730 * 86400) * 1000)
     since = captured.get("since") or 0
     check(since > 1_000_000_000_000,
           "since_ms — эпоха в миллисекундах, а не время loop", str(since))
     check(abs(since - expected) < 120_000,
-          "since_ms — примерно год назад", f"{since} vs {expected}")
+          "since_ms — примерно два года назад", f"{since} vs {expected}")
     check((captured.get("until") or 0) > since,
           "until_ms позже since_ms", str(captured))
     check((captured.get("transfer_wm") or 0) > 1_000_000_000_000,

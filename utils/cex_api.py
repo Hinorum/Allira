@@ -31,11 +31,21 @@ logger = logging.getLogger(__name__)
 BYBIT_API = "https://api.bybit.com"
 OKX_API = "https://www.okx.com"
 
-# Безконечный лимит «торгов» Bybit'а — за последние 2 года. OKX — 3 месяца
-# для спота через trade/fills (для расширения нужен /api/v5/trade/fills-history
-# через OKX-плагин). На текущий момент ограничиваемся этими окнами.
-BYBIT_LOOKBACK_S = 365 * 86400
+# Bybit хранит историю сделок два года, OKX отдаёт fills-history только за
+# три месяца. Для более старых периодов у OKX остаётся импорт выписки.
+BYBIT_LOOKBACK_S = 730 * 86400
 OKX_LOOKBACK_S = 90 * 86400
+
+# Bybit execution/list не принимает диапазон шире 7 дней: если передать
+# год одним запросом, API вернёт ошибку и история молча останется пустой.
+BYBIT_TRADE_WINDOW_MS = 7 * 86400 * 1000
+
+# Перекрытие инкрементального окна: сделка может появиться в истории с
+# задержкой, поэтому начинаем чуть раньше водяного знака.
+TRADE_OVERLAP_MS = 86400 * 1000
+
+# Пауза между страницами сделок, чтобы не ловить 429.
+TRADE_PAUSE_S = 0.4
 
 # Bybit отдаёт историю депозитов и выводов окнами строго меньше 30 дней.
 # Берём 29 суток с запасом на inclusive-границы.
@@ -65,6 +75,79 @@ class CexSyncResult:
 # ---------------------------------------------------------------- Bybit
 
 
+async def _bybit_trade_pages(
+    client, api_key: str, api_secret: str,
+    since_ms: int, until_ms: int, result: CexSyncResult,
+):
+    """Страницы Bybit execution/list окнами не шире 7 дней.
+
+    API не принимает startTime и endTime с разницей больше 7 суток.
+    Внутри окна история листается cursor; окна идут от старых к новым,
+    чтобы водяной знак не перескочил через непрочитанный участок.
+    """
+    start = int(since_ms)
+    end_limit = int(until_ms)
+    while start < end_limit:
+        end = min(start + BYBIT_TRADE_WINDOW_MS, end_limit)
+        cursor: str | None = None
+        while True:
+            params = {
+                "category": "spot",
+                "limit": "100",
+                "startTime": str(start),
+                "endTime": str(end),
+            }
+            if cursor:
+                params["cursor"] = cursor
+
+            headers = _bybit_sign(api_key, api_secret, params)
+            try:
+                resp = await client.get(
+                    f"{BYBIT_API}/v5/execution/list",
+                    params=params,
+                    headers=headers,
+                    timeout=20.0,
+                )
+            except Exception as e:
+                result.errors.append(f"bybit сеть: {e}")
+                return
+
+            if resp.status_code == 429:
+                await asyncio.sleep(5.0)
+                result.errors.append("bybit 429 (лимит)")
+                return
+            if resp.status_code != 200:
+                result.errors.append(
+                    f"bybit {resp.status_code}: {resp.text[:120]}"
+                )
+                return
+
+            try:
+                payload = resp.json()
+            except Exception:
+                result.errors.append("bybit: невалидный JSON")
+                return
+
+            if payload.get("retCode") != 0:
+                result.errors.append(
+                    f"bybit retCode {payload.get('retCode')}: "
+                    f"{payload.get('retMsg', '')[:120]}"
+                )
+                return
+
+            data = payload.get("result") or {}
+            for row in data.get("list") or []:
+                yield row
+
+            cursor = data.get("nextPageCursor")
+            if not cursor:
+                break
+            await asyncio.sleep(TRADE_PAUSE_S)
+
+        start = end + 1
+        await asyncio.sleep(TRADE_PAUSE_S)
+
+
 async def sync_bybit_trades(
     api_key: str, api_secret: str,
     since_ts: int | None = None, until_ts: int | None = None,
@@ -79,67 +162,20 @@ async def sync_bybit_trades(
         since_ts = int((time.time() - BYBIT_LOOKBACK_S) * 1000)
     if until_ts is None:
         until_ts = int(time.time() * 1000)
+    if since_ts >= until_ts:
+        return result
 
     client = await get_client()
-    cursor: str | None = None
-    while True:
-        params = {
-            "category": "spot",
-            "limit": "100",
-            "startTime": str(since_ts),
-            "endTime": str(until_ts),
-        }
-        if cursor:
-            params["cursor"] = cursor
-
-        headers = _bybit_sign(api_key, api_secret, params)
-        try:
-            resp = await client.get(
-                f"{BYBIT_API}/v5/execution/list",
-                params=params,
-                headers=headers,
-                timeout=20.0,
-            )
-        except Exception as e:
-            result.errors.append(f"bybit сеть: {e}")
-            break
-
-        if resp.status_code == 429:
-            await asyncio.sleep(5.0)
-            result.errors.append("bybit 429 (лимит)")
-            break
-        if resp.status_code != 200:
-            result.errors.append(f"bybit {resp.status_code}: {resp.text[:120]}")
-            break
-
-        try:
-            payload = resp.json()
-        except Exception:
-            result.errors.append("bybit: невалидный JSON")
-            break
-
-        if payload.get("retCode") != 0:
-            result.errors.append(f"bybit retCode {payload.get('retCode')}: "
-                                 f"{payload.get('retMsg', '')[:120]}")
-            break
-
-        rows = (payload.get("result") or {}).get("list") or []
-        if not rows:
-            break
-
-        for r in rows:
-            row = _bybit_row_to_parsed(r)
-            if row:
-                result.saved += 1
-                # Передаём наверх — caller сам запишет через add_transaction
-                # с дедупликацией по external_id.
-                setattr(row, "_exchange", "bybit")
-                yield_row(row, result)
-
-        cursor = (payload.get("result") or {}).get("nextPageCursor")
-        if not cursor:
-            break
-        await asyncio.sleep(0.4)
+    async for raw in _bybit_trade_pages(
+        client, api_key, api_secret, since_ts, until_ts, result,
+    ):
+        row = _bybit_row_to_parsed(raw)
+        if row:
+            result.saved += 1
+            # Передаём наверх — caller сам запишет через add_transaction
+            # с дедупликацией по external_id.
+            setattr(row, "_exchange", "bybit")
+            yield_row(row, result)
 
     return result
 
@@ -465,70 +501,119 @@ def yield_row(row: ParsedRow, result: CexSyncResult) -> None:
 # ------------------------------------------------------------------- OKX
 
 
-async def sync_okx_trades(
-    api_key: str, api_secret: str, passphrase: str,
-    since_ts: int | None = None, until_ts: int | None = None,
-) -> CexSyncResult:
-    """Подтянуть сделки OKX (spot) — /api/v5/trade/fills."""
-    result = CexSyncResult(exchange="okx")
-    if since_ts is None:
-        since_ts = int((time.time() - OKX_LOOKBACK_S) * 1000)
-    if until_ts is None:
-        until_ts = int(time.time() * 1000)
+async def _okx_trade_pages(
+    client, api_key: str, api_secret: str, passphrase: str,
+    since_ms: int, until_ms: int, result: CexSyncResult,
+):
+    """Страницы OKX fills-history через after/by time.
 
-    client = await get_client()
-    while True:
+    fills-history отдаёт три месяца и сортирует записи по убыванию ts.
+    Внутри страницы используем after=billId; если биржа не вернула billId,
+    сдвигаем end на самую старую метку времени. Дедуп по tradeId защищает
+    от повторов на стыке страниц.
+    """
+    seen: set[str] = set()
+    end = int(until_ms)
+    after = ""
+    while int(since_ms) < end:
         params = {
             "instType": "SPOT",
             "limit": "100",
-            "begin": str(since_ts),
-            "end": str(until_ts),
+            "begin": str(int(since_ms)),
+            "end": str(end),
         }
+        if after:
+            params["after"] = after
         headers = _okx_sign(api_key, api_secret, passphrase,
-                            "GET", "/api/v5/trade/fills", params)
+                            "GET", "/api/v5/trade/fills-history", params)
         try:
             resp = await client.get(
-                f"{OKX_API}/api/v5/trade/fills",
+                f"{OKX_API}/api/v5/trade/fills-history",
                 params=params,
                 headers=headers,
                 timeout=20.0,
             )
         except Exception as e:
             result.errors.append(f"okx сеть: {e}")
-            break
+            return
 
         if resp.status_code == 429:
             await asyncio.sleep(5.0)
             result.errors.append("okx 429 (лимит)")
-            break
+            return
         if resp.status_code != 200:
             result.errors.append(f"okx {resp.status_code}: {resp.text[:120]}")
-            break
+            return
 
         try:
             payload = resp.json()
         except Exception:
             result.errors.append("okx: невалидный JSON")
-            break
+            return
 
         if payload.get("code") != "0":
             result.errors.append(f"okx {payload.get('code')}: "
                                  f"{payload.get('msg', '')[:120]}")
-            break
+            return
 
-        rows = payload.get("data") or []
-        if not rows:
-            break
+        data = payload.get("data") or []
+        if not data:
+            return
 
-        for r in rows:
-            row = _okx_row_to_parsed(r)
-            if row:
-                result.saved += 1
-                setattr(row, "_exchange", "okx")
-                yield_row(row, result)
+        for row in data:
+            key = str(row.get("tradeId") or row.get("billId") or "")
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            yield row
 
-        # OKX пагинирует через after/before; упрощённо — break.
-        break
+        if len(data) < 100:
+            return
+
+        last = data[-1]
+        next_after = str(last.get("billId") or "").strip()
+        if next_after and next_after != after:
+            after = next_after
+            await asyncio.sleep(TRADE_PAUSE_S)
+            continue
+
+        # Нет billId или страница не сдвинулась — режем диапазон по времени.
+        stamps = [int(r.get("ts") or 0) for r in data]
+        oldest = min((ts for ts in stamps if ts), default=0)
+        if not oldest:
+            return
+        next_end = oldest - 1
+        if next_end >= end:
+            return
+        end = next_end
+        after = ""
+        await asyncio.sleep(TRADE_PAUSE_S)
+
+
+async def sync_okx_trades(
+    api_key: str, api_secret: str, passphrase: str,
+    since_ts: int | None = None, until_ts: int | None = None,
+) -> CexSyncResult:
+    """Подтянуть сделки OKX (spot) — /api/v5/trade/fills-history."""
+    result = CexSyncResult(exchange="okx")
+    if since_ts is None:
+        since_ts = int((time.time() - OKX_LOOKBACK_S) * 1000)
+    if until_ts is None:
+        until_ts = int(time.time() * 1000)
+    if since_ts >= until_ts:
+        return result
+
+    client = await get_client()
+    async for raw in _okx_trade_pages(
+        client, api_key, api_secret, passphrase,
+        since_ts, until_ts, result,
+    ):
+        row = _okx_row_to_parsed(raw)
+        if row:
+            result.saved += 1
+            setattr(row, "_exchange", "okx")
+            yield_row(row, result)
 
     return result
 
@@ -568,7 +653,9 @@ def _okx_row_to_parsed(r: dict) -> ParsedRow | None:
         price = r.get("fillPx") or "0"
         if not qty or float(qty) == 0:
             return None
-        trade_id = r.get("tradeId", "")
+        trade_id = str(r.get("tradeId") or r.get("billId") or "").strip()
+        if not trade_id:
+            trade_id = f"{ts_ms}:{inst_id}:{side}:{qty}:{price}"
         quote_amount = _fmt_amount(float(qty) * float(price))
 
         if side == "buy":
