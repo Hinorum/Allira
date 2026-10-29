@@ -31,6 +31,28 @@ logger = logging.getLogger(__name__)
 _sync_in_progress: dict[int, str] = {}
 
 
+def _is_creator_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Пишет ли создатель бота — та же проверка, что в личке.
+
+    Нужна, чтобы чужой пользователь не получил по умолчанию отчёт по
+    кошельку создателя: без адреса «свой» кошелёк есть только у него.
+    Если CREATOR_USER_IDS/CREATOR_USERNAME пусты, ограничения нет — как и
+    в message_handler._is_creator.
+    """
+    user = getattr(update, "effective_user", None)
+    if user is None:
+        return False
+    creator_ids = context.bot_data.get("CREATOR_USER_IDS") or ()
+    creator_username = (
+        context.bot_data.get("CREATOR_USERNAME") or ""
+    ).strip().lstrip("@").lower()
+    if not creator_ids and not creator_username:
+        return True
+    if user.id in creator_ids:
+        return True
+    return bool(creator_username and (user.username or "").lower() == creator_username)
+
+
 async def _resolve_wallet(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -62,6 +84,14 @@ async def _resolve_wallet(
             )
             return None
     if not wallet:
+        # Без адреса отчёт по умолчанию есть только у создателя: его
+        # MARKETAPP_WALLET — единственный «свой» кошелёк в конфиге. Чужому
+        # показывать чужой отчёт нельзя, поэтому просим адрес.
+        if not _is_creator_user(update, context):
+            await update.message.reply_text(
+                "Укажи адрес своего TON-кошелька.\n" + usage
+            )
+            return None
         wallet = context.bot_data.get("MARKETAPP_WALLET", "")
 
     if not wallet:
@@ -360,12 +390,12 @@ async def _ensure_rent_data(bot, chat_id: int, wallet: str, api_token: str, is_o
         if not events:
             return events
 
-    if events and _count_linked(events) == 0 and api_token and is_owner:
-        # Небольшой бюджет: отчёт не должен ждать глубокого чтения ленты
-        # Marketapp. Глубину добьёт фоновая джоба. Если джоба как раз идёт —
-        # второй читатель затёр бы её курсор и границы: привязку из отчёта
-        # пропускаем и об этом не обещаем (enrich по цене истории не читает
-        # и продолжает работать).
+    if events and _count_linked(events) == 0 and api_token:
+        # Привязка через ленту Marketapp работает для любого кошелька:
+        # лента платформенная, а записи фильтруются по src/dst. Раньше
+        # здесь стояло api_token and is_owner, поэтому /marketapptop по
+        # чужому адресу не мог разложить доход по подаркам и показывал
+        # «привязка доступна только для своего».
         if LINKAGE_BUSY["running"]:
             logger.info("_ensure_rent_data: прогон привязки идёт — пропускаю")
         else:
@@ -385,9 +415,11 @@ async def _ensure_rent_data(bot, chat_id: int, wallet: str, api_token: str, is_o
                 )
         events = _dedupe_events(await get_all_rent_events(wallet))
 
-        if events and _count_linked(events) == 0:
+        if events and _count_linked(events) == 0 and is_owner:
             # Точный матч не сработал — пробуем примерять по цене аренды
             # (медленный перебор events × nfts × 30 дней, но зато без истории).
+            # Это запасной путь только для своего кошелька: my-rented отдаёт
+            # список аренд владельца API-ключа, а не чужого кошелька.
             try:
                 enriched = await _enrich_by_price(api_token, wallet)
                 if enriched:
@@ -405,21 +437,19 @@ async def _ensure_rent_data(bot, chat_id: int, wallet: str, api_token: str, is_o
     return events
 
 
-def _no_linkage_reason(api_token: str, is_owner: bool) -> str:
+def _no_linkage_reason(api_token: str) -> str:
     """Почему платежи нельзя разложить по подаркам — для сообщения юзеру."""
     if not api_token:
         return "не задан MARKETAPP_API_KEY"
-    if not is_owner:
-        return "кошелёк не совпадает с MARKETAPP_WALLET — привязка доступна только для своего"
-    return "Marketapp не вернул совпадений (подробности в логах Render)"
+    return "Marketapp не вернул совпадений по этому кошельку (подробности в логах Render)"
 
 
-async def _send_no_linkage(bot, chat_id: int, events: list, api_token: str, is_owner: bool):
+async def _send_no_linkage(bot, chat_id: int, events: list, api_token: str):
     total = _format_ton(_nano_to_ton(str(sum(int(e.get("price_nano", 0) or 0) for e in events))))
     await bot.send_message(
         chat_id,
         f"В базе {len(events)} платежей на {total} TON, но ни один не привязан к подарку:\n"
-        f"{_no_linkage_reason(api_token, is_owner)}.\n\n"
+        f"{_no_linkage_reason(api_token)}.\n\n"
         "Без привязки к NFT разложить доход по подаркам нельзя — суммы по кошельку "
         "смотри в /marketapprent.",
         parse_mode="HTML",
@@ -479,7 +509,7 @@ async def _run_gifts_report(bot, chat_id: int, wallet: str, api_token: str, is_o
             chat_id,
             f"Платежей по кошельку <code>{escape_html(wallet)}</code> нет даже после "
             "полной синхронизации.\n"
-            "Проверь MARKETAPP_WALLET и запусти /marketapprent — он покажет период сбора.",
+            "Проверь адрес кошелька и запусти /marketapprent — он покажет период сбора.",
             parse_mode="HTML",
         )
         return
@@ -506,7 +536,7 @@ async def _run_gifts_report(bot, chat_id: int, wallet: str, api_token: str, is_o
         await bot.send_message(
             chat_id,
             f"Общий доход: <b>{total_ton} TON</b> ({len(events)} событий)\n\n"
-            f"Причина: {_no_linkage_reason(api_token, is_owner)}.\n"
+            f"Причина: {_no_linkage_reason(api_token)}.\n"
             "Платежи не привязаны к конкретным подаркам — разложить доход по ним нельзя, "
             "суммы по кошельку смотри в /marketapprent.",
             parse_mode="HTML",
@@ -769,7 +799,7 @@ async def _run_top_report(bot, chat_id: int, wallet: str, api_token: str,
             chat_id,
             f"Платежей по кошельку <code>{escape_html(wallet)}</code> нет даже после "
             "полной синхронизации.\n"
-            "Проверь MARKETAPP_WALLET и запусти /marketapprent — он покажет период сбора.",
+            "Проверь адрес кошелька и запусти /marketapprent — он покажет период сбора.",
             parse_mode="HTML",
         )
         return
@@ -783,7 +813,7 @@ async def _run_top_report(bot, chat_id: int, wallet: str, api_token: str,
 
     if not rows:
         period_events = [e for e in events if int(e.get("ts", 0) or 0) >= since_ts]
-        await _send_no_linkage(bot, chat_id, period_events, api_token, is_owner)
+        await _send_no_linkage(bot, chat_id, period_events, api_token)
         return
 
     await bot.send_message(
