@@ -353,11 +353,12 @@ async def sync_bybit_transfers(
     api_key: str, api_secret: str,
     since_ts: int | None = None, until_ts: int | None = None,
 ) -> CexSyncResult:
-    """Подтянуть ончейн-депозиты и выводы Bybit.
+    """Подтянуть депозиты и выводы Bybit, включая off-chain.
 
-    Успешный депозит становится TRANSFER_IN, вывод — TRANSFER_OUT. Дальше
-    rematch_transfers сопоставит их с ончейн-переводами кошельков: ввод на
-    биржу ↔ исходящий перевод, вывод с биржи ↔ входящий перевод.
+    Успешный депозит становится TRANSFER_IN, вывод — TRANSFER_OUT.
+    Дальше rematch_transfers сопоставит их с ончейн-переводами кошельков
+    и с off-chain парой на другой стороне: ввод на биржу ↔ исходящий
+    перевод, вывод с биржи ↔ входящий перевод.
     """
     result = CexSyncResult(exchange="bybit")
     if since_ts is None:
@@ -379,12 +380,25 @@ async def sync_bybit_transfers(
             setattr(row, "_exchange", "bybit")
             yield_row(row, result)
 
-    # withdrawType=0 — только ончейн-выводы. Внутренние (off-chain) переводы
-    # между биржами не являются блокчейн-движением и здесь не нужны.
+    # Выводы Bybit бывают ончейн (withdrawType=0) и off-chain (1) —
+    # перевод на другой аккаунт Bybit без блокчейна. Оба движения
+    # списывают актив с нашего счёта и должны попасть в учёт: иначе
+    # off-chain перевод просто исчезает из баланса и отчёта.
     async for raw in _bybit_transfer_pages(
         client, "/v5/asset/withdraw/query-record",
         api_key, api_secret, since_ts, until_ts, result,
         extra={"withdrawType": "0"},
+    ):
+        row = _bybit_withdraw_to_parsed(raw)
+        if row:
+            result.saved += 1
+            setattr(row, "_exchange", "bybit")
+            yield_row(row, result)
+
+    async for raw in _bybit_transfer_pages(
+        client, "/v5/asset/withdraw/query-record",
+        api_key, api_secret, since_ts, until_ts, result,
+        extra={"withdrawType": "1"},
     ):
         row = _bybit_withdraw_to_parsed(raw)
         if row:
@@ -431,12 +445,14 @@ def _bybit_deposit_to_parsed(r: dict) -> ParsedRow | None:
 
 
 def _bybit_withdraw_to_parsed(r: dict) -> ParsedRow | None:
-    """Ончейн-вывод Bybit → TRANSFER_OUT.
+    """Вывод Bybit → TRANSFER_OUT.
 
-    success и BlockchainConfirmed — финальные успешные статусы. Pending,
-    SecurityCheck, Fail и отмены пропускаем. Комиссию не вычитаем из
-    суммы: в учёте остаётся движение, которое биржа списала со счёта;
-    допуск rematch_transfers (1%) покрывает разницу с зачислением.
+    withdrawType=0 — ончейн-вывод, 1 — off-chain перевод на другой
+    аккаунт Bybit. Оба финальных статуса success и BlockchainConfirmed
+    означают, что биржа списала средства. Pending, SecurityCheck, Fail и
+    отмены пропускаем. Комиссию не вычитаем из суммы: в учёте остаётся
+    движение, которое биржа списала со счёта; допуск rematch_transfers
+    (1%) покрывает разницу с зачислением.
     """
     status = str(r.get("status") or "").strip()
     if status not in ("success", "BlockchainConfirmed"):
@@ -445,8 +461,9 @@ def _bybit_withdraw_to_parsed(r: dict) -> ParsedRow | None:
         withdraw_type = int(r.get("withdrawType") or 0)
     except (TypeError, ValueError):
         withdraw_type = 0
-    if withdraw_type != 0:
+    if withdraw_type not in (0, 1):
         return None
+    offchain = withdraw_type == 1
 
     coin = str(r.get("coin") or "").strip().upper()
     amount = _positive_amount(r.get("amount"))
@@ -456,8 +473,8 @@ def _bybit_withdraw_to_parsed(r: dict) -> ParsedRow | None:
         return None
 
     chain = str(r.get("chain") or "").strip()
-    note = f"bybit withdraw {coin}"
-    if chain:
+    note = f"bybit {'off-chain ' if offchain else ''}withdraw {coin}"
+    if chain and not offchain:
         note += f" ({chain})"
     fee = _positive_amount(r.get("withdrawFee"))
     if fee:
@@ -799,12 +816,13 @@ async def sync_okx_transfers(
     api_key: str, api_secret: str, passphrase: str,
     since_ts: int | None = None, until_ts: int | None = None,
 ) -> CexSyncResult:
-    """Подтянуть ончейн-депозиты и выводы OKX.
+    """Подтянуть депозиты и выводы OKX.
 
-    type=4 — ончейн-операция; type=3 (внутренний перевод внутри OKX) не
-    берём, чтобы не считать один и тот же перевод дважды. Депозит
-    засчитывается со state 1 (credited) или 2 (success), вывод — только
-    state 2 (success).
+    type=4 — ончейн-операция, type=3 — off-chain перевод на другой
+    аккаунт OKX. Оба типа списывают/зачисляют средства и попадают в
+    учёт; совпадение пары off-chain переводов помечает rematch_transfers
+    как внутреннее перемещение. Депозит засчитывается со state 1
+    (credited) или 2 (success), вывод — только state 2 (success).
     """
     result = CexSyncResult(exchange="okx")
     if since_ts is None:
@@ -842,11 +860,18 @@ async def sync_okx_transfers(
 
 
 def _okx_deposit_to_parsed(r: dict) -> ParsedRow | None:
-    """Ончейн-депозит OKX → TRANSFER_IN (state 1/2)."""
-    if str(r.get("type") or "").strip() != "4":
+    """Депозит OKX → TRANSFER_IN.
+
+    type=4 — ончейн-депозит, type=3 — off-chain перевод с другого
+    аккаунта OKX. Оба успешных состояния (1/2) означают, что средства
+    уже на счёте.
+    """
+    op_type = str(r.get("type") or "").strip()
+    if op_type not in ("3", "4"):
         return None
     if str(r.get("state") or "").strip() not in ("1", "2"):
         return None
+    offchain = op_type == "3"
 
     coin = str(r.get("ccy") or "").strip().upper()
     amount = _positive_amount(r.get("amt"))
@@ -856,8 +881,8 @@ def _okx_deposit_to_parsed(r: dict) -> ParsedRow | None:
         return None
 
     chain = str(r.get("chain") or "").strip()
-    note = f"okx deposit {coin}"
-    if chain:
+    note = f"okx {'off-chain ' if offchain else ''}deposit {coin}"
+    if chain and not offchain:
         note += f" ({chain})"
     return ParsedRow(
         ts=ts, asset=coin, tx_type=TxType.TRANSFER_IN,
@@ -868,11 +893,17 @@ def _okx_deposit_to_parsed(r: dict) -> ParsedRow | None:
 
 
 def _okx_withdraw_to_parsed(r: dict) -> ParsedRow | None:
-    """Ончейн-вывод OKX → TRANSFER_OUT (state 2)."""
-    if str(r.get("type") or "").strip() != "4":
+    """Вывод OKX → TRANSFER_OUT.
+
+    type=4 — ончейн-вывод, type=3 — off-chain перевод на другой аккаунт
+    OKX. Оба списывают средства с нашего счёта; state=2 — успех.
+    """
+    op_type = str(r.get("type") or "").strip()
+    if op_type not in ("3", "4"):
         return None
     if str(r.get("state") or "").strip() != "2":
         return None
+    offchain = op_type == "3"
 
     coin = str(r.get("ccy") or "").strip().upper()
     amount = _positive_amount(r.get("amt"))
@@ -882,8 +913,8 @@ def _okx_withdraw_to_parsed(r: dict) -> ParsedRow | None:
         return None
 
     chain = str(r.get("chain") or "").strip()
-    note = f"okx withdraw {coin}"
-    if chain:
+    note = f"okx {'off-chain ' if offchain else ''}withdraw {coin}"
+    if chain and not offchain:
         note += f" ({chain})"
     fee = _positive_amount(r.get("fee"))
     fee_ccy = str(r.get("feeCcy") or coin).strip().upper()

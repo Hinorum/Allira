@@ -188,7 +188,7 @@ def _load_transfer_rows(owner_id: int) -> list[dict]:
     with get_db() as conn:
         rows = conn.execute(
             "SELECT t.id, t.ts, t.tx_type, t.amount_raw, t.is_internal, "
-            "       t.source, a.symbol, a.decimals "
+            "       t.source, t.note, a.symbol, a.decimals "
             "FROM crypto_transactions t "
             "JOIN crypto_assets a ON a.id = t.asset_id "
             "WHERE t.owner_id = ? AND t.tx_type IN (?, ?)",
@@ -204,11 +204,17 @@ def _load_transfer_rows(owner_id: int) -> list[dict]:
             "tx_type": r["tx_type"],
             "symbol": r["symbol"],
             "source": r["source"] or "",
+            "note": r["note"] or "",
             "amount": raw / (Decimal(10) ** decimals),
             "is_internal": bool(r["is_internal"]) if "is_internal" in r.keys()
             else False,
         })
     return out
+
+
+def _is_offchain(row: dict) -> bool:
+    """Проводка помечена как off-chain перевод внутри биржи."""
+    return "off-chain" in str(row.get("note") or "").lower()
 
 
 def _load_chain_rows(owner_id: int) -> list[dict]:
@@ -296,14 +302,20 @@ def rematch_transfers(owner_id: int) -> int:
     # отслеживаемого периметра, и обе проводки — перемещения. Иначе ввод
     # открывал бы второй лот на актив, который уже учтён лотом от покупки.
     # Источники должны различаться: ввод с карты и вывод на ту же биржу —
-    # это разные движения, а не перенос.
+    # это разные движения, а не перенос. Исключение — две off-chain
+    # проводки одной биржи: это перевод между аккаунтами внутри неё,
+    # и обе стороны такого перевода мы действительно видим.
     for tr in transfer_rows:
         if tr["is_internal"] or tr["tx_type"] != TxType.TRANSFER_IN:
             continue
         for out in transfer_rows:
             if out["is_internal"] or out["tx_type"] != TxType.TRANSFER_OUT:
                 continue
-            if out["id"] == tr["id"] or out["source"] == tr["source"]:
+            if out["id"] == tr["id"]:
+                continue
+            if out["source"] == tr["source"] and not (
+                _is_offchain(out) and _is_offchain(tr)
+            ):
                 continue
             if out["symbol"] != tr["symbol"]:
                 continue

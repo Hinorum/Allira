@@ -87,6 +87,18 @@ class BybitFakeClient:
                     "nextPageCursor": "" if cursor else "page-2",
                 },
             })
+        if "withdraw/query-record" in url and params.get("withdrawType") == "1":
+            return FakeResponse({
+                "retCode": 0,
+                "result": {
+                    "rows": [{
+                        "coin": "USDT", "amount": "5", "status": "success",
+                        "createTime": str(int(params["startTime"]) + 2000),
+                        "withdrawId": "offchain-1", "withdrawType": 1,
+                    }],
+                    "nextPageCursor": "",
+                },
+            })
         return FakeResponse({
             "retCode": 0,
             "result": {"rows": [], "nextPageCursor": ""},
@@ -187,11 +199,17 @@ async def main() -> int:
         "createTime": "1742738305000", "withdrawId": "133",
         "withdrawType": 0,
     }) is not None, "BlockchainConfirmed — успешный вывод")
-    check(cex_api._bybit_withdraw_to_parsed({
+    offchain_wd = cex_api._bybit_withdraw_to_parsed({
         "coin": "ETH", "amount": "0.1", "status": "success",
         "createTime": "1742738305000", "withdrawId": "134",
         "withdrawType": 1,
-    }) is None, "внутренний off-chain вывод пропущен")
+    })
+    check(offchain_wd is not None
+          and offchain_wd.tx_type == TxType.TRANSFER_OUT,
+          "off-chain вывод Bybit — TRANSFER_OUT", str(offchain_wd))
+    check(offchain_wd is not None and "off-chain" in offchain_wd.note,
+          "off-chain вывод помечен в примечании",
+          getattr(offchain_wd, "note", ""))
 
     # ------------------------------------------------- 2. маппинг OKX
     print("2. Маппинг OKX")
@@ -210,10 +228,16 @@ async def main() -> int:
         "ccy": "USDT", "amt": "10", "state": "0",
         "ts": "1742728163000", "depId": "90", "type": "4",
     }) is None, "ожидающий подтверждения депозит пропущен")
-    check(cex_api._okx_deposit_to_parsed({
+    offchain_dep = cex_api._okx_deposit_to_parsed({
         "ccy": "USDT", "amt": "10", "state": "2",
         "ts": "1742728163000", "depId": "91", "type": "3",
-    }) is None, "внутренний депозит OKX пропущен")
+    })
+    check(offchain_dep is not None
+          and offchain_dep.tx_type == TxType.TRANSFER_IN,
+          "off-chain депозит OKX принят", str(offchain_dep))
+    check(offchain_dep is not None and "off-chain" in offchain_dep.note,
+          "off-chain депозит помечен",
+          getattr(offchain_dep, "note", ""))
 
     owd = cex_api._okx_withdraw_to_parsed({
         "ccy": "BTC", "chain": "BTC-Bitcoin", "amt": "0.01",
@@ -227,10 +251,16 @@ async def main() -> int:
         "ccy": "BTC", "amt": "0.01", "state": "1",
         "ts": "1742728163000", "wdId": "155", "type": "4",
     }) is None, "вывод в процессе пропущен")
-    check(cex_api._okx_withdraw_to_parsed({
+    offchain_owd = cex_api._okx_withdraw_to_parsed({
         "ccy": "BTC", "amt": "0.01", "state": "2",
         "ts": "1742728163000", "wdId": "156", "type": "3",
-    }) is None, "внутренний вывод OKX пропущен")
+    })
+    check(offchain_owd is not None
+          and offchain_owd.tx_type == TxType.TRANSFER_OUT,
+          "off-chain вывод OKX принят", str(offchain_owd))
+    check(offchain_owd is not None and "off-chain" in offchain_owd.note,
+          "off-chain вывод OKX помечен",
+          getattr(offchain_owd, "note", ""))
 
     # ------------------------------- 3. окна и пагинация Bybit
     print("3. Окна и пагинация Bybit")
@@ -266,12 +296,21 @@ async def main() -> int:
     check(any(p.get("cursor") for p in deposit_calls),
           "cursor-пагинация внутри окна", str(deposit_calls[:2]))
     check(bool(withdraw_calls), "выводы запрошены отдельно")
-    check(all(p.get("withdrawType") == "0" for p in withdraw_calls),
-          "запрошены только ончейн-выводы")
-    check(len(result.rows) == 6, "две страницы в каждом из трёх окон",
+    withdraw_types = {p.get("withdrawType") for p in withdraw_calls}
+    check(withdraw_types == {"0", "1"},
+          "запрошены ончейн- и off-chain-выводы", str(withdraw_types))
+    check(len(result.rows) == 9, "депозиты и off-chain выводы записаны",
           str(len(result.rows)))
-    check(all(r.tx_type == TxType.TRANSFER_IN for r in result.rows),
-          "все строки — депозиты")
+    check(sum(1 for r in result.rows
+              if r.tx_type == TxType.TRANSFER_IN) == 6,
+          "шесть депозитов")
+    offchain_rows = [r for r in result.rows
+                     if r.tx_type == TxType.TRANSFER_OUT]
+    check(len(offchain_rows) == 3, "три off-chain вывода",
+          str(len(offchain_rows)))
+    check(all("off-chain" in r.note for r in offchain_rows),
+          "off-chain отмечен в примечании",
+          str([r.note for r in offchain_rows]))
     check(not result.errors, "ошибок нет", str(result.errors))
 
     # ------------------------------------- 4. пагинация OKX
@@ -365,6 +404,92 @@ async def main() -> int:
     check(usdt_dep is not None and usdt_dep["is_internal"] == 1,
           "депозит на биржу помечен внутренним",
           str(dict(usdt_dep)) if usdt_dep else "нет")
+
+    # ------------------------- 5b. off-chain переводы
+    print("5b. Off-chain переводы и их сопоставление")
+    from utils.csv_import import ParsedRow
+
+    owner_off = 9003
+    t_off = base_ts
+    pair = [
+        ParsedRow(
+            ts=t_off, asset="USDT", tx_type=TxType.TRANSFER_OUT,
+            amount="25", fiat_value_rub="", cost_basis_rub="",
+            note="bybit off-chain withdraw USDT",
+            external_id="bybit:withdraw:off-1", source="bybit",
+        ),
+        ParsedRow(
+            ts=t_off + 60, asset="USDT", tx_type=TxType.TRANSFER_IN,
+            amount="25", fiat_value_rub="", cost_basis_rub="",
+            note="okx off-chain deposit USDT",
+            external_id="okx:deposit:off-1", source="okx",
+        ),
+    ]
+    saved, dups = await persist_cex_rows(owner_off, pair, "bybit")
+    check(saved == 2 and dups == 0, "off-chain пара записана",
+          f"saved={saved}, dups={dups}")
+    changed = rematch_transfers(owner_off)
+    check(changed == 1, "off-chain пара сопоставлена", str(changed))
+    with db.get_db() as conn:
+        rows = conn.execute(
+            "SELECT external_id, is_internal FROM crypto_transactions "
+            "WHERE owner_id = ? ORDER BY id", (owner_off,),
+        ).fetchall()
+    check(all(r["is_internal"] == 1 for r in rows),
+          "обе стороны off-chain перевода внутренние", str([dict(r) for r in rows]))
+
+    owner_same = 9004
+    same_pair = [
+        ParsedRow(
+            ts=t_off, asset="TON", tx_type=TxType.TRANSFER_OUT,
+            amount="3", fiat_value_rub="", cost_basis_rub="",
+            note="bybit off-chain withdraw TON",
+            external_id="bybit:withdraw:off-2", source="bybit",
+        ),
+        ParsedRow(
+            ts=t_off + 120, asset="TON", tx_type=TxType.TRANSFER_IN,
+            amount="3", fiat_value_rub="", cost_basis_rub="",
+            note="bybit off-chain deposit TON",
+            external_id="bybit:deposit:off-2", source="bybit",
+        ),
+    ]
+    await persist_cex_rows(owner_same, same_pair, "bybit")
+    changed = rematch_transfers(owner_same)
+    check(changed == 1, "off-chain пара одной биржи сопоставлена", str(changed))
+    with db.get_db() as conn:
+        rows = conn.execute(
+            "SELECT is_internal FROM crypto_transactions WHERE owner_id = ?",
+            (owner_same,),
+        ).fetchall()
+    check(all(r["is_internal"] == 1 for r in rows),
+          "внутренний перевод одной биржи закрыт", str([dict(r) for r in rows]))
+
+    owner_chain = 9005
+    chain_pair = [
+        ParsedRow(
+            ts=t_off, asset="BTC", tx_type=TxType.TRANSFER_OUT,
+            amount="0.2", fiat_value_rub="", cost_basis_rub="",
+            note="bybit withdraw BTC (BTC)",
+            external_id="bybit:withdraw:on-1", source="bybit",
+        ),
+        ParsedRow(
+            ts=t_off + 120, asset="BTC", tx_type=TxType.TRANSFER_IN,
+            amount="0.2", fiat_value_rub="", cost_basis_rub="",
+            note="bybit deposit BTC (BTC)",
+            external_id="bybit:deposit:on-1", source="bybit",
+        ),
+    ]
+    await persist_cex_rows(owner_chain, chain_pair, "bybit")
+    changed = rematch_transfers(owner_chain)
+    check(changed == 0, "ончейн-пара одной биржи не склеена", str(changed))
+    with db.get_db() as conn:
+        rows = conn.execute(
+            "SELECT is_internal FROM crypto_transactions WHERE owner_id = ?",
+            (owner_chain,),
+        ).fetchall()
+    check(all(r["is_internal"] == 0 for r in rows),
+          "ончейн-проводки остались внешними",
+          str([dict(r) for r in rows]))
 
     # ---------------------- 6. sync_cex: переводы и rematch
     print("6. sync_cex: переводы и rematch")
