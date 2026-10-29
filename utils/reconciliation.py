@@ -10,7 +10,9 @@
      операции попадают в issues с указанием tx_id.
   3. Баланс-контроль. Расчётный остаток каждого актива по журналу
      сверяется с ФАКТИЧЕСКИМ балансом: TON-кошельки — через TonAPI,
-     биржи Bybit/OKX — через их read-only API. Расхождения — в issues.
+     биржи Bybit/OKX — через их read-only API, включая отдельные
+     funding-счета (средства, выведенные из торговли, но ещё не
+     отправленные в блокчейн). Расхождения — в issues.
   4. Контроль отрицательных остатков: продажа больше, чем есть на
      балансе, — признак незаписанного прихода.
 
@@ -440,68 +442,135 @@ async def _fetch_ton_balances(owner_id: int,
     return out, not ok
 
 
+async def _bybit_balance_request(client, sign, api_key: str, api_secret: str,
+                                 account_type: str,
+                                 where: str) -> tuple[list[ActualBalance], bool]:
+    """Один счёт Bybit: SPOT через wallet-balance, FUND — asset-эндпоинтом.
+
+    Funding-счёт (FUND) — отдельный кошелёк Bybit: средства, выведенные
+    из спота, но ещё не отправленные в блокчейн. Без него расчётный
+    остаток расходится с фактическим на всю сумму funding-баланса.
+    """
+    if account_type == "FUND":
+        path = "/v5/asset/transfer/query-account-coins-balance"
+        params = {"accountType": "FUND"}
+    else:
+        path = "/v5/account/wallet-balance"
+        params = {"accountType": "SPOT"}
+    try:
+        resp = await client.get(
+            f"https://api.bybit.com{path}",
+            params=params, headers=sign(api_key, api_secret, params),
+            timeout=20.0,
+        )
+        if resp.status_code != 200:
+            logger.warning(f"bybit balance {account_type}: {resp.status_code}")
+            return [], False
+        payload = resp.json() or {}
+        if payload.get("retCode") != 0:
+            logger.warning(
+                f"bybit balance {account_type}: retCode "
+                f"{payload.get('retCode')} {payload.get('retMsg')}"
+            )
+            return [], False
+        result = payload.get("result") or {}
+        if account_type == "FUND":
+            coins = result.get("balance") or []
+        else:
+            coins = [coin
+                     for acct in result.get("list") or []
+                     for coin in acct.get("coin") or []]
+        out: list[ActualBalance] = []
+        for coin in coins:
+            symbol = (coin.get("coin") or "").upper()
+            raw = (coin.get("walletBalance")
+                   or coin.get("transferBalance") or "0")
+            qty = _to_decimal(raw)
+            if symbol and qty > 0:
+                out.append(ActualBalance(symbol=symbol, qty=qty, where=where))
+        return out, True
+    except Exception as e:
+        logger.warning(f"bybit balance {account_type} fetch: {e}")
+        return [], False
+
+
 async def _fetch_bybit_balances(api_key: str,
                                 api_secret: str) -> tuple[list[ActualBalance], bool]:
-    """Пустой список без недоступности — это настоящее «на бирже пусто»."""
+    """Спотовый и funding-счёт Bybit. Второй элемент — источник не ответил."""
     if not (api_key and api_secret):
         return [], False  # ключи не заданы — сверять нечего
     from utils.cex_api import _bybit_sign  # переиспользуем подпись
     client = await get_client()
-    params = {"accountType": "SPOT"}
-    headers = _bybit_sign(api_key, api_secret, params)
+    out: list[ActualBalance] = []
+    ok = True
+    for account_type, where in (("SPOT", "bybit"), ("FUND", "bybit:fund")):
+        rows, good = await _bybit_balance_request(
+            client, _bybit_sign, api_key, api_secret, account_type, where,
+        )
+        out += rows
+        ok = ok and good
+    return out, not ok
+
+
+async def _okx_balance_request(client, sign, api_key: str, api_secret: str,
+                               passphrase: str, path: str, params: dict,
+                               where: str) -> tuple[list[ActualBalance], bool]:
+    """Один счёт OKX: trading — account/balance, funding — asset/balances."""
     try:
         resp = await client.get(
-            "https://api.bybit.com/v5/account/wallet-balance",
-            params=params, headers=headers, timeout=20.0,
+            f"https://www.okx.com{path}",
+            params=params,
+            headers=sign(api_key, api_secret, passphrase, "GET", path, params),
+            timeout=20.0,
         )
         if resp.status_code != 200:
-            return [], True
+            logger.warning(f"okx balance {path}: {resp.status_code}")
+            return [], False
         payload = resp.json() or {}
-        if payload.get("retCode") != 0:
-            return [], True
+        if payload.get("code") != "0":
+            logger.warning(
+                f"okx balance {path}: {payload.get('code')} "
+                f"{payload.get('msg')}"
+            )
+            return [], False
         out: list[ActualBalance] = []
-        for acct in (payload.get("result") or {}).get("list") or []:
-            for coin in acct.get("coin") or []:
-                symbol = (coin.get("coin") or "").upper()
-                qty = _to_decimal(coin.get("walletBalance") or "0")
+        for acct in payload.get("data") or []:
+            if path.endswith("/asset/balances"):
+                details = [acct]
+            else:
+                details = acct.get("details") or []
+            for detail in details:
+                symbol = (detail.get("ccy") or "").upper()
+                qty = _to_decimal(detail.get("bal") or "0")
                 if symbol and qty > 0:
-                    out.append(ActualBalance(symbol=symbol, qty=qty, where="bybit"))
-        return out, False
+                    out.append(ActualBalance(symbol=symbol, qty=qty,
+                                             where=where))
+        return out, True
     except Exception as e:
-        logger.warning(f"bybit balance fetch: {e}")
-        return [], True
+        logger.warning(f"okx balance {path} fetch: {e}")
+        return [], False
 
 
 async def _fetch_okx_balances(api_key: str, api_secret: str,
                               passphrase: str) -> tuple[list[ActualBalance], bool]:
+    """Торговый и funding-счёт OKX. Второй элемент — источник не ответил."""
     if not (api_key and api_secret and passphrase):
         return [], False  # ключи не заданы — сверять нечего
     from utils.cex_api import _okx_sign
     client = await get_client()
-    params = {"ccy": ""}
-    headers = _okx_sign(api_key, api_secret, passphrase,
-                        "GET", "/api/v5/account/balance", params)
-    try:
-        resp = await client.get(
-            "https://www.okx.com/api/v5/account/balance",
-            params=params, headers=headers, timeout=20.0,
+    out: list[ActualBalance] = []
+    ok = True
+    for path, where in (
+        ("/api/v5/account/balance", "okx"),
+        ("/api/v5/asset/balances", "okx:fund"),
+    ):
+        rows, good = await _okx_balance_request(
+            client, _okx_sign, api_key, api_secret, passphrase,
+            path, {"ccy": ""}, where,
         )
-        if resp.status_code != 200:
-            return [], True
-        payload = resp.json() or {}
-        if payload.get("code") != "0":
-            return [], True
-        out: list[ActualBalance] = []
-        for acct in payload.get("data") or []:
-            for detail in acct.get("details") or []:
-                symbol = (detail.get("ccy") or "").upper()
-                qty = _to_decimal(detail.get("bal") or "0")
-                if symbol and qty > 0:
-                    out.append(ActualBalance(symbol=symbol, qty=qty, where="okx"))
-        return out, False
-    except Exception as e:
-        logger.warning(f"okx balance fetch: {e}")
-        return [], True
+        out += rows
+        ok = ok and good
+    return out, not ok
 
 
 def compare_balances(calculated: list[BalanceRow],

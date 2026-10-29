@@ -24,6 +24,7 @@ import os
 import sys
 import tempfile
 import time
+from decimal import Decimal
 
 TEST_DB = tempfile.mktemp(suffix=".db")
 os.environ["DB_PATH"] = TEST_DB
@@ -174,6 +175,77 @@ async def main() -> int:
         okx_passphrase = "pass"
 
     orig_get_client = rec.get_client
+
+    # --- Funding-счета: средства, выведенные из торговли, но ещё не
+    # отправленные в блокчейн. Раньше сверялся только спотовый счёт, и
+    # весь funding-баланс выглядел как расхождение (или скрывал его).
+    class _BalResp:
+        def __init__(self, payload, status=200):
+            self.status_code = status
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class _BalClient:
+        async def get(self, url, params=None, headers=None, timeout=None):
+            if url.endswith("/v5/account/wallet-balance"):
+                return _BalResp({"retCode": 0, "result": {"list": [
+                    {"coin": [{"coin": "BTC", "walletBalance": "0.5"}]},
+                ]}})
+            if url.endswith("/v5/asset/transfer/query-account-coins-balance"):
+                return _BalResp({"retCode": 0, "result": {"balance": [
+                    {"coin": "ETH", "walletBalance": "2",
+                     "transferBalance": "2"},
+                ]}})
+            if url.endswith("/api/v5/account/balance"):
+                return _BalResp({"code": "0", "data": [
+                    {"details": [{"ccy": "BTC", "bal": "0.5"}]},
+                ]})
+            if url.endswith("/api/v5/asset/balances"):
+                return _BalResp({"code": "0", "data": [
+                    {"ccy": "USDT", "bal": "50"},
+                ]})
+            return _BalResp({}, 404)
+
+    class _BalCfg:
+        tonapi_api_key = ""
+        bybit_api_key = "key"
+        bybit_api_secret = "secret"
+        okx_api_key = "key"
+        okx_api_secret = "secret"
+        okx_passphrase = "pass"
+
+    async def _fake_bal_client():
+        return _BalClient()
+
+    rec.get_client = _fake_bal_client
+    try:
+        balances, bal_unavailable = await rec.fetch_actual_balances(
+            owner, _BalCfg(),
+        )
+    finally:
+        rec.get_client = orig_get_client
+
+    by_account = {(a.where, a.symbol): a.qty for a in balances}
+    if by_account.get(("bybit:fund", "ETH")) != 2:
+        errors.append(f"funding-баланс Bybit не получен: {by_account}")
+    if by_account.get(("okx:fund", "USDT")) != 50:
+        errors.append(f"funding-баланс OKX не получен: {by_account}")
+    if bal_unavailable:
+        errors.append(f"все счёта ответили, а источники недоступны: "
+                      f"{bal_unavailable}")
+    drift = rec.compare_balances([
+        rec.BalanceRow(symbol="BTC", qty=Decimal("1"),
+                       cost_rub=Decimal(0)),
+        rec.BalanceRow(symbol="ETH", qty=Decimal("2"),
+                       cost_rub=Decimal(0)),
+        rec.BalanceRow(symbol="USDT", qty=Decimal("50"),
+                       cost_rub=Decimal(0)),
+    ], balances)
+    if drift:
+        errors.append(f"funding-балансы не суммируются со спотом: "
+                      f"{[i.message for i in drift]}")
 
     async def _fake_get_client():
         return _FakeClient()
