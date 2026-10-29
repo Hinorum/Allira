@@ -458,11 +458,16 @@ async def _send_tax_summary(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
     ])
 
     from utils.sources import sources_snapshot
+    from utils.report_readiness import check_readiness
 
     snapshot = sources_snapshot(owner, context.bot_data.get("BOT_CONFIG"),
                                 year)
+    readiness = check_readiness(owner, year, summary, snapshot)
+    status = ("✅ <b>Отчёт готов к подаче</b>" if readiness.ready
+              else "⚠️ <b>Отчёт пока не готов</b>")
     text = (
         f"<b>Сводка 3-НДФЛ за {year}:</b>\n\n"
+        f"{status}\n\n"
         f"Доход (аирдропы, майнинг…): <b>{format_rub(float(summary.total_income_rub))}</b>\n"
         f"Себестоимость реализованных: <b>{format_rub(float(summary.total_cost_rub))}</b>\n"
         f"Прибыль от реализации: <b>{format_rub(float(summary.realized_gain_rub))}</b>\n"
@@ -479,10 +484,10 @@ async def _send_tax_summary(chat_id: int, context: ContextTypes.DEFAULT_TYPE,
     if snapshot.coverage_line:
         text += (f"Покрытие истории: "
                  f"{escape_html(snapshot.coverage_line)}\n")
-    if snapshot.coverage_warnings:
-        text += "\n<b>Покрытие истории неполное:</b>\n"
-        for warn in snapshot.coverage_warnings[:4]:
-            text += f"• {escape_html(warn)}\n"
+    if readiness.blockers:
+        text += "\n<b>Что мешает подаче:</b>\n"
+        for blocker in readiness.blockers[:6]:
+            text += f"• {escape_html(blocker)}\n"
     if not summary.income_events and not summary.disposal_events:
         text += (
             "\n<i>Операций за этот год нет. Записать первую: "

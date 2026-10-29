@@ -508,6 +508,12 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
                         f"списания ({shortfall} минимальных единиц) — "
                         "вероятно, приход не записан в бота"
                     )
+                    summary.skipped.append({
+                        "tx_id": tx.id,
+                        "reason": "missing_lots",
+                        "symbol": symbol,
+                        "shortfall": str(shortfall),
+                    })
                 summary.disposal_events.append(DisposalEvent(
                     tx_id=tx.id,
                     ts=tx.ts,
