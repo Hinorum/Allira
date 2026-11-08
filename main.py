@@ -199,7 +199,10 @@ async def purge_stale_user_data(context: ContextTypes.DEFAULT_TYPE):
     for user_id, data in list(context.application.user_data.items()):
         last_seen = data.get(LAST_SEEN_KEY, 0) if isinstance(data, dict) else 0
         if now - last_seen > USER_DATA_TTL:
-            context.application.user_data.pop(user_id, None)
+            # application.user_data — read-only MappingProxyType начиная с PTB 20.
+            # Удалять записи нужно через публичный drop_user_data(), иначе
+            # каждый час падало с AttributeError: 'mappingproxy' object has no attribute 'pop'.
+            context.application.drop_user_data(user_id)
             removed += 1
     if removed:
         logger.info(f"Очищено неактивных профилей памяти: {removed}")
@@ -668,13 +671,21 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"Конфликт поллинга (другой инстанс): {error}")
         return
 
-    logger.error("Необработанная ошибка при обработке апдейта", exc_info=error)
+    # У ошибок JobQueue нет апдейта, зато есть context.job — по его имени
+    # видно, какая фоновая задача упала, вместо бесполезного «неизвестный чат».
+    job = getattr(context, "job", None)
+    if job is not None:
+        logger.error(f"Необработанная ошибка в задаче {job.name}", exc_info=error)
+    else:
+        logger.error("Необработанная ошибка при обработке апдейта", exc_info=error)
 
     chat = getattr(update, "effective_chat", None)
     user = getattr(update, "effective_user", None)
     where = "неизвестный чат"
     if chat is not None:
         where = f"чат {getattr(chat, 'id', '?')}"
+    elif job is not None:
+        where = f"задача {job.name}"
     who = f"от {user.id}" if user else ""
     alert_key = f"{type(error).__name__}:{str(error)[:200]}"
     try:
