@@ -189,6 +189,104 @@ def crypto_stats(owner_id: int) -> dict:
     }
 
 
+def health_diagnostics(config) -> dict:
+    """Подробная диагностика базы и синков — только для админ-панели.
+
+    Раньше этот блок отдавался публичным /health на каждый пинг UptimeRobot.
+    Теперь он доступен за токеном в /admin/api/status: снаружи не видно ни
+    число пользователей, ни тексты сетевых ошибок, ни глубину истории.
+    """
+    from utils.database import (
+        _sync_get_messages_today,
+        _sync_get_rent_events_stats,
+        _sync_get_stat,
+        _sync_get_sync_state,
+        _sync_get_total_users,
+    )
+
+    rent = _sync_get_rent_events_stats()
+    sync_state = None
+    wallet = getattr(config, "marketapp_wallet", "") or ""
+    if wallet:
+        try:
+            sync_state = _sync_get_sync_state(wallet)
+        except Exception as e:
+            logger.warning(f"health_diagnostics: sync_state: {e}")
+
+    try:
+        from tasks.marketapp_reports import (
+            LAST_HISTORY_META,
+            LAST_HTTP_ERROR,
+            LAST_LINKAGE,
+            LAST_SYNC,
+        )
+        from utils.database import LAST_MATCH_PATHS
+
+        linkage = {
+            "age_s": (int(time.time() - LAST_LINKAGE["at"])
+                      if LAST_LINKAGE["at"] else None),
+            "collected": LAST_LINKAGE["collected"],
+            "matched": LAST_LINKAGE["matched"],
+            "categories": LAST_LINKAGE["categories"],
+            "api_keys": LAST_LINKAGE["api_keys"],
+            "direction": LAST_LINKAGE["direction"],
+            "pages": LAST_LINKAGE["pages"],
+            "dropped": dict(LAST_LINKAGE["dropped"]),
+            "stops": dict(LAST_LINKAGE["stops"]),
+            "feed": dict(LAST_LINKAGE["feed"]),
+            "match_paths": dict(LAST_MATCH_PATHS),
+            "history_meta": dict(LAST_HISTORY_META),
+            "error": LAST_LINKAGE["error"],
+        }
+        rent_sync = {
+            path: {"age_s": int(time.time() - v["at"]), **v}
+            for path, v in LAST_SYNC.items()
+        }
+        http_error = (
+            None if not LAST_HTTP_ERROR["at"] else {
+                "age_s": int(time.time() - LAST_HTTP_ERROR["at"]),
+                "text": LAST_HTTP_ERROR["text"],
+            }
+        )
+    except Exception as e:
+        logger.warning(f"health_diagnostics: marketapp: {e}")
+        linkage, rent_sync, http_error = {}, {}, None
+
+    return {
+        "total_messages": _sync_get_stat("total_messages"),
+        "messages_today": _sync_get_messages_today(),
+        "total_users": _sync_get_total_users(),
+        "rent_events": rent["total"],
+        "rent_events_distinct": rent["distinct_hash"],
+        "rent_events_linked": rent["linked"],
+        "rent_events_last_ts": rent["last_ts"],
+        "rent_events_oldest_ts": rent["oldest_ts"],
+        "rent_events_span_days": rent["span_days"],
+        "rent_events_by_source": rent["by_source"],
+        "rent_comments": rent["comments"],
+        "rent_duration": rent["duration"],
+        "rent_sync": rent_sync,
+        "http_error": http_error,
+        "rent_sync_state": (
+            None if not sync_state else {
+                "lt": sync_state.get("last_synced_lt"),
+                "hash_len": len(sync_state.get("last_synced_hash") or ""),
+                "utime": sync_state.get("last_synced_utime"),
+                "at": sync_state.get("last_sync_at"),
+            }
+        ),
+        "linkage": linkage,
+        "config": {
+            "marketapp_wallet": bool(wallet),
+            "marketapp_api_key": bool(getattr(config, "marketapp_api_key", "")),
+            "sync_jobs": bool(getattr(config, "marketapp_api_key", "") and wallet),
+            "tonapi_key": bool(getattr(config, "tonapi_api_key", "")),
+            "toncenter_key": bool(getattr(config, "toncenter_api_key", "")),
+            "admin_ids": len(getattr(config, "admin_user_ids", ()) or ()),
+        },
+    }
+
+
 def full_status(application, config, start_time: float) -> dict:
     """Полный статус для панели/админ-меню (без сетевых вызовов)."""
     uptime = int(time.time() - start_time)
@@ -202,6 +300,12 @@ def full_status(application, config, start_time: float) -> dict:
     except Exception:
         marketapp = {}
 
+    try:
+        runtime = health_diagnostics(config)
+    except Exception as e:
+        logger.warning(f"full_status: health_diagnostics: {e}")
+        runtime = {}
+
     return {
         "time": datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
         "uptime_seconds": uptime,
@@ -210,6 +314,7 @@ def full_status(application, config, start_time: float) -> dict:
         "database": database_stats(),
         "crypto": crypto_stats(owner_id),
         "marketapp": marketapp,
+        "runtime": runtime,
         "llm_queue": llm_queue_stats(),
         "config": {
             # Только признаки «задано/не задано» — секреты не отдаются.

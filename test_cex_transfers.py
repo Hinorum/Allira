@@ -407,7 +407,6 @@ async def main() -> int:
 
     # ------------------------- 5b. off-chain переводы
     print("5b. Off-chain переводы и их сопоставление")
-    from utils.csv_import import ParsedRow
 
     owner_off = 9003
     t_off = base_ts

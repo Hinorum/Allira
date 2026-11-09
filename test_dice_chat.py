@@ -363,8 +363,6 @@ async def main() -> int:
     message = chat_message()
     update = Update(update_id=3, message=message)
 
-    import utils.ai_responses as ai
-
     original_llm = mh.get_llm_response
     original_snapshot = mh.get_market_facts
     original_rate = mh.check_rate_limit
@@ -449,8 +447,6 @@ async def main() -> int:
     async def fake_llm(user_prompt, system_prompt, model, api_key, history=None, images=None, **kwargs):
         captured["prompt"] = user_prompt
         return "ответ"
-
-    import utils.ai_responses as ai
 
     original_llm = mh.get_llm_response
     original_facts = mh.get_market_facts

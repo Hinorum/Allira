@@ -39,6 +39,11 @@ logger = logging.getLogger(__name__)
 # Двухлетнее окно покрывает и текущий, и прошлый налоговый год.
 LOOKBACK_DAYS = {"bybit": 730, "okx": 90}
 
+# Часовая джоба может наложиться на ручной /cex_sync (или на прошлый
+# прогон, застрявший на 429): два параллельных скана читают одни и те же
+# водяные знаки и пишут дубли. Второй прогон пропускаем.
+_SYNC_BUSY = {"running": False}
+
 
 @dataclass
 class ExchangeSync:
@@ -130,8 +135,14 @@ async def _sync_job(context) -> None:
     cfg = data.get("cfg") or context.bot_data.get("BOT_CONFIG")
     if not owner_id or not cfg:
         return
-
-    report = await sync_cex(owner_id, cfg)
+    if _SYNC_BUSY["running"]:
+        logger.info("cex_sync: прошлый прогон ещё идёт — пропускаю")
+        return
+    _SYNC_BUSY["running"] = True
+    try:
+        report = await sync_cex(owner_id, cfg)
+    finally:
+        _SYNC_BUSY["running"] = False
     for ex in report.exchanges:
         if ex.saved:
             logger.info(f"cex_sync {ex.name}: +{ex.saved} записей")

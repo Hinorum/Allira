@@ -63,6 +63,10 @@ LINKAGE_REPORT_BUDGET = 60
 LINKAGE_REREAD_S = 86400
 # Потолок страниц для полного скана истории блокчейна (свежая база).
 MAX_SYNC_PAGES = 1000
+# Скан блокчейна идёт дольше интервала джобы: полный обход на бесплатном
+# API легко занимает десятки минут. Второй параллельный прогон читал бы те
+# же страницы и писал тот же чекпоинт — пропускаем, пока первый не закончил.
+_SYNC_BUSY = {"running": False}
 # «Лишнее» событие: глубже максимума своей страницы настолько, что это не
 # может быть обычным порядком ленты. У tonapi попадались старые события с
 # чужим lt/timestamp на свежей позиции: их lt уводил пагинацию (before_lt)
@@ -743,6 +747,10 @@ async def _sync_from_toncenter(wallet: str, max_pages: int = 50, from_scratch: b
 
 
 async def sync_blockchain_rent_job(context: ContextTypes.DEFAULT_TYPE):
+    if _SYNC_BUSY["running"]:
+        logger.info("[sync] прошлый скан блокчейна ещё идёт — пропускаю")
+        return
+    _SYNC_BUSY["running"] = True
     try:
         wallet = context.bot_data.get("MARKETAPP_WALLET", "")
         if not wallet:
@@ -781,6 +789,8 @@ async def sync_blockchain_rent_job(context: ContextTypes.DEFAULT_TYPE):
                 await sync_rent_from_blockchain(wallet, max_pages=3, from_scratch=False)
     except Exception as e:
         logger.error(f"Ошибка синхронизации блокчейна: {e}", exc_info=True)
+    finally:
+        _SYNC_BUSY["running"] = False
 
 
 @with_retry(max_retries=2, base_delay=5.0)

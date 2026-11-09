@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 from datetime import datetime
@@ -129,7 +130,7 @@ async def reconcile_xlsx_command(update: Update, context: ContextTypes.DEFAULT_T
     config = context.bot_data.get("BOT_CONFIG")
     report = await reconcile(owner, year, config=config, with_actual=True)
     settings = get_tax_settings(owner)
-    payload = render_reconciliation_xlsx(report, settings)
+    payload = await asyncio.to_thread(render_reconciliation_xlsx, report, settings)
     await update.message.reply_document(
         document=InputFile(io.BytesIO(payload),
                            filename=f"reconciliation_{year}.xlsx"),

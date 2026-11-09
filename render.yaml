@@ -30,6 +30,11 @@ services:
         value: "hinorum"
       - key: PORT
         value: "10000"
+      # Постоянного диска на free-плане нет: база стирается при деплое,
+      # поэтому /backup — единственный способ сохранить историю. На платном
+      # плане подключи диск на /var/data и укажи /var/data/allira.db.
+      - key: DB_PATH
+        value: "allira.db"
       - key: LOG_LEVEL
         value: "INFO"
       - key: TZ

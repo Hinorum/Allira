@@ -547,8 +547,11 @@ async def tax_export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = query.message.chat_id
 
     try:
+        # Рендер PDF/XLSX — синхронная и небыстрая работа (openpyxl/reportlab).
+        # Выполняем в потоке, чтобы бот не переставал отвечать на другие
+        # апдейты, пока формируется отчёт.
         if kind == "taxpdf":
-            payload = render_pdf(summary, settings)
+            payload = await asyncio.to_thread(render_pdf, summary, settings)
             file = InputFile(io.BytesIO(payload),
                             filename=f"tax_report_{year_int}.pdf")
             await context.bot.send_document(
@@ -558,7 +561,7 @@ async def tax_export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                         f"НДФЛ: {format_rub(float(summary.ndfl_total))}",
             )
         elif kind == "taxxlsx":
-            payload = render_xlsx(summary, settings)
+            payload = await asyncio.to_thread(render_xlsx, summary, settings)
             file = InputFile(io.BytesIO(payload),
                             filename=f"tax_report_{year_int}_details.xlsx")
             await context.bot.send_document(
@@ -567,7 +570,7 @@ async def tax_export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 caption=f"Детальная XLSX по {year_int}.",
             )
         elif kind == "taxcsvi":
-            payload = render_income_csv(summary)
+            payload = await asyncio.to_thread(render_income_csv, summary)
             file = InputFile(io.BytesIO(payload),
                             filename=f"income_{year_int}.csv")
             await context.bot.send_document(
@@ -576,7 +579,7 @@ async def tax_export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 caption=f"Доходы по {year_int} ({len(summary.income_events)} строк).",
             )
         elif kind == "taxcsvs":
-            payload = render_disposal_csv(summary)
+            payload = await asyncio.to_thread(render_disposal_csv, summary)
             file = InputFile(io.BytesIO(payload),
                             filename=f"disposal_{year_int}.csv")
             await context.bot.send_document(
@@ -606,7 +609,7 @@ async def tax_pdf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Готовлю PDF за {year}…")
     summary = await compute_year_report(owner, year)
     settings = get_tax_settings(owner)
-    payload = render_pdf(summary, settings)
+    payload = await asyncio.to_thread(render_pdf, summary, settings)
     await update.message.reply_document(
         document=InputFile(io.BytesIO(payload),
                            filename=f"tax_report_{year}.pdf"),
@@ -625,7 +628,7 @@ async def tax_xlsx_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Готовлю XLSX за {year}…")
     summary = await compute_year_report(owner, year)
     settings = get_tax_settings(owner)
-    payload = render_xlsx(summary, settings)
+    payload = await asyncio.to_thread(render_xlsx, summary, settings)
     await update.message.reply_document(
         document=InputFile(io.BytesIO(payload),
                            filename=f"tax_report_{year}_details.xlsx"),
@@ -652,12 +655,12 @@ async def tax_csv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     owner = _owner_id(context)
     summary = await compute_year_report(owner, year)
     if kind in ("income", "доход", "доходы"):
-        payload = render_income_csv(summary)
+        payload = await asyncio.to_thread(render_income_csv, summary)
         file = InputFile(io.BytesIO(payload),
                          filename=f"income_{year}.csv")
         cap = f"Доходы за {year} ({len(summary.income_events)} строк)."
     elif kind in ("disposal", "sale", "продажа", "реализация"):
-        payload = render_disposal_csv(summary)
+        payload = await asyncio.to_thread(render_disposal_csv, summary)
         file = InputFile(io.BytesIO(payload),
                          filename=f"disposal_{year}.csv")
         cap = f"Реализации за {year} ({len(summary.disposal_events)} строк)."

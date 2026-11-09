@@ -1,7 +1,7 @@
-import os
 import time
 import logging
 import json
+import sys
 import uuid
 import asyncio
 from datetime import datetime
@@ -19,6 +19,7 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    TypeHandler,
     filters,
     ContextTypes,
     CallbackQueryHandler,
@@ -30,11 +31,10 @@ from cachetools import TTLCache
 
 from utils.common import setup_logging, escape_html
 from utils.database import (
-    init_db, increment_stat, get_stat, get_total_users, get_messages_today,
-    close_all, prune_live_states, get_rent_events_stats, LAST_MATCH_PATHS,
-    get_sync_state,
+    init_db, close_all, prune_live_states, get_rent_events_stats, get_db,
 )
 from utils.config import BotConfig
+from utils.crypto_db import seed_tax_settings
 from utils.http_client import close_client
 from prompts.loader import preload_all_prompts
 from handlers.start_command import (
@@ -45,10 +45,11 @@ from handlers.message_handler import (
     handle_message,
     handle_private_message,
     market_command,
-    _get_history,
-    HISTORY_KEY,
+    mark_activity,
+    reset_dialog,
     LAST_SEEN_KEY,
 )
+from handlers.backup_command import backup_command
 from handlers.stats_command import stats_command, history_command, leaderboard_command
 from handlers.moderation import ban_command, kick_command, unban_command
 from handlers.dice_tournament import (
@@ -86,7 +87,7 @@ from utils import bot_admin, web_panel
 from utils.log_buffer import setup_log_buffer
 from utils.llm_queue import llm_queue
 from tasks.autoposting import setup_autoposting
-from tasks.marketapp_reports import setup_marketapp_jobs, LAST_LINKAGE, LAST_HISTORY_META, LAST_SYNC, LAST_HTTP_ERROR
+from tasks.marketapp_reports import setup_marketapp_jobs
 from tasks.crypto_sync import setup_crypto_sync_jobs
 from tasks.cex_sync import setup_cex_sync_jobs
 from tasks.reconcile_sync import setup_reconcile_jobs
@@ -103,24 +104,22 @@ _inline_rate_limit = TTLCache(maxsize=200, ttl=60)
 
 
 def _build_health_payload() -> dict:
-    uptime = int(time.time() - BOT_START_TIME)
-    hours = uptime // 3600
-    minutes = (uptime % 3600) // 60
-    data = {
-        "status": "ok",
-        "uptime": f"{hours}h {minutes}m",
-        "uptime_seconds": uptime,
-    }
+    """Минимальный ответ для Render/UptimeRobot.
+
+    Раньше /health на каждый пинг считал несколько GROUP BY по базе аренды
+    и отдавал наружу число пользователей, тексты ошибок и состояние синков.
+    Публичной ручке это не нужно: подробная диагностика живёт в
+    /admin/api/status под токеном. Здесь только жизнь процесса и дешёвый
+    SELECT 1, чтобы не уронить health-check таймаутом.
+    """
     try:
-        data.update(asyncio.run(_collect_health_stats()))
+        with get_db() as conn:
+            conn.execute("SELECT 1").fetchone()
     except Exception as e:
         # /health обязан всегда отдавать 200: на Render провал этой ручки
-        # считается падением сервиса и вызывает рестарт.
-        logging.getLogger(__name__).warning(f"/health: сбор статистики не удался: {e}")
-        data.setdefault("total_messages", 0)
-        data.setdefault("messages_today", 0)
-        data.setdefault("total_users", 0)
-    return data
+        # считается падением сервиса и вызывает рестарт. Причину пишем в лог.
+        logger.warning(f"/health: проверка БД не удалась: {e}")
+    return {"status": "ok"}
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -189,15 +188,24 @@ USER_DATA_TTL = 7 * 86400
 
 
 async def purge_stale_user_data(context: ContextTypes.DEFAULT_TYPE):
-    """Убирает user_data юзеров, которые не писали больше недели.
+    """Убирает user_data юзеров, которые не активны больше недели.
 
     Память диалога живёт в user_data и без этой задачи копилась бы вечно —
     процесс на бесплатном инстансе держится неделями и расползается.
+
+    Записи без LAST_SEEN_KEY не трогаем. Раньше отсутствие метки считалось
+    «активность в 1970-м», и первый же прогон сносил начатый мастер или
+    ожидание списка адресов: эти состояния создаются командами и кнопками,
+    а метку ставил только обычный текст.
     """
     now = time.time()
     removed = 0
     for user_id, data in list(context.application.user_data.items()):
-        last_seen = data.get(LAST_SEEN_KEY, 0) if isinstance(data, dict) else 0
+        if not isinstance(data, dict):
+            continue
+        last_seen = data.get(LAST_SEEN_KEY)
+        if not isinstance(last_seen, (int, float)) or last_seen <= 0:
+            continue
         if now - last_seen > USER_DATA_TTL:
             # application.user_data — read-only MappingProxyType начиная с PTB 20.
             # Удалять записи нужно через публичный drop_user_data(), иначе
@@ -206,108 +214,6 @@ async def purge_stale_user_data(context: ContextTypes.DEFAULT_TYPE):
             removed += 1
     if removed:
         logger.info(f"Очищено неактивных профилей памяти: {removed}")
-
-
-async def _collect_health_stats() -> dict:
-    async def _sync_state():
-        if not config.marketapp_wallet:
-            return None
-        return await get_sync_state(config.marketapp_wallet)
-
-    total_messages, messages_today, total_users, rent, sync_state = await asyncio.gather(
-        get_stat("total_messages"),
-        get_messages_today(),
-        get_total_users(),
-        get_rent_events_stats(),
-        _sync_state(),
-    )
-    return {
-        "total_messages": total_messages,
-        "messages_today": messages_today,
-        "total_users": total_users,
-        # Диагностика «нет данных» в отчётах: SQLite на Render стирается при
-        # каждом деплое, и по этим счётчикам видно, наполнилась ли база аренды.
-        "rent_events": rent["total"],
-        "rent_events_distinct": rent["distinct_hash"],
-        "rent_events_linked": rent["linked"],
-        "rent_events_last_ts": rent["last_ts"],
-        # Глубина истории: если скан блокчейна оборвался, oldest_ts встаёт
-        # на последние дни и «доход за период» молча недосчитывает.
-        "rent_events_oldest_ts": rent["oldest_ts"],
-        "rent_events_span_days": rent["span_days"],
-        "rent_events_by_source": rent["by_source"],
-        # Какие комментарии транзакций составляют «доход»: аренда помечена в
-        # блокчейне текстом, а посторонние переводы сюда попадают, если проходят
-        # маркер. По «сколько привязано к NFT» видно, где фильтр пускает лишнее.
-        "rent_comments": rent["comments"],
-        "rent_duration": rent["duration"],
-        # Последние прогоны скана (ключ — источник tonapi/toncenter):
-        # страницы, завершённость, сохранено и ошибка. По ним видно, что
-        # именно встало, если история перестала расти.
-        "rent_sync": {
-            path: {"age_s": int(time.time() - v["at"]), **v}
-            for path, v in LAST_SYNC.items()
-        },
-        # Последняя ошибка сетевого слоя: какая именно страница не прошла
-        # (429 / статус / сеть / обрезанный JSON) и когда. Скан-ошибки её
-        # подмешивают в своё поле error, но здесь она видна целиком, даже
-        # когда последний прогон прошёл чисто.
-        "http_error": (
-            None if not LAST_HTTP_ERROR["at"] else {
-                "age_s": int(time.time() - LAST_HTTP_ERROR["at"]),
-                "text": LAST_HTTP_ERROR["text"],
-            }
-        ),
-        # Чекпоинт, от которого продолжается скан. hash_len=0 означает, что
-        # границу записал tonapi (он пишет пустой hash) — пагинация TON Center
-        # от такой границы невозможна, и скан уходит в полный перебор.
-        "rent_sync_state": (
-            None if not sync_state else {
-                "lt": sync_state.get("last_synced_lt"),
-                "hash_len": len(sync_state.get("last_synced_hash") or ""),
-                "utime": sync_state.get("last_synced_utime"),
-                "at": sync_state.get("last_sync_at"),
-            }
-        ),
-        # Чем закончилась последняя попытка привязать платежи к подаркам:
-        # collected — сколько записей вернул Marketapp, matched — сколько
-        # совпало с блокчейном, error — причина, если упала.
-        "linkage": {
-            "age_s": int(time.time() - LAST_LINKAGE["at"]) if LAST_LINKAGE["at"] else None,
-            "collected": LAST_LINKAGE["collected"],
-            "matched": LAST_LINKAGE["matched"],
-            "categories": LAST_LINKAGE["categories"],
-            "api_keys": LAST_LINKAGE["api_keys"],
-            "direction": LAST_LINKAGE["direction"],
-            # Полнота выгрузки Marketapp: страниц прочитано, сколько записей
-            # отброшено (чужие кошельки / без суммы) и на какой причине
-            # остановилась пагинация по категориям — по этому видно, мало ли
-            # отдаёт их API или мы сами чего-то не дочитываем.
-            "pages": LAST_LINKAGE["pages"],
-            "dropped": dict(LAST_LINKAGE["dropped"]),
-            "stops": dict(LAST_LINKAGE["stops"]),
-            # Глубина чтения ленты по категориям: top_ts — граница, ниже
-            # которой прошлый прогон уже всё прочитал (по ней следующий
-            # прогон читает только новое), depth_ts — как глубоко дошли.
-            "feed": dict(LAST_LINKAGE["feed"]),
-            # Чем привязались: hash — тот же tx (точно), exact — совпали
-            # src/dst/ts, price_tight — цена в ±300 сек, price — в ±2 ч.
-            "match_paths": dict(LAST_MATCH_PATHS),
-            # Первый ответ rent/history: ключи конверта, записей на странице
-            # и был ли курсор — видно, обрывается ли пагинация.
-            "history_meta": dict(LAST_HISTORY_META),
-            "error": LAST_LINKAGE["error"],
-        },
-        # Только признаки «задано/не задано», сами секреты не отдаются.
-        "config": {
-            "marketapp_wallet": bool(config.marketapp_wallet),
-            "marketapp_api_key": bool(config.marketapp_api_key),
-            "sync_jobs": bool(config.marketapp_api_key and config.marketapp_wallet),
-            "tonapi_key": bool(config.tonapi_api_key),
-            "toncenter_key": bool(config.toncenter_api_key),
-            "admin_ids": len(config.admin_user_ids),
-        },
-    }
 
 
 def run_health_server():
@@ -369,6 +275,7 @@ BOT_COMMANDS: list[tuple[str, str]] = [
     ("stats", "Статистика бота"),
     # Владелец
     ("admin", "Сервис управления (владелец)"),
+    ("backup", "Скачать резервную копию базы"),
 ]
 
 ADMIN_COMMANDS: list[tuple[str, str]] = [
@@ -440,6 +347,25 @@ async def post_init(application: Application):
     )
 
     init_db()
+    if config.crypto_owner_id:
+        # COST_BASIS_METHOD/TAX_STATUS/TAXPAYER_INN — только начальные
+        # значения для новой базы. Ручные настройки из /tax_setup и панели
+        # seed_tax_settings не перезаписывает.
+        method = (config.cost_basis_method or "fifo").strip().lower()
+        if method not in ("fifo", "wac"):
+            method = "fifo"
+        status = (config.tax_status or "resident").strip().lower()
+        if status not in ("resident", "miner", "nonresident"):
+            status = "resident"
+        try:
+            seed_tax_settings(
+                config.crypto_owner_id,
+                taxpayer_inn=config.taxpayer_inn,
+                tax_status=status,
+                cost_basis=method,
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось применить настройки ФНС из env: {e}")
     preload_all_prompts()
 
     await restore_tournaments()
@@ -651,9 +577,13 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error(f"Inline answer error: {e}")
 
 
-# Дедупликация алертов: в момент деплоя одна и та же ошибка прилетает
-# пачкой (PTB ретраит поллинг), и админ получал четыре одинаковых сообщения.
-_alert_cache: TTLCache = TTLCache(maxsize=64, ttl=600)
+# Дедупликация и backoff алертов: в момент деплоя одна и та же ошибка
+# прилетает пачкой (PTB ретраит поллинг), и админ получал четыре одинаковых
+# сообщения. Повтор той же ошибки не спамит каждые 10 минут: 5 мин → 30 мин
+# → 2 ч → 12 ч. Ключ включает место (задачу/чат), чтобы падения разных
+# джоб не схлопывались в один счётчик.
+_ALERT_DELAYS = (300, 1800, 7200, 43200)
+_alert_cache: TTLCache = TTLCache(maxsize=256, ttl=_ALERT_DELAYS[-1])
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -687,10 +617,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     elif job is not None:
         where = f"задача {job.name}"
     who = f"от {user.id}" if user else ""
-    alert_key = f"{type(error).__name__}:{str(error)[:200]}"
+    alert_key = f"{where}|{type(error).__name__}:{str(error)[:200]}"
     try:
-        if config.admin_chat_id and alert_key not in _alert_cache:
-            _alert_cache[alert_key] = True
+        record = _alert_cache.get(alert_key)
+        now = time.time()
+        if config.admin_chat_id and (record is None or now >= record[1]):
+            count = 1 if record is None else record[0] + 1
+            delay = _ALERT_DELAYS[min(count - 1, len(_ALERT_DELAYS) - 1)]
+            _alert_cache[alert_key] = (count, now + delay)
             await context.bot.send_message(
                 config.admin_chat_id,
                 f"Ошибка бота ({where}, {who}):\n{type(error).__name__}: {error}"[:1000]
@@ -706,10 +640,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def clear_context_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    turns = len(_get_history(context)) // 2
-    # Чистим только память диалога: context.user_data.clear() затирал бы
-    # и остальные ключи пользователя (включая метку активности).
-    context.user_data.pop(HISTORY_KEY, None)
+    turns = reset_dialog(context)
     if turns:
         await update.message.reply_text(
             f"=> Контекст сброшен, забыто {turns} реплик. Начинай с чистого листа."
@@ -735,6 +666,12 @@ def build_application() -> Application:
         .post_init(post_init) \
         .post_shutdown(post_shutdown) \
         .build()
+
+    # Метка активности на любом апдейте: команда, кнопка, инлайн-запрос,
+    # начало мастера. Иначе purge_stale_user_data не знает, что человек
+    # жив, и удаляет начатое состояние. Группа -10 — раньше всех остальных,
+    # но без ApplicationHandlerStop: обработка продолжается как обычно.
+    application.add_handler(TypeHandler(Update, mark_activity), group=-10)
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
@@ -783,6 +720,7 @@ def build_application() -> Application:
 
     # Сервис управления (Telegram-интерфейс; веб-панель — /admin на порту).
     application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("backup", backup_command))
     application.add_handler(CallbackQueryHandler(
         admin_menu_callback, pattern="^adm:"
     ))
@@ -873,7 +811,9 @@ def build_application() -> Application:
 def main():
     if not config.bot_token:
         logger.critical("BOT_TOKEN не найден!")
-        return
+        # Явный ненулевой код: иначе Render считает деплой успешным, а бот
+        # просто завершился и не отвечает.
+        sys.exit(1)
 
     Thread(target=run_health_server, daemon=True).start()
     logger.info(f"Health-check сервер запущен на порту {config.port}")

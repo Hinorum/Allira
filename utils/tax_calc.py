@@ -9,11 +9,14 @@
   № 03-04-05/9243 от 10.02.2022 и № 03-04-07/80764 от 08.11.2018).
 - Ст. 224 НК РФ — прогрессивная шкала НДФЛ для резидентов.
 
-Метод FIFO:
-  Расходы на приобретение конкретной единицы = цена, по которой эта
-  единица была получена первой из всех доступных лотов. Для учёта
-  стоимости единицы актива пересчитываем в «цена за единицу в RUB» и
-  при реализации снимаем сначала самый старый лот.
+Методы списания (настройка tax_settings.cost_basis):
+  FIFO — расходы на приобретение конкретной единицы = цена, по которой
+  эта единица была получена первой из всех доступных лотов. При
+  реализации снимаем сначала самый старый лот.
+  WAC — средневзвешенная: в момент реализации себестоимость единицы =
+  общая стоимость открытых лотов / их общее количество. После списания
+  остаток лотов переоценивается по той же средней, поэтому следующая
+  покупка снова меняет среднюю, а не «прилипает» к старой цене.
 
 Прогрессивная шкала (резидент, ст. 224 НК РФ):
   до 2,4 млн      — 13%
@@ -181,12 +184,17 @@ def _lot_cost_total(tx_type: str, cost_basis: Decimal, fiat_value: Decimal) -> D
     return fiat_value
 
 
-# --------------------------------------------------------- FIFO
+# --------------------------------------------------------- FIFO / WAC
 
 
 @dataclass
 class Lot:
-    """Лот актива на балансе. FIFO: гасится строго по acquired_ts ASC."""
+    """Лот актива на балансе.
+
+    При FIFO гасится строго по acquired_ts ASC. При WAC перед списанием
+    все открытые лоты переоцениваются по средней цене — см.
+    _wac_cost_inplace().
+    """
     id: int
     asset_id: int
     acquired_ts: int
@@ -245,7 +253,9 @@ class YearSummary:
 
 
 def rebuild_lots(owner_id: int, up_to_ts: Optional[int] = None) -> int:
-    """Пересборка FIFO-лотов по всем транзакциям до up_to_ts.
+    """Пересборка лотов по всем транзакциям до up_to_ts.
+
+    Метод списания — из tax_settings (FIFO или WAC).
 
     ВАЖНО: пишет ТЕКУЩИЙ остаток (что лежит на балансе) в tax_lots,
     но НЕ гасит их по ходу: это нужно делать in-memory во время
@@ -267,11 +277,17 @@ def _walk_fifo(
     """Чистый проход по операциям в хронологическом порядке с возвратом
     активных лотов. Не трогает tax_lots на диске, если persist_balance=False.
 
+    Списание идёт по методу из tax_settings (FIFO или WAC). Имя функции
+    оставлено историческим: на ней же держится rebuild_lots(), который
+    нужен /wallet_list и /balance.
+
     Внутренний контракт: cost_per_unit_rub вычисляется на момент открытия
-    лота и далее не меняется. Если пользователь вручную ввёл fiat_value_rub
-    в приходе — используется он. Если нет — cost_per_unit = 0 и лот
-    существует, но при списании даёт нулевую себестоимость (что в случае
-    аирдропа и соответствует НК: приход равен доходу, расходы нулевые).
+    лота. При FIFO он далее не меняется; при WAC перед списанием все лоты
+    переоцениваются по средней (см. _wac_cost_inplace). Если пользователь
+    вручную ввёл fiat_value_rub в приходе — используется он. Если нет —
+    cost_per_unit = 0 и лот существует, но при списании даёт нулевую
+    себестоимость (что в случае аирдропа и соответствует НК: приход равен
+    доходу, расходы нулевые).
     """
     with get_db() as conn:
         if up_to_ts is None:
@@ -286,6 +302,7 @@ def _walk_fifo(
 
     active: dict[int, list[Lot]] = {}
     next_lot_id = 0
+    method = _cost_basis_method(owner_id)
     for row in rows:
         tx_id = row["id"]
         asset_id = row["asset_id"]
@@ -320,17 +337,7 @@ def _walk_fifo(
 
         elif tx_type in TxType.lot_out_types():
             lots = active.get(asset_id, [])
-            to_consume = amount
-            i = 0
-            while i < len(lots) and to_consume > 0:
-                head = lots[i]
-                take = min(head.qty_remaining, to_consume)
-                head.qty_remaining -= take
-                to_consume -= take
-                if head.qty_remaining <= 0:
-                    lots.pop(i)
-                else:
-                    i += 1
+            _consume_lots_inplace(lots, amount, scale, method)
 
         # transfer_out намеренно не трогает активы: в MVP считаем, что
         # обе записи (transfer_in на получателе и transfer_out у отправителя)
@@ -364,7 +371,8 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
       1. Загрузить все транзакции до конца года включительно.
       2. Пройтись по операциям года в хронологическом порядке ОДИН РАЗ:
          на каждой операции классифицировать (доход/списание), посчитать
-         доход/расход/прибыль, И ТУТ ЖЕ обновить in-memory FIFO-лоты.
+         доход/расход/прибыль, И ТУТ ЖЕ обновить in-memory лоты по
+         выбранному методу (FIFO или WAC).
          Это критично: если сначала «высушить» все лоты через _walk_fifo,
          а потом снова итерировать для расчёта — поздние приходы (аирдроп
          после продажи) окажутся в лотах и будут использованы для FIFO
@@ -419,6 +427,7 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
     # Один проход: обновляем лоты и события одновременно.
     active: dict[int, list[Lot]] = {}
     year_start_ts = _year_start(year)
+    method = _cost_basis_method(owner_id)
 
     for tx in txs:
         symbol, decimals = get_asset_meta(tx.asset_id)
@@ -482,9 +491,10 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
                 ))
 
         elif tx.tx_type in TxType.lot_out_types():
-            # FIFO-себестоимость ДО открытия новых лотов (это текущая операция).
-            cost, shortfall = _fifo_cost_inplace(
-                active.get(tx.asset_id, []), amount_raw, scale
+            # Себестоимость списания ДО открытия новых лотов (это текущая
+            # операция). Метод выбирается в tax_settings: FIFO или WAC.
+            cost, shortfall = _consume_lots_inplace(
+                active.get(tx.asset_id, []), amount_raw, scale, method
             )
 
             if tx_year and tx.tx_type in TxType.disposal_types():
@@ -639,6 +649,66 @@ def _fifo_cost_inplace(lots: list[Lot], to_consume: Decimal,
     return total_cost, to_consume
 
 
+def _consume_lots_inplace(
+    lots: list[Lot],
+    to_consume: Decimal,
+    scale: Decimal,
+    method: str,
+) -> tuple[Decimal, Decimal]:
+    """Списать количество по выбранному в настройках методу."""
+    if method == "wac":
+        return _wac_cost_inplace(lots, to_consume, scale)
+    return _fifo_cost_inplace(lots, to_consume, scale)
+
+
+def _wac_cost_inplace(
+    lots: list[Lot],
+    to_consume: Decimal,
+    scale: Decimal,
+) -> tuple[Decimal, Decimal]:
+    """WAC-расход: средневзвешенная стоимость открытых лотов.
+
+    qty_remaining хранится в минимальных единицах, cost_per_unit_rub — за
+    одну человеческую единицу. Перед списанием все лоты приводятся к одной
+    средней цене: иначе после частичной продажи остаток сохранил бы цену
+    конкретного лота, и следующая продажа снова считалась бы по FIFO.
+    """
+    if to_consume <= 0:
+        return Decimal(0), Decimal(0)
+
+    total_qty = sum((lot.qty_remaining for lot in lots), Decimal(0))
+    if total_qty <= 0:
+        return Decimal(0), to_consume
+
+    total_human = total_qty / scale
+    total_cost = sum(
+        ((lot.qty_remaining / scale) * lot.cost_per_unit_rub for lot in lots),
+        Decimal(0),
+    )
+    avg_cost = total_cost / total_human
+    covered = min(to_consume, total_qty)
+    cost = (covered / scale) * avg_cost
+
+    # Средняя теперь одна на весь остаток. Количество списываем в порядке
+    # acquired_ts — на сумму расхода это уже не влияет.
+    for lot in lots:
+        lot.cost_per_unit_rub = avg_cost
+
+    remaining = covered
+    i = 0
+    while i < len(lots) and remaining > 0:
+        head = lots[i]
+        take = min(head.qty_remaining, remaining)
+        head.qty_remaining -= take
+        remaining -= take
+        if head.qty_remaining <= 0:
+            lots.pop(i)
+        else:
+            i += 1
+
+    return cost, to_consume - covered
+
+
 def _asset_decimals(asset_id: int) -> int:
     with get_db() as conn:
         row = conn.execute(
@@ -665,6 +735,17 @@ def _price_to_decimal(price: float) -> Decimal:
     запись без двоичного хвоста, а дальше _round2 округляет до копеек.
     """
     return Decimal(str(price))
+
+
+def _cost_basis_method(owner_id: int) -> str:
+    """Метод списания из tax_settings: fifo (по умолчанию) или wac."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT cost_basis FROM tax_settings WHERE owner_id = ?",
+            (owner_id,),
+        ).fetchone()
+    method = (row["cost_basis"] if row and row["cost_basis"] else "fifo")
+    return method if method in ("fifo", "wac") else "fifo"
 
 
 def _tax_status(owner_id: int) -> str:

@@ -1,5 +1,6 @@
 import sqlite3
 import logging
+import os
 import time
 import asyncio
 import threading
@@ -12,7 +13,10 @@ from utils.common import normalize_ton_address
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = "allira.db"
+# Путь задаётся снаружи: на Render с постоянным диском — /var/data/allira.db,
+# локально — файл рядом с кодом. Пустая переменная означает дефолт, иначе
+# `DB_PATH=` в .env молча создал бы файл с пустым именем.
+DB_PATH = (os.getenv("DB_PATH", "") or "").strip() or "allira.db"
 _local = threading.local()
 
 # Реестр открытых соединений: один на все потоки, защищён замком. Нужен, чтобы

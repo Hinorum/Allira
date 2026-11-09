@@ -401,18 +401,12 @@ async def _safe_edit(query, text: str, markup) -> None:
 async def _clear_context_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сброс памяти диалога (то же, что /clear).
 
-    Отдельная копия логики из main.py: main импортирует этот модуль,
-    поэтому импортировать main отсюда нельзя.
+    Логика живёт в handlers.message_handler.reset_dialog: main импортирует
+    этот модуль, поэтому импортировать main отсюда нельзя.
     """
-    from handlers.message_handler import (ANSWER_OVERFLOW_KEY, HISTORY_KEY,
-                                         _get_history)
+    from handlers.message_handler import reset_dialog
 
-    turns = len(_get_history(context)) // 2
-    # Чистим только память диалога: context.user_data.clear() затирал бы
-    # и остальные ключи пользователя (включая метку активности).
-    context.user_data.pop(HISTORY_KEY, None)
-    # Сбрасываем и режиссёрский счётчик: новая тема — новый ритм ответа.
-    context.user_data.pop(ANSWER_OVERFLOW_KEY, None)
+    turns = reset_dialog(context)
     if turns:
         await update.message.reply_text(
             f"=> Контекст сброшен, забыто {turns} реплик. Начинай с чистого листа."

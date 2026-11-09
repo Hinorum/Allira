@@ -731,6 +731,31 @@ def set_tax_settings(owner_id: int, **fields) -> None:
         )
 
 
+def seed_tax_settings(owner_id: int, **fields) -> None:
+    """Создать настройки из env при первом запуске, не затирая ручные.
+
+    COST_BASIS_METHOD/TAX_STATUS/TAXPAYER_INN раньше читались из env, но
+    нигде не использовались: пользователь ставил wac, а бот считал FIFO.
+    Теперь это только начальные значения. Если строка уже есть (человек
+    настроил через /tax_setup или панель), INSERT OR IGNORE её не трогает.
+    """
+    allowed = {"taxpayer_inn", "taxpayer_name", "tax_status",
+               "cost_basis", "reporting_currency"}
+    safe = {k: v for k, v in fields.items() if k in allowed and v is not None}
+    if not safe:
+        return
+    cols = ", ".join(safe.keys())
+    placeholders = ", ".join("?" for _ in safe)
+    with get_db() as conn:
+        conn.execute(
+            f"""
+            INSERT OR IGNORE INTO tax_settings (owner_id, {cols})
+            VALUES (?, {placeholders})
+            """,
+            [owner_id, *safe.values()],
+        )
+
+
 def _year_start(year: int) -> int:
     return int(time.mktime(time.strptime(f"{year}-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")))
 

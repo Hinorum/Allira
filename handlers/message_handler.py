@@ -107,6 +107,33 @@ def _is_creator(user, bot_data) -> bool:
     return False
 
 
+async def mark_activity(update: Update,
+                        context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обновить метку активности на ЛЮБОМ апдейте с пользователем.
+
+    Раньше LAST_SEEN_KEY ставился только в _process_message, то есть на
+    обычном тексте. Команды, кнопки и начатые мастера создавали user_data
+    без метки, и purge_stale_user_data считал их «неактивными с 1970-го»,
+    удаляя состояние посреди диалога.
+    """
+    if update.effective_user is None:
+        return
+    context.user_data[LAST_SEEN_KEY] = time.time()
+
+
+def reset_dialog(context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Забыть историю диалога и режиссёрский счётчик длины.
+
+    Возвращает число забытых реплик (пар «вопрос-ответ»). Две копии этой
+    логики — в main.py и start_command.py — уже разошлись: одна чистила
+    только историю, другая ещё и answer_overflow.
+    """
+    turns = len(_get_history(context)) // 2
+    context.user_data.pop(HISTORY_KEY, None)
+    context.user_data.pop(ANSWER_OVERFLOW_KEY, None)
+    return turns
+
+
 async def _refuse_non_creator(message, user) -> None:
     """Чужому в ЛС — один отказ в сутки, дальше только молчание."""
     if user is None:

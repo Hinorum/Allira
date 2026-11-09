@@ -43,6 +43,11 @@ TONAPI_API_URL = "https://tonapi.io/v2"
 # работала и при повторных прогонах сканера.
 EXTERNAL_PREFIX = "jetton-sync"
 
+# Прошлый скан может идти дольше интервала (15 минут): полный обход
+# истории на бесплатном API легко растягивается. Второй параллельный
+# прогон только удвоит лимиты и запросы, а результат запишет тот же.
+_SYNC_BUSY = {"running": False}
+
 
 # --------------------------------------------------------- регистрация
 
@@ -88,17 +93,24 @@ async def _sync_wallets_job(context) -> None:
     owner_id = int(context.job.data.get("owner_id") or 0)
     if not owner_id:
         return
-    cfg: BotConfig = context.job.data.get("config")  # type: ignore[assignment]
-    try:
-        result = await run(owner_id, cfg)
-    except Exception as e:
-        logger.error(f"crypto_sync: скан не удался: {e}", exc_info=True)
+    if _SYNC_BUSY["running"]:
+        logger.info("crypto_sync: прошлый скан ещё идёт — пропускаю")
         return
-    if result.saved or result.review:
-        logger.info(
-            f"crypto_sync: +{result.saved} операций, "
-            f"{result.duplicates} дублей, на проверку {len(result.review)}"
-        )
+    _SYNC_BUSY["running"] = True
+    try:
+        cfg: BotConfig = context.job.data.get("config")  # type: ignore[assignment]
+        try:
+            result = await run(owner_id, cfg)
+        except Exception as e:
+            logger.error(f"crypto_sync: скан не удался: {e}", exc_info=True)
+            return
+        if result.saved or result.review:
+            logger.info(
+                f"crypto_sync: +{result.saved} операций, "
+                f"{result.duplicates} дублей, на проверку {len(result.review)}"
+            )
+    finally:
+        _SYNC_BUSY["running"] = False
 
 
 async def sync_jetton_transfers(wallet, api_key: str) -> int:
@@ -169,7 +181,7 @@ async def _warm_rate_cache_job(context) -> None:
     """
     from utils.crypto_db import list_assets, list_transactions
     from utils.database import get_db
-    from utils.price_oracle import get_asset_price_rub, get_usd_rub_rate
+    from utils.price_oracle import get_usd_rub_rate
 
     today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
     yesterday = (datetime.now(tz=timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
