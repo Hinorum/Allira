@@ -6,6 +6,12 @@ import uuid
 import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
+
+# .env нужно прочитать ДО импорта utils.database: DB_PATH вычисляется на
+# импорте модуля, и вызов load_dotenv() в конце блока импортов оставлял
+# локальный DB_PATH из .env без эффекта.
+load_dotenv()
+
 from telegram import (
     Update,
     InlineQueryResultArticle,
@@ -92,7 +98,6 @@ from tasks.crypto_sync import setup_crypto_sync_jobs
 from tasks.cex_sync import setup_cex_sync_jobs
 from tasks.reconcile_sync import setup_reconcile_jobs
 
-load_dotenv()
 setup_logging()
 
 logger = logging.getLogger(__name__)
