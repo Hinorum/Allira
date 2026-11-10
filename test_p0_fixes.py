@@ -53,7 +53,7 @@ async def test_cost_basis_methods() -> None:
         Chain, TxType, add_transaction, add_wallet, ensure_asset,
         get_tax_settings, set_tax_settings,
     )
-    from utils.tax_calc import compute_year_report
+    from utils.tax_calc import compute_year_report, rebuild_lots
 
     print("\n1. FIFO и WAC на одной истории")
     owner = 990001
@@ -94,6 +94,11 @@ async def test_cost_basis_methods() -> None:
           "WAC: себестоимость 2 250 000", str(wac.total_cost_rub))
     check(wac.realized_gain_rub == Decimal("2250000"),
           "WAC: прибыль 2 250 000", str(wac.realized_gain_rub))
+
+    # Отчёт за прошлый год не перезаписывает текущий баланс (см.
+    # compute_year_report), поэтому остаток читаем после явной
+    # пересборки — именно её делает /wallet_list и /balance.
+    rebuild_lots(owner)
 
     from utils.database import get_db
     with get_db() as conn:

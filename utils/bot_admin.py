@@ -480,7 +480,12 @@ def tax_settings_ui(owner_id: int) -> dict:
     return get_tax_settings(owner_id)
 
 
-def save_tax_settings(owner_id: int, payload: dict) -> None:
+def save_tax_settings(owner_id: int, payload: dict) -> bool:
+    """Сохранить настройки из веб-панели. True — если сменился метод.
+
+    Флаг нужен панели, чтобы показать предупреждение: после FIFO ↔ WAC
+    отчёты за прошлые годы будут пересчитаны, а кэш уже сброшен.
+    """
     allowed_status = {"resident", "miner", "nonresident"}
     allowed_method = {"fifo", "wac"}
     safe: dict = {}
@@ -498,5 +503,6 @@ def save_tax_settings(owner_id: int, payload: dict) -> None:
         if method not in allowed_method:
             raise CryptoError(f"Метод должен быть одним из: {sorted(allowed_method)}")
         safe["cost_basis"] = method
-    if safe:
-        set_tax_settings(owner_id, **safe)
+    if not safe:
+        return False
+    return set_tax_settings(owner_id, **safe)

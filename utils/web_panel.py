@@ -197,8 +197,11 @@ def handle_post(handler) -> bool:
             data = {"ok": bot_admin.delete_transaction_ui(
                 _owner_id(), int(body.get("id") or 0))}
         elif api == "tax":
-            bot_admin.save_tax_settings(_owner_id(), body)
+            method_changed = bot_admin.save_tax_settings(_owner_id(), body)
             data = bot_admin.tax_settings_ui(_owner_id())
+            # Панель показывает предупреждение: после FIFO ↔ WAC старые
+            # снапшоты отчётов уже удалены и годы будут пересчитаны.
+            data["method_changed"] = method_changed
         elif api == "sync/cex":
             data = bot_admin.run_async(
                 bot_admin.manual_cex_sync(_config, _owner_id()), timeout=240)
@@ -689,12 +692,14 @@ document.getElementById("t-method").value=t.cost_basis||"fifo";}
 catch(e){toast(e.message,true);}
 }
 async function saveTax(){
-try{await api("/admin/api/tax",{method:"POST",body:JSON.stringify({
+try{const r=await api("/admin/api/tax",{method:"POST",body:JSON.stringify({
 taxpayer_inn:document.getElementById("t-inn").value,
 taxpayer_name:document.getElementById("t-name").value,
 tax_status:document.getElementById("t-status").value,
 cost_basis:document.getElementById("t-method").value})});
-toast("Настройки сохранены");}
+toast(r&&r.method_changed
+  ? "Метод изменён: кэш отчётов сброшен, прошлые годы будут пересчитаны"
+  : "Настройки сохранены");}
 catch(e){toast(e.message,true);}
 }
 

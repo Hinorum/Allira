@@ -30,6 +30,8 @@ from telegram.ext import ContextTypes
 from utils import bot_admin
 from utils.common import escape_html
 from utils.log_buffer import recent_logs
+from utils.permissions import owner_id as _owner_id
+from utils.permissions import require_owner as _is_owner_chat
 from utils.price_oracle import format_rub
 
 logger = logging.getLogger(__name__)
@@ -39,41 +41,7 @@ BACK_BUTTON = InlineKeyboardMarkup([[
 ]])
 
 
-def _owner_id(context: ContextTypes.DEFAULT_TYPE) -> int:
-    return int(context.bot_data.get("CRYPTO_OWNER_ID") or 0)
-
-
-async def _is_owner_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Guard: отвечаем только владельцу (CREATOR_USER_IDS / @username).
-
-    Проверка закрыта по умолчанию. Раньше при пустом CREATOR_USERNAME
-    (переменная задана, но пустая) любой аккаунт БЕЗ username проходил
-    проверку: `username != creator_username` давало «» != «» → False →
-    guard отдавал меню. Вместе с незаполненным CREATOR_USER_IDS это
-    означало, что админ-меню (кошельки, операции, настройки ФНС, запуск
-    синков) доставалось любому, у кого нет @username.
-    """
-    if not update.effective_user:
-        return False
-    user_id = update.effective_user.id
-    creator_ids = context.bot_data.get("CREATOR_USER_IDS") or ()
-    creator_username = (context.bot_data.get("CREATOR_USERNAME") or "").lstrip("@").strip().lower()
-    username = (update.effective_user.username or "").strip().lower()
-
-    if creator_ids:
-        allowed = user_id in creator_ids
-    elif creator_username:
-        allowed = bool(username) and username == creator_username
-    else:
-        # Ни ID, ни username не заданы — владельца определить не по чему.
-        # Закрываем доступ, а не открываем его всем подряд.
-        allowed = False
-
-    if not allowed:
-        if update.message:
-            await update.message.reply_text("Команды доступны только владельцу бота.")
-        return False
-    return True
+# Проверки владельца — единые для всех команд, см. utils/permissions.py.
 
 
 def _main_menu() -> InlineKeyboardMarkup:
@@ -253,12 +221,9 @@ def _format_reconcile(data: dict) -> str:
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """`/admin` — главное меню."""
+    # require_owner уже отвечает пользователю и при чужом аккаунте, и при
+    # незаданном CRYPTO_OWNER_ID — повторная проверка здесь не нужна.
     if not await _is_owner_chat(update, context):
-        return
-    if not _owner_id(context):
-        await update.message.reply_text(
-            "Владелец не настроен. Добавь CRYPTO_OWNER_ID в .env."
-        )
         return
     await update.message.reply_text(
         "⚙️ <b>Сервис управления</b>\n"

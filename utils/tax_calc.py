@@ -39,6 +39,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, asdict, field
+from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP, getcontext
 from typing import Optional
 
@@ -48,10 +49,18 @@ from utils.crypto_db import (
 )
 from utils.database import get_db
 from utils.price_oracle import get_asset_price_rub
+from utils.tax_period import MOSCOW_TZ
+from utils.tax_period import moscow_year_end as _year_end
+from utils.tax_period import moscow_year_start as _year_start
 
 # Decimal-контекст: 28 знаков хватает и для BTC в сатоши, и для RUB-копеек.
 getcontext().prec = 28
 logger = logging.getLogger(__name__)
+
+# Окно сопоставления ног internal-перевода. То же значение использует
+# utils.auto_import.MATCH_WINDOW_S; здесь дублируется, чтобы tax_calc не
+# зависел от хендлерного модуля.
+INTERNAL_TRANSFER_WINDOW_S = 3 * 86400
 
 
 # --------------------------------------------------------- шкалы НДФЛ
@@ -202,6 +211,8 @@ class Lot:
     qty_remaining: Decimal
     cost_per_unit_rub: Decimal
     source: str
+    # Кошелёк, в котором лежит лот. None — старые лоты без привязки.
+    wallet_id: Optional[int] = None
 
 
 @dataclass
@@ -247,6 +258,9 @@ class YearSummary:
     expenses: list[dict] = field(default_factory=list)
     # Ошибки в данных: пропущенные котировки, отрицательный итог.
     skipped: list[dict] = field(default_factory=list)
+    # Метод, которым посчитан отчёт: fifo | wac. Хранится вместе со
+    # снапшотом, чтобы после смены настройки не выдать старый расчёт.
+    cost_basis: str = "fifo"
 
 
 # --------------------------------------------------------- ядро
@@ -266,6 +280,149 @@ def rebuild_lots(owner_id: int, up_to_ts: Optional[int] = None) -> int:
     """
     active = _walk_fifo(owner_id, up_to_ts=up_to_ts, persist_balance=True)
     return sum(len(v) for v in active.values())
+
+
+def _tx_from_row(row) -> Tx:
+    """sqlite3.Row → Tx. Один конвертер для отчёта и пересборки лотов."""
+    return Tx(
+        id=row["id"], owner_id=row["owner_id"], ts=int(row["ts"]),
+        wallet_id=row["wallet_id"], asset_id=row["asset_id"],
+        tx_type=row["tx_type"], direction=row["direction"],
+        amount_raw=row["amount_raw"],
+        fiat_value_rub=row["fiat_value_rub"],
+        cost_basis_rub=row["cost_basis_rub"],
+        note=row["note"] or "", source=row["source"] or "manual",
+        external_id=row["external_id"],
+        is_internal=(bool(row["is_internal"])
+                     if "is_internal" in row.keys() else False),
+    )
+
+
+def _internal_transfer_pairs(txs: list[Tx]) -> dict[int, Tx]:
+    """Сопоставить ноги internal-перевода: id вывода → проводка ввода.
+
+    В базе нет явного pair_id: auto_import помечает обе проводки
+    is_internal=1 по совпадению актива, суммы и времени. Для переноса
+    лотов между кошельками используем то же правило (допуск 1% на
+    комиссию вывода). Без пары проводка остаётся «перемещением с
+    неизвестной второй стороной» — лот не двигаем, иначе можно потерять
+    актив.
+    """
+    outs = [
+        t for t in txs
+        if t.is_internal and t.tx_type == TxType.TRANSFER_OUT and t.wallet_id
+    ]
+    ins = [
+        t for t in txs
+        if t.is_internal and t.tx_type == TxType.TRANSFER_IN and t.wallet_id
+    ]
+    pairs: dict[int, Tx] = {}
+    used_in: set[int] = set()
+    for out in outs:
+        out_amount = _to_decimal(out.amount_raw)
+        best: Optional[tuple[int, Tx]] = None
+        for inc in ins:
+            if inc.id in used_in:
+                continue
+            if inc.asset_id != out.asset_id:
+                continue
+            if inc.wallet_id == out.wallet_id:
+                continue
+            inc_amount = _to_decimal(inc.amount_raw)
+            if out_amount <= 0 or inc_amount <= 0:
+                continue
+            if abs(inc_amount - out_amount) > max(
+                inc_amount, out_amount
+            ) * Decimal("0.01"):
+                continue
+            delta = inc.ts - out.ts
+            if delta < 0 or delta > INTERNAL_TRANSFER_WINDOW_S:
+                continue
+            if best is None or delta < best[0]:
+                best = (delta, inc)
+        if best is not None:
+            pairs[out.id] = best[1]
+            used_in.add(best[1].id)
+    return pairs
+
+
+def _take_lots(
+    lots: list[Lot],
+    amount: Decimal,
+    preferred_wallet: Optional[int],
+) -> list[Lot]:
+    """Вынуть amount минимальных единиц из лотов, не меняя их стоимость.
+
+    Сначала берём лоты нужного кошелька (это обычный случай), затем —
+    остальные: покупка могла быть вне отслеживаемого периметра, но
+    перевод всё равно должен дойти до кошелька получателя. Возвращённые
+    сегменты переносятся в другой кошелёк в _handle_internal_transfer.
+    """
+    if amount <= 0 or not lots:
+        return []
+    order = [i for i, lot in enumerate(lots)
+             if lot.wallet_id == preferred_wallet]
+    order += [i for i, lot in enumerate(lots)
+              if lot.wallet_id != preferred_wallet]
+    moved: list[Lot] = []
+    remaining = amount
+    for i in order:
+        if remaining <= 0:
+            break
+        lot = lots[i]
+        if lot.qty_remaining <= 0:
+            continue
+        take = min(lot.qty_remaining, remaining)
+        moved.append(Lot(
+            id=lot.id,
+            asset_id=lot.asset_id,
+            acquired_ts=lot.acquired_ts,
+            acquired_tx_id=lot.acquired_tx_id,
+            qty_remaining=take,
+            cost_per_unit_rub=lot.cost_per_unit_rub,
+            source=lot.source,
+            wallet_id=lot.wallet_id,
+        ))
+        lot.qty_remaining -= take
+        remaining -= take
+    if remaining > 0:
+        logger.debug(
+            "internal transfer: не хватило %.8f единиц для переноса лота",
+            float(remaining),
+        )
+    lots[:] = [lot for lot in lots if lot.qty_remaining > 0]
+    return moved
+
+
+def _handle_internal_transfer(
+    tx: Tx,
+    active: dict[int, list[Lot]],
+    pairs: dict[int, Tx],
+    pending_moves: dict[int, list[Lot]],
+) -> None:
+    """Перенести лот из кошелька-отправителя в кошелёк-получатель."""
+    if tx.tx_type == TxType.TRANSFER_OUT:
+        in_tx = pairs.get(tx.id)
+        if in_tx is not None:
+            # Комиссия сети/биржи может уменьшить сумму на входе. Переносим
+            # меньшую из двух: остаток остаётся в кошельке-отправителе.
+            amount = min(
+                _to_decimal(tx.amount_raw),
+                _to_decimal(in_tx.amount_raw),
+            )
+            moved = _take_lots(
+                active.get(tx.asset_id, []),
+                amount,
+                tx.wallet_id,
+            )
+            if moved:
+                pending_moves[in_tx.id] = moved
+    elif tx.tx_type == TxType.TRANSFER_IN:
+        moved = pending_moves.pop(tx.id, [])
+        for lot in moved:
+            lot.wallet_id = tx.wallet_id
+        if moved:
+            active.setdefault(tx.asset_id, []).extend(moved)
 
 
 def _walk_fifo(
@@ -300,67 +457,63 @@ def _walk_fifo(
             args = (owner_id, up_to_ts)
         rows = conn.execute(sql, args).fetchall()
 
+    txs = [_tx_from_row(row) for row in rows]
+    txs.sort(key=lambda t: (t.ts, t.id))
     active: dict[int, list[Lot]] = {}
     next_lot_id = 0
     method = _cost_basis_method(owner_id)
-    for row in rows:
-        tx_id = row["id"]
-        asset_id = row["asset_id"]
-        tx_type = row["tx_type"]
-        amount = _to_decimal(row["amount_raw"])
+    pairs = _internal_transfer_pairs(txs)
+    pending_moves: dict[int, list[Lot]] = {}
+
+    for tx in txs:
+        asset_id = tx.asset_id
+        amount = _to_decimal(tx.amount_raw)
         decimals = _asset_decimals(asset_id)
         scale = Decimal(10) ** decimals
-        cost_basis = _to_decimal(row["cost_basis_rub"]) if row["cost_basis_rub"] else Decimal(0)
-        fiat_value = _to_decimal(row["fiat_value_rub"]) if row["fiat_value_rub"] else Decimal(0)
 
-        # Перемещение внутри отслеживаемого периметра: актив уже учтён
-        # лотом в месте покупки. Лот здесь открывать нельзя — иначе один
-        # актив будет учтён дважды (лот от покупки и лот от зачисления).
-        if "is_internal" in row.keys() and row["is_internal"]:
+        # Перемещение внутри периметра: актив уже учтён лотом в месте
+        # покупки. Не открываем второй лот, но переносим уже открытый
+        # лот в кошелёк-получатель — иначе /wallet_list покажет его
+        # в старом кошельке.
+        if tx.is_internal:
+            _handle_internal_transfer(tx, active, pairs, pending_moves)
             continue
 
-        if tx_type in TxType.lot_in_types():
+        cost_basis = (
+            _to_decimal(tx.cost_basis_rub) if tx.cost_basis_rub else Decimal(0)
+        )
+        fiat_value = (
+            _to_decimal(tx.fiat_value_rub) if tx.fiat_value_rub else Decimal(0)
+        )
+
+        if tx.tx_type in TxType.lot_in_types():
             # Себестоимость прихода (за 1 единицу актива):
-            cost_total = _lot_cost_total(tx_type, cost_basis, fiat_value)
+            cost_total = _lot_cost_total(tx.tx_type, cost_basis, fiat_value)
             qty_human = amount / scale
-            cost_per_unit = cost_total / qty_human if qty_human > 0 else Decimal(0)
+            cost_per_unit = (
+                cost_total / qty_human if qty_human > 0 else Decimal(0)
+            )
             next_lot_id -= 1  # in-memory id, чтобы не пересекаться с persisted
             active.setdefault(asset_id, []).append(Lot(
                 id=next_lot_id,
                 asset_id=asset_id,
-                acquired_ts=int(row["ts"]),
-                acquired_tx_id=tx_id,
+                acquired_ts=tx.ts,
+                acquired_tx_id=tx.id,
                 qty_remaining=amount,
                 cost_per_unit_rub=cost_per_unit,
-                source=row["source"] or "manual",
+                source=tx.source,
+                wallet_id=tx.wallet_id,
             ))
 
-        elif tx_type in TxType.lot_out_types():
+        elif tx.tx_type in TxType.lot_out_types():
             lots = active.get(asset_id, [])
             _consume_lots_inplace(lots, amount, scale, method)
 
-        # transfer_out намеренно не трогает активы: в MVP считаем, что
-        # обе записи (transfer_in на получателе и transfer_out у отправителя)
-        # вводятся вручную и net-effect нулевой.
+        # transfer_out без пары намеренно не трогает активы: вторая нога
+        # неизвестна, и списание «в никуда» потеряло бы лот.
 
     if persist_balance:
-        with get_db() as conn:
-            conn.execute("DELETE FROM tax_lots WHERE owner_id = ?", (owner_id,))
-            for asset_id, lots in active.items():
-                for lot in lots:
-                    if lot.qty_remaining <= 0:
-                        continue
-                    conn.execute(
-                        """
-                        INSERT INTO tax_lots
-                            (owner_id, asset_id, acquired_ts, acquired_tx_id,
-                             qty_remaining, cost_per_unit_rub, source)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (owner_id, asset_id, lot.acquired_ts, lot.acquired_tx_id,
-                         str(lot.qty_remaining), str(lot.cost_per_unit_rub),
-                         lot.source),
-                    )
+        _persist_lots(owner_id, active)
     return active
 
 
@@ -380,7 +533,7 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
          прибыль.
       3. Подтянуть пропущенные котировки через price_oracle.
       4. Посчитать НДФЛ по прогрессивной шкале.
-      5. Сохранить финальные лоты в tax_lots (persist).
+      5. Сохранить финальные лоты в tax_lots — только для текущего года.
     """
     summary = YearSummary(year=year)
 
@@ -394,20 +547,7 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
             "ORDER BY ts ASC, id ASC",
             (owner_id, year_end),
         ).fetchall()
-    txs = [
-        Tx(
-            id=r["id"], owner_id=r["owner_id"], ts=int(r["ts"]),
-            wallet_id=r["wallet_id"], asset_id=r["asset_id"],
-            tx_type=r["tx_type"], direction=r["direction"],
-            amount_raw=r["amount_raw"],
-            fiat_value_rub=r["fiat_value_rub"],
-            cost_basis_rub=r["cost_basis_rub"],
-            note=r["note"] or "", source=r["source"] or "manual",
-            external_id=r["external_id"],
-            is_internal=(bool(r["is_internal"])
-                         if "is_internal" in r.keys() else False),
-        ) for r in rows
-    ]
+    txs = [_tx_from_row(r) for r in rows]
     txs.sort(key=lambda t: (t.ts, t.id))
 
     asset_cache: dict[int, tuple[str, int]] = {}
@@ -428,6 +568,9 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
     active: dict[int, list[Lot]] = {}
     year_start_ts = _year_start(year)
     method = _cost_basis_method(owner_id)
+    summary.cost_basis = method
+    pairs = _internal_transfer_pairs(txs)
+    pending_moves: dict[int, list[Lot]] = {}
 
     for tx in txs:
         symbol, decimals = get_asset_meta(tx.asset_id)
@@ -437,8 +580,9 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
         tx_year = tx.ts >= year_start_ts
 
         if tx.is_internal:
-            # Перемещение внутри отслеживаемого периметра: актив уже учтён
-            # лотом в месте покупки. Ни лота, ни дохода, ни расхода.
+            # Перемещение внутри периметра: ни дохода, ни расхода, но лот
+            # переезжает в кошелёк-получатель (см. _handle_internal_transfer).
+            _handle_internal_transfer(tx, active, pairs, pending_moves)
             continue
 
         if tx.tx_type in TxType.lot_in_types():
@@ -459,6 +603,7 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
                 qty_remaining=amount_raw,
                 cost_per_unit_rub=cost_per_unit,
                 source=tx.source or "manual",
+                wallet_id=tx.wallet_id,
             ))
 
             if tx_year and tx.tx_type in TxType.taxable_income_types():
@@ -539,8 +684,12 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
 
         # transfer_out намеренно не трогает активы.
 
-    # Сохраняем итоговое состояние лотов в tax_lots.
-    _persist_lots(owner_id, active)
+    # Сохраняем текущий остаток лотов только для отчёта за текущий год.
+    # Отчёт за прошлый год — это срез на старую дату; записав его в
+    # tax_lots, мы бы показали в /wallet_list и /balance исторический
+    # портфель до следующего rebuild_lots.
+    if year == datetime.now(MOSCOW_TZ).year:
+        _persist_lots(owner_id, active)
 
     summary.total_income_rub = _round2(
         sum((e.income_rub for e in summary.income_events), Decimal(0))
@@ -600,11 +749,6 @@ async def compute_year_report(owner_id: int, year: int) -> YearSummary:
     return summary
 
 
-def _year_start(year: int) -> int:
-    return int(time.mktime(time.strptime(f"{year}-01-01 00:00:00",
-                                          "%Y-%m-%d %H:%M:%S")))
-
-
 def _persist_lots(owner_id: int, active: dict[int, list[Lot]]) -> None:
     """Сбросить tax_lots и записать текущий остаток из in-memory."""
     with get_db() as conn:
@@ -617,12 +761,12 @@ def _persist_lots(owner_id: int, active: dict[int, list[Lot]]) -> None:
                     """
                     INSERT INTO tax_lots
                         (owner_id, asset_id, acquired_ts, acquired_tx_id,
-                         qty_remaining, cost_per_unit_rub, source)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                         wallet_id, qty_remaining, cost_per_unit_rub, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (owner_id, asset_id, lot.acquired_ts, lot.acquired_tx_id,
-                     str(lot.qty_remaining), str(lot.cost_per_unit_rub),
-                     lot.source),
+                     lot.wallet_id, str(lot.qty_remaining),
+                     str(lot.cost_per_unit_rub), lot.source),
                 )
 
 
@@ -761,15 +905,13 @@ def _fmt_date(ts: int) -> str:
     return time.strftime("%d.%m.%Y", time.localtime(ts))
 
 
-def _year_end(year: int) -> int:
-    return int(time.mktime(time.strptime(f"{year + 1}-01-01 00:00:00",
-                                    "%Y-%m-%d %H:%M:%S")))
-
-
 def summary_to_dict(summary: YearSummary) -> dict:
     """JSON-кэш отчёта. Для tax_reports.payload."""
     return {
         "year": summary.year,
+        # getattr — на случай duck-typed сводок в тестах и старых
+        # сериализованных объектов без поля cost_basis.
+        "cost_basis": getattr(summary, "cost_basis", "") or "fifo",
         "total_income_rub": str(summary.total_income_rub),
         "total_cost_rub": str(summary.total_cost_rub),
         "realized_gain_rub": str(summary.realized_gain_rub),
@@ -786,31 +928,50 @@ def summary_to_dict(summary: YearSummary) -> dict:
 
 
 def cache_report(owner_id: int, summary: YearSummary) -> None:
+    """Сохранить снапшот отчёта вместе с методом расчёта."""
+    method = getattr(summary, "cost_basis", "") or _cost_basis_method(owner_id)
     with get_db() as conn:
         conn.execute(
             """
-            INSERT INTO tax_reports (owner_id, year, payload, generated_at)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO tax_reports
+                (owner_id, year, cost_basis, payload, generated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(owner_id, year) DO UPDATE SET
+                cost_basis = excluded.cost_basis,
                 payload = excluded.payload,
                 generated_at = CURRENT_TIMESTAMP
             """,
-            (owner_id, summary.year, json.dumps(
+            (owner_id, summary.year, method, json.dumps(
                 summary_to_dict(summary), ensure_ascii=False, default=str)),
         )
 
 
-def load_cached_report(owner_id: int, year: int) -> Optional[dict]:
+def load_cached_report(
+    owner_id: int,
+    year: int,
+    *,
+    expected_method: Optional[str] = None,
+) -> Optional[dict]:
+    """Прочитать снапшот. None — нет отчёта или он посчитан другим методом.
+
+    expected_method защищает от выдачи старого FIFO-снапшота после
+    переключения на WAC: вызывающая сторона явно говорит, какой метод
+    считает актуальным.
+    """
     with get_db() as conn:
         row = conn.execute(
-            "SELECT payload, generated_at FROM tax_reports "
+            "SELECT payload, cost_basis, generated_at FROM tax_reports "
             "WHERE owner_id = ? AND year = ?",
             (owner_id, year),
         ).fetchone()
     if not row:
         return None
+    stored_method = (row["cost_basis"] or "fifo").lower()
+    if expected_method and stored_method != expected_method.lower():
+        return None
     try:
         data = json.loads(row["payload"])
+        data["cost_basis"] = stored_method
         data["generated_at"] = row["generated_at"]
         return data
     except (TypeError, ValueError):

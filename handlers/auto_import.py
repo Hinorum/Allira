@@ -31,6 +31,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ApplicationHandlerStop, ContextTypes
 
 from utils.common import escape_html
+from utils.permissions import owner_id as _owner_id
+from utils.permissions import require_owner as _is_owner_chat
 
 logger = logging.getLogger(__name__)
 
@@ -38,29 +40,7 @@ MAX_REVIEW_ROWS = 6
 MAX_WALLETS_SHOWN = 8
 
 
-def _owner_id(context: ContextTypes.DEFAULT_TYPE) -> int:
-    return int(context.bot_data.get("CRYPTO_OWNER_ID") or 0)
-
-
-async def _is_owner_chat(update: Update,
-                         context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if not update.effective_user:
-        return False
-    user_id = update.effective_user.id
-    creator_ids = context.bot_data.get("CREATOR_USER_IDS") or ()
-    creator_username = (context.bot_data.get("CREATOR_USERNAME")
-                        or "").lstrip("@").lower()
-    username = (update.effective_user.username or "").lower()
-    if creator_ids and user_id not in creator_ids:
-        await update.message.reply_text("Команды доступны только владельцу бота.")
-        return False
-    if not creator_ids and username != creator_username:
-        await update.message.reply_text("Команды доступны только владельцу бота.")
-        return False
-    if not _owner_id(context):
-        await update.message.reply_text("Владелец не настроен.")
-        return False
-    return True
+# Проверки владельца — единые для всех команд, см. utils/permissions.py.
 
 
 # ------------------------------------------------------------- клавиатуры

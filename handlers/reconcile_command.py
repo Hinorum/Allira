@@ -22,6 +22,8 @@ from telegram.ext import ContextTypes
 
 from utils.common import escape_html
 from utils.crypto_db import get_tax_settings
+from utils.permissions import owner_id as _owner_id
+from utils.permissions import require_owner as _is_owner_chat
 from utils.price_oracle import format_rub
 from utils.reconciliation import ReconciliationReport, reconcile
 from utils.report_export import render_reconciliation_xlsx
@@ -29,29 +31,7 @@ from utils.report_export import render_reconciliation_xlsx
 logger = logging.getLogger(__name__)
 
 
-def _owner_id(context: ContextTypes.DEFAULT_TYPE) -> int:
-    return int(context.bot_data.get("CRYPTO_OWNER_ID") or 0)
-
-
-async def _is_owner_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if not update.effective_user:
-        return False
-    user_id = update.effective_user.id
-    creator_ids = context.bot_data.get("CREATOR_USER_IDS") or ()
-    creator_username = (context.bot_data.get("CREATOR_USERNAME") or "").lstrip("@").lower()
-    username = (update.effective_user.username or "").lower()
-    if creator_ids and user_id not in creator_ids:
-        await update.message.reply_text("Команды доступны только владельцу бота.")
-        return False
-    if not creator_ids and username != creator_username:
-        await update.message.reply_text("Команды доступны только владельцу бота.")
-        return False
-    if not _owner_id(context):
-        await update.message.reply_text(
-            "Владелец не настроен. Добавь CRYPTO_OWNER_ID в .env."
-        )
-        return False
-    return True
+# Проверки владельца — единые для всех команд, см. utils/permissions.py.
 
 
 def _parse_year(args) -> int:

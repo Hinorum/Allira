@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Iterable, Optional
@@ -22,6 +21,8 @@ from typing import Iterable, Optional
 from utils.common import normalize_ton_address
 from utils.database import get_db
 from utils.price_oracle import DEFAULT_COINGECKO_IDS
+from utils.tax_period import moscow_year_end as _year_end
+from utils.tax_period import moscow_year_start as _year_start
 
 logger = logging.getLogger(__name__)
 
@@ -708,12 +709,19 @@ def get_tax_settings(owner_id: int) -> dict:
     }
 
 
-def set_tax_settings(owner_id: int, **fields) -> None:
+def set_tax_settings(owner_id: int, **fields) -> bool:
+    """Сохранить настройки. True — если сменился метод расчёта.
+
+    Смена FIFO ↔ WAC меняет себестоимость и прибыль во всех годах, поэтому
+    кэш отчётов владельца сбрасывается: старый снапшот не должен выглядеть
+    как расчёт по новому методу. Возвращаемое значение позволяет хендлеру
+    предупредить пользователя, что прошлые годы будут пересчитаны.
+    """
     allowed = {"taxpayer_inn", "taxpayer_name", "tax_status",
                "cost_basis", "reporting_currency"}
     safe = {k: v for k, v in fields.items() if k in allowed and v is not None}
     if not safe:
-        return
+        return False
     cols = ", ".join(safe.keys())
     placeholders = ", ".join("?" for _ in safe)
     # Значения должны быть и в INSERT, и в DO UPDATE: при первом INSERT
@@ -721,6 +729,14 @@ def set_tax_settings(owner_id: int, **fields) -> None:
     # DO UPDATE значения при создании строки молча терялись бы.
     updates = ", ".join(f"{k}=excluded.{k}" for k in safe)
     with get_db() as conn:
+        old = conn.execute(
+            "SELECT cost_basis FROM tax_settings WHERE owner_id = ?",
+            (owner_id,),
+        ).fetchone()
+        old_method = (old["cost_basis"] if old else None) or "fifo"
+        method_changed = (
+            "cost_basis" in safe and safe["cost_basis"] != old_method
+        )
         conn.execute(
             f"""
             INSERT INTO tax_settings (owner_id, {cols})
@@ -729,6 +745,15 @@ def set_tax_settings(owner_id: int, **fields) -> None:
             """,
             [owner_id, *safe.values()],
         )
+        if method_changed:
+            conn.execute(
+                "DELETE FROM tax_reports WHERE owner_id = ?", (owner_id,)
+            )
+            logger.info(
+                "tax_settings: метод %s → %s, кэш отчётов сброшен",
+                old_method, safe["cost_basis"],
+            )
+    return method_changed
 
 
 def seed_tax_settings(owner_id: int, **fields) -> None:
@@ -754,10 +779,6 @@ def seed_tax_settings(owner_id: int, **fields) -> None:
             """,
             [owner_id, *safe.values()],
         )
-
-
-def _year_start(year: int) -> int:
-    return int(time.mktime(time.strptime(f"{year}-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")))
 
 
 # ------------------------------------------------- расходы, уменьшающие базу
@@ -831,10 +852,6 @@ def total_tax_expenses(owner_id: int, year: int) -> Decimal:
     for r in row:
         total += _to_decimal(r["amount_rub"])
     return total
-
-
-def _year_end(year: int) -> int:
-    return int(time.mktime(time.strptime(f"{year + 1}-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")))
 
 
 def humanize_amount(amount_raw: str, decimals: int) -> str:

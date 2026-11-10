@@ -326,14 +326,23 @@ async def main() -> int:
     check(not allowed, "без настройки владельца доступ закрыт")
 
     # Настроен только username — аккаунт БЕЗ username не проходит.
-    ctx = FakeCtx({"CREATOR_USER_IDS": (), "CREATOR_USERNAME": "hinorum"})
+    ctx = FakeCtx({"CREATOR_USER_IDS": (), "CREATOR_USERNAME": "hinorum",
+                   "CRYPTO_OWNER_ID": 1})
     allowed = await admin_menu._is_owner_chat(FakeUpdate(FakeUser(1, None)), ctx)
     check(not allowed, "аккаунт без username не проходит")
     allowed = await admin_menu._is_owner_chat(FakeUpdate(FakeUser(1, "hinorum")), ctx)
     check(allowed, "владелец по username проходит")
 
+    # Создатель опознан, но учётный владелец не задан: команды, которым
+    # нужен owner_id, должны быть закрыты (иначе работают с owner 0).
+    ctx = FakeCtx({"CREATOR_USER_IDS": (7,), "CREATOR_USERNAME": "",
+                   "CRYPTO_OWNER_ID": 0})
+    allowed = await admin_menu._is_owner_chat(FakeUpdate(FakeUser(7, None)), ctx)
+    check(not allowed, "без CRYPTO_OWNER_ID доступ закрыт")
+
     # Настроен только ID — username не важен.
-    ctx = FakeCtx({"CREATOR_USER_IDS": (7,), "CREATOR_USERNAME": ""})
+    ctx = FakeCtx({"CREATOR_USER_IDS": (7,), "CREATOR_USERNAME": "",
+                   "CRYPTO_OWNER_ID": 7})
     allowed = await admin_menu._is_owner_chat(FakeUpdate(FakeUser(7, None)), ctx)
     check(allowed, "владелец по ID проходит")
     allowed = await admin_menu._is_owner_chat(FakeUpdate(FakeUser(8, None)), ctx)

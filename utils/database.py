@@ -280,20 +280,24 @@ def init_db():
                 FOREIGN KEY (wallet_id) REFERENCES crypto_wallets(id) ON DELETE SET NULL
             );
 
-            -- FIFO-лоты: сколько единиц актива числятся на балансе с какой
-            -- себестоимостью и датой прихода. Реализация выбытия идёт по
-            -- этим лотам; после реализации лот гасится, баланс пересчитывается.
+            -- Лоты (FIFO/WAC): сколько единиц актива числятся на балансе с
+            -- какой себестоимостью и датой прихода. Реализация выбытия идёт
+            -- по этим лотам; после реализации лот гасится, баланс
+            -- пересчитывается. wallet_id нужен для /wallet_list: без него
+            -- запрос по кошелькам показывал общий остаток владельца в каждом.
             CREATE TABLE IF NOT EXISTS tax_lots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 owner_id INTEGER NOT NULL,
                 asset_id INTEGER NOT NULL,
                 acquired_ts INTEGER NOT NULL,
                 acquired_tx_id INTEGER NOT NULL,
+                wallet_id INTEGER,
                 qty_remaining TEXT NOT NULL,
                 cost_per_unit_rub TEXT NOT NULL,
                 source TEXT DEFAULT 'manual',
                 FOREIGN KEY (asset_id) REFERENCES crypto_assets(id),
-                FOREIGN KEY (acquired_tx_id) REFERENCES crypto_transactions(id) ON DELETE CASCADE
+                FOREIGN KEY (acquired_tx_id) REFERENCES crypto_transactions(id) ON DELETE CASCADE,
+                FOREIGN KEY (wallet_id) REFERENCES crypto_wallets(id) ON DELETE SET NULL
             );
 
             -- Исторические курсы в RUB: на дату операции и в текущий момент.
@@ -321,12 +325,14 @@ def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
-            -- Кэш последних сгенерированных отчётов (по сути — снапшоты
-            -- FIFO-расчёта, чтобы /tax повторно не пересчитывал десятки
-            -- тысяч лотов).
+            -- Кэш последних сгенерированных отчётов (снапшоты расчёта,
+            -- чтобы /tax повторно не пересчитывал десятки тысяч лотов).
+            -- cost_basis хранится вместе с payload: после переключения
+            -- FIFO ↔ WAC старый снапшот нельзя выдавать за новый расчёт.
             CREATE TABLE IF NOT EXISTS tax_reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 owner_id INTEGER NOT NULL, year INTEGER NOT NULL,
+                cost_basis TEXT NOT NULL DEFAULT 'fifo',
                 payload TEXT NOT NULL,
                 generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE (owner_id, year)
@@ -404,6 +410,47 @@ def init_db():
         if "comment" not in cols:
             conn.execute("ALTER TABLE marketapp_rent_events ADD COLUMN comment TEXT DEFAULT ''")
             logger.info("Миграция: добавлена колонка comment в marketapp_rent_events")
+
+        # Привязка лота к кошельку: /wallet_list больше не должен показывать
+        # общий остаток владельца в каждом кошельке. Старые лоты привязываем
+        # к кошельку операции, по которой они были открыты.
+        lot_cols = [row["name"] for row in conn.execute(
+            "PRAGMA table_info(tax_lots)")]
+        if "wallet_id" not in lot_cols:
+            conn.execute("ALTER TABLE tax_lots ADD COLUMN wallet_id INTEGER")
+            logger.info("Миграция: добавлена колонка wallet_id в tax_lots")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tax_lots_wallet "
+            "ON tax_lots(owner_id, wallet_id, asset_id)"
+        )
+        if not _migration_done(conn, "backfill_tax_lot_wallet"):
+            conn.execute(
+                """
+                UPDATE tax_lots
+                SET wallet_id = (
+                    SELECT t.wallet_id FROM crypto_transactions t
+                    WHERE t.id = tax_lots.acquired_tx_id
+                )
+                WHERE wallet_id IS NULL
+                """
+            )
+            _mark_migration(conn, "backfill_tax_lot_wallet")
+
+        # В старых снапшотах отчёта не было метода расчёта. После смены
+        # FIFO ↔ WAC их нельзя считать актуальными, поэтому чистим один раз:
+        # отчёт — производные данные, он пересобирается из операций.
+        report_cols = [row["name"] for row in conn.execute(
+            "PRAGMA table_info(tax_reports)")]
+        if "cost_basis" not in report_cols:
+            conn.execute(
+                "ALTER TABLE tax_reports "
+                "ADD COLUMN cost_basis TEXT NOT NULL DEFAULT 'fifo'"
+            )
+            conn.execute("DELETE FROM tax_reports")
+            logger.info(
+                "Миграция: добавлена колонка cost_basis в tax_reports; "
+                "старые снапшоты удалены"
+            )
 
         # Раньше эти два UPDATE по всей таблице аренды гонялись на КАЖДОМ старте
         # и замедляли деплой по мере роста данных. Одноразовый бэкфилл.

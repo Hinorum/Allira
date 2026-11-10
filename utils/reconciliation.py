@@ -32,6 +32,8 @@ from utils.crypto_db import (Chain, Tx, TxType, _to_decimal, list_wallets)
 from utils.database import get_db
 from utils.http_client import get_client
 from utils.price_oracle import get_asset_price_rub
+from utils.tax_period import moscow_year_end as _year_end
+from utils.tax_period import moscow_year_start as _year_start
 
 logger = logging.getLogger(__name__)
 
@@ -655,16 +657,6 @@ async def reconcile(owner_id: int, year: int, config=None,
 
 
 # --------------------------------------------------------------- утилиты
-
-
-def _year_start(year: int) -> int:
-    return int(time.mktime(time.strptime(f"{year}-01-01 00:00:00",
-                                         "%Y-%m-%d %H:%M:%S")))
-
-
-def _year_end(year: int) -> int:
-    return int(time.mktime(time.strptime(f"{year + 1}-01-01 00:00:00",
-                                         "%Y-%m-%d %H:%M:%S")))
 
 
 def report_to_dict(report: ReconciliationReport) -> dict:

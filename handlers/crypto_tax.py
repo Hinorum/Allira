@@ -22,7 +22,6 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
-import time
 from datetime import datetime
 
 from telegram import InputFile, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -32,37 +31,17 @@ from utils.common import escape_html
 from utils.crypto_db import (add_tax_expense, delete_tax_expense,
                              get_tax_settings, list_tax_expenses,
                              set_tax_settings)
+from utils.permissions import owner_id as _owner_id
+from utils.permissions import require_owner as _is_owner_chat
 from utils.price_oracle import format_rub
 from utils.report_export import (render_disposal_csv, render_income_csv,
                                  render_pdf, render_xlsx)
-from utils.tax_calc import cache_report, compute_year_report, load_cached_report
+from utils.tax_calc import cache_report, compute_year_report
 
 logger = logging.getLogger(__name__)
 
 
-def _owner_id(context: ContextTypes.DEFAULT_TYPE) -> int:
-    return int(context.bot_data.get("CRYPTO_OWNER_ID") or 0)
-
-
-async def _is_owner_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if not update.effective_user:
-        return False
-    user_id = update.effective_user.id
-    creator_ids = context.bot_data.get("CREATOR_USER_IDS") or ()
-    creator_username = (context.bot_data.get("CREATOR_USERNAME") or "").lstrip("@").lower()
-    username = (update.effective_user.username or "").lower()
-    if creator_ids and user_id not in creator_ids:
-        await update.message.reply_text("Команды доступны только владельцу бота.")
-        return False
-    if not creator_ids and username != creator_username:
-        await update.message.reply_text("Команды доступны только владельцу бота.")
-        return False
-    if not _owner_id(context):
-        await update.message.reply_text(
-            "Владелец не настроен. Добавь CRYPTO_OWNER_ID или CREATOR_USER_IDS в .env."
-        )
-        return False
-    return True
+# Проверки владельца — единые для всех команд, см. utils/permissions.py.
 
 
 # --------------------------------------------------------- /tax_setup
@@ -110,8 +89,14 @@ async def tax_setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_tax_status(update, context)
         return
 
-    set_tax_settings(_owner_id(context), **payload)
+    method_changed = set_tax_settings(_owner_id(context), **payload)
     await update.message.reply_text("Настройки обновлены.")
+    if method_changed:
+        await update.message.reply_text(
+            "Метод расчёта изменён. Кэш отчётов сброшен, и отчёты за прошлые "
+            "годы при следующем расчёте будут пересчитаны по новому методу. "
+            "Если декларация уже сдана, сверь цифры перед повторной выгрузкой."
+        )
     await _send_tax_status(update, context)
 
 

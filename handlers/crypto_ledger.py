@@ -24,7 +24,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import io
 import logging
 import time
@@ -36,12 +35,13 @@ from telegram.ext import ContextTypes
 
 from utils.common import escape_html
 from utils.crypto_db import (
-    Asset, Chain, CryptoError, Tx, TxType, Wallet,
-    add_transaction, add_wallet, ensure_asset, get_asset, humanize_amount,
+    Asset, Chain, CryptoError, Tx, TxType,
+    add_transaction, add_wallet, ensure_asset, humanize_amount,
     list_transactions, list_wallets,
 )
-from utils.statement_import import parse_statement
 from utils.database import get_db
+from utils.permissions import owner_id as _owner_id
+from utils.permissions import require_owner as _is_owner_chat
 from utils.price_oracle import format_rub, get_asset_price_rub
 from utils.tax_calc import rebuild_lots
 from handlers.tx_wizard import (
@@ -51,42 +51,9 @@ from handlers.tx_wizard import (
 logger = logging.getLogger(__name__)
 
 
-# --------------------------------------------------------- гварды
-
-
-def _owner_id(context: ContextTypes.DEFAULT_TYPE) -> int:
-    return int(context.bot_data.get("CRYPTO_OWNER_ID") or 0)
-
-
-def _deny_no_owner(update: Update) -> bool:
-    """Возвращает True, если owner_id = 0 и пользователю уже ответили."""
-    return False  # гард ниже; см. _is_owner_chat
-
-
-async def _is_owner_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Только ЛС владельца бота: как и message_handler.handle_private_message."""
-    if not update.effective_user:
-        return False
-    user_id = update.effective_user.id
-    creator_ids = context.bot_data.get("CREATOR_USER_IDS") or ()
-    creator_username = (context.bot_data.get("CREATOR_USERNAME") or "").lstrip("@").lower()
-    username = (update.effective_user.username or "").lower()
-    if creator_ids and user_id not in creator_ids:
-        await update.message.reply_text(
-            "Команды крипто-учёта доступны только владельцу бота."
-        )
-        return False
-    if not creator_ids and username != creator_username:
-        await update.message.reply_text(
-            "Команды крипто-учёта доступны только владельцу бота."
-        )
-        return False
-    if not _owner_id(context):
-        await update.message.reply_text(
-            "Владелец не настроен. Добавь CRYPTO_OWNER_ID или CREATOR_USER_IDS в .env."
-        )
-        return False
-    return True
+# Проверки владельца — единые для всех команд, см. utils/permissions.py.
+# Имена _owner_id/_is_owner_chat сохранены как псевдонимы, чтобы не менять
+# десятки вызовов в этом модуле.
 
 
 # --------------------------------------------------------- /wallet_add
@@ -151,6 +118,71 @@ async def wallet_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.warning(f"wallet_add: автосинк не запущен: {e}")
 
 
+def _rows_to_holdings(rows) -> list[tuple[str, Decimal, int]]:
+    out: list[tuple[str, Decimal, int]] = []
+    for r in rows:
+        qty = Decimal(str(r["qty"] or 0)) / (Decimal(10) ** int(r["decimals"]))
+        out.append((r["symbol"], qty, int(r["decimals"])))
+    return out
+
+
+def wallet_holdings(owner_id: int) -> dict[int, list[tuple[str, Decimal, int]]]:
+    """Баланс по кошелькам из tax_lots.
+
+    Вызывать после rebuild_lots(): функция только читает лоты. Раньше
+    запрос джойнил tax_lots по owner_id и показывал общий остаток
+    владельца в каждом кошельке — теперь лот привязан к wallet_id.
+    """
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT l.wallet_id, a.symbol, a.decimals,
+                   COALESCE(SUM(CAST(l.qty_remaining AS REAL)), 0) AS qty
+            FROM tax_lots l
+            JOIN crypto_assets a ON a.id = l.asset_id
+            JOIN crypto_wallets w ON w.id = l.wallet_id
+                                 AND w.owner_id = l.owner_id
+            WHERE l.owner_id = ?
+              AND CAST(l.qty_remaining AS REAL) > 0
+            GROUP BY l.wallet_id, a.id
+            ORDER BY a.symbol
+            """,
+            (owner_id,),
+        ).fetchall()
+    by_wallet: dict[int, list[tuple[str, Decimal, int]]] = {}
+    for r in rows:
+        qty = Decimal(str(r["qty"] or 0)) / (
+            Decimal(10) ** int(r["decimals"])
+        )
+        by_wallet.setdefault(int(r["wallet_id"]), []).append(
+            (r["symbol"], qty, int(r["decimals"]))
+        )
+    return by_wallet
+
+
+def unassigned_holdings(owner_id: int) -> list[tuple[str, Decimal, int]]:
+    """Лоты без живого кошелька: старые записи или удалённый кошелёк."""
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT a.symbol, a.decimals,
+                   COALESCE(SUM(CAST(l.qty_remaining AS REAL)), 0) AS qty
+            FROM tax_lots l
+            JOIN crypto_assets a ON a.id = l.asset_id
+            WHERE l.owner_id = ?
+              AND CAST(l.qty_remaining AS REAL) > 0
+              AND (l.wallet_id IS NULL OR NOT EXISTS (
+                  SELECT 1 FROM crypto_wallets w
+                  WHERE w.id = l.wallet_id AND w.owner_id = l.owner_id
+              ))
+            GROUP BY a.id
+            ORDER BY a.symbol
+            """,
+            (owner_id,),
+        ).fetchall()
+    return _rows_to_holdings(rows)
+
+
 async def wallet_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """`/wallet_list` — все кошельки + текущий баланс из tax_lots."""
     if not await _is_owner_chat(update, context):
@@ -166,34 +198,8 @@ async def wallet_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # Перестроить лоты для баланса.
     rebuild_lots(owner)
-
-    with get_db() as conn:
-        rows = conn.execute(
-            """
-            SELECT w.id, w.label, w.chain, w.address, a.symbol, a.decimals,
-                   COALESCE(SUM(CAST(l.qty_remaining AS REAL)), 0) AS qty
-            FROM crypto_wallets w
-            LEFT JOIN tax_lots l ON l.owner_id = w.owner_id
-                                  AND l.qty_remaining > 0
-            LEFT JOIN crypto_assets a ON a.id = l.asset_id
-            WHERE w.owner_id = ?
-            GROUP BY w.id, a.id
-            ORDER BY w.chain, w.label, a.symbol
-            """,
-            (owner,),
-        ).fetchall()
-
-    # Группируем по кошельку.
-    by_wallet: dict[int, list[tuple[str, Decimal, int]]] = {}
-    wallet_by_id = {w.id: w for w in wallets}
-    for r in rows:
-        if r["symbol"] is None:
-            continue
-        wallet_id = r["id"]
-        qty = Decimal(str(r["qty"] or 0)) / (Decimal(10) ** int(r["decimals"]))
-        by_wallet.setdefault(wallet_id, []).append(
-            (r["symbol"], qty, int(r["decimals"]))
-        )
+    by_wallet = wallet_holdings(owner)
+    unassigned = unassigned_holdings(owner)
 
     lines = ["<b>Мои кошельки:</b>\n"]
     for w in wallets:
@@ -210,16 +216,29 @@ async def wallet_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE
                 lines.append(f"  • {sym}: <b>{qty:.8f}</b>".rstrip("0").rstrip("."))
         lines.append("")
 
+    if unassigned:
+        lines.append("<b>Без привязки к кошельку:</b>")
+        for sym, qty, _dec in unassigned:
+            lines.append(f"  • {sym}: <b>{qty:.8f}</b>".rstrip("0").rstrip("."))
+        lines.append("")
+
     # Суммарный баланс по активам.
     total_by_asset: dict[str, Decimal] = {}
     for holdings in by_wallet.values():
         for sym, qty, _ in holdings:
             total_by_asset[sym] = total_by_asset.get(sym, Decimal(0)) + qty
+    for sym, qty, _ in unassigned:
+        total_by_asset[sym] = total_by_asset.get(sym, Decimal(0)) + qty
     if total_by_asset:
         lines.append("<b>Σ по активам:</b>")
         for sym in sorted(total_by_asset):
             q = total_by_asset[sym]
             lines.append(f"  • {sym}: <b>{q:.8f}</b>".rstrip("0").rstrip("."))
+
+    lines.append(
+        "\n<i>Разбивка по кошелькам расчётная: реализация списывает лоты "
+        "по FIFO/WAC без привязки к кошельку продажи.</i>"
+    )
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -306,7 +325,6 @@ async def addtx_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ts = int(time.time())
     fiat = ""
     cost = ""
-    note_parts: list[str] = []
     extra = args[3:]
     if extra:
         iso_or_ddmm = extra[0]
