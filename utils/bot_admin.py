@@ -116,6 +116,7 @@ def llm_queue_stats() -> dict:
         "active": stats.active,
         "processed": stats.processed,
         "rejected": stats.rejected,
+        "timed_out": stats.timed_out,
         "workers": stats.workers,
         "max_queue": stats.max_queue,
     }

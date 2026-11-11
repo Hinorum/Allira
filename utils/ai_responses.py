@@ -7,7 +7,7 @@ from datetime import datetime
 from cachetools import TTLCache
 from prompts.loader import load_post_prompt
 from utils.http_client import get_client, with_retry
-from utils.llm_queue import QueueFull, llm_queue
+from utils.llm_queue import QueueFull, QueueTimeout, llm_queue
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +171,9 @@ ERR_TECHNICAL = "Технические неполадки! Попробуй е�
 # Очередь запросов переполнена: ждать полчаса бесполезно, лучше сказать
 # прямо и предложить вернуться позже.
 ERR_QUEUE_FULL = "Сейчас очередь запросов переполнена — слишком много одновременных вопросов. Попробуй через минуту."
+# Запрос слишком долго ждал в очереди и был снят, чтобы не держать
+# пользователя в неопределённости.
+ERR_QUEUE_TIMEOUT = "Запрос слишком долго ждал в очереди. Попробуй ещё раз чуть позже."
 
 SERVICE_ERRORS = (
     ERR_RATE_LIMITED,
@@ -179,6 +182,7 @@ SERVICE_ERRORS = (
     ERR_EMPTY_ANSWER,
     ERR_TECHNICAL,
     ERR_QUEUE_FULL,
+    ERR_QUEUE_TIMEOUT,
 )
 
 
@@ -202,6 +206,8 @@ PERSONA_ERRORS: dict[str, dict[str, str]] = {
         ERR_TECHNICAL: "Сбой в матрице. SEGMENTATION FAULT. Попробуй ещё раз. 👾",
         ERR_QUEUE_FULL: "Очередь перебита: слишком много вопросов разом. "
                         "Попробуй через минуту.",
+        ERR_QUEUE_TIMEOUT: "Я слишком долго стояла в очереди и выпала из "
+                           "реальности. Спроси ещё раз. ⏳",
     },
     "lane": {
         ERR_RATE_LIMITED: "...тишина вдруг стала слишком громкой... "
@@ -212,6 +218,8 @@ PERSONA_ERRORS: dict[str, dict[str, str]] = {
         ERR_TECHNICAL: "...что-то сломалось на линии... ещё раз... 🌙",
         ERR_QUEUE_FULL: "...слишком много голосов одновременно... "
                         "подожди, и я отзовусь... 🌱",
+        ERR_QUEUE_TIMEOUT: "...я ждала так долго, что почти растворилась... "
+                           "позови меня снова... 🫧",
     },
 }
 
@@ -279,7 +287,7 @@ async def _call_openrouter(payload: dict, headers: dict, timeout: float = 25.0,
     # страховочный семафор, чтобы запрос не потерялся.
     try:
         return await llm_queue.submit(_do, on_wait=on_queue)
-    except QueueFull:
+    except (QueueFull, QueueTimeout):
         raise
     except Exception:
         async with _llm_semaphore:
@@ -409,9 +417,17 @@ async def get_llm_response(
                         _record_success(m)
                         logger.info(f"Модель {m} работает!")
                         return result
+                    # 200 с пустым content — тоже сбой модели, иначе
+                    # circuit breaker никогда не увидит такие отказы.
+                    logger.warning(f"Модель {m} вернула пустой content")
+                    _record_failure(m)
                 else:
                     logger.warning(f"Модель {m} вернула {resp.status_code}")
                     _record_failure(m)
+            except (QueueFull, QueueTimeout):
+                # Таймаут/переполнение очереди относится ко всему запросу,
+                # а не к конкретной модели: перебирать остальные бессмысленно.
+                raise
             except Exception as e:
                 logger.warning(f"Модель {m} ошибка: {e}")
                 _record_failure(m)
@@ -421,8 +437,19 @@ async def get_llm_response(
     async def _run(imgs: list[str] | None) -> tuple[str | None, str | None]:
         """Один проход по цепочке моделей. Возвращает (ответ, сервисная ошибка)."""
         messages[-1]["content"] = _user_content(imgs)
+
+        # Circuit breaker должен экономить вызов, а не только считать
+        # ошибки: раньше заблокированная основная модель всё равно
+        # вызывалась первой на каждый запрос.
+        if _is_circuit_open(model):
+            logger.warning(
+                f"Модель {model} заблокирована circuit breaker — сразу фолбэки"
+            )
+            fallback = await _try_models(model, imgs)
+            return (fallback, None) if fallback else (None, ERR_NO_MODELS)
+
         resp = await _call_openrouter(payload, headers, timeout=30.0,
-                                         on_queue=on_queue)
+                                      on_queue=on_queue)
 
         if resp.status_code == 429:
             logger.warning("Превышен лимит API")
@@ -474,6 +501,12 @@ async def get_llm_response(
         # Очередь переполнена: ждать бесполезно, лучше честно сказать.
         logger.warning("Очередь LLM переполнена — запрос отклонён")
         return ERR_QUEUE_FULL
+
+    except QueueTimeout:
+        # Запрос ждал дольше MAX_WAIT_SECONDS: пользователь уже ушёл,
+        # отвечать ему через полчаса бессмысленно.
+        logger.warning("Ожидание в очереди LLM истекло — запрос снят")
+        return ERR_QUEUE_TIMEOUT
 
     except Exception as e:
         logger.error(f"Ошибка LLM: {e}")

@@ -116,7 +116,9 @@ async def mark_activity(update: Update,
     без метки, и purge_stale_user_data считал их «неактивными с 1970-го»,
     удаляя состояние посреди диалога.
     """
-    if update.effective_user is None:
+    if update.effective_user is None or context.user_data is None:
+        # В канале и у анонимного админа пользователя нет — хранить
+        # активность негде.
         return
     context.user_data[LAST_SEEN_KEY] = time.time()
 
@@ -129,8 +131,9 @@ def reset_dialog(context: ContextTypes.DEFAULT_TYPE) -> int:
     только историю, другая ещё и answer_overflow.
     """
     turns = len(_get_history(context)) // 2
-    context.user_data.pop(HISTORY_KEY, None)
-    context.user_data.pop(ANSWER_OVERFLOW_KEY, None)
+    if context.user_data is not None:
+        context.user_data.pop(HISTORY_KEY, None)
+        context.user_data.pop(ANSWER_OVERFLOW_KEY, None)
     return turns
 
 
@@ -520,10 +523,15 @@ def _link_context(text: str) -> str:
 
 
 def _get_history(context: ContextTypes.DEFAULT_TYPE) -> list[dict]:
-    history = context.user_data.get(HISTORY_KEY)
+    data = context.user_data
+    if data is None:
+        # Каналы и анонимные админы приходят без пользователя, а значит
+        # и без user_data. Память диалога им недоступна — не падаем.
+        return []
+    history = data.get(HISTORY_KEY)
     if not isinstance(history, list):
         history = []
-        context.user_data[HISTORY_KEY] = history
+        data[HISTORY_KEY] = history
     elif history:
         cutoff = time.time() - HISTORY_TTL
         fresh = [turn for turn in history if turn.get("ts", 0) >= cutoff]
@@ -533,7 +541,8 @@ def _get_history(context: ContextTypes.DEFAULT_TYPE) -> list[dict]:
 
 
 def _append_history(context: ContextTypes.DEFAULT_TYPE, role: str, text: str, speaker: str):
-    if not text or not text.strip():
+    if not text or not text.strip() or context.user_data is None:
+        # Нечего запоминать или негде хранить (канал/анонимный админ).
         return
     history = _get_history(context)
     history.append({
@@ -594,7 +603,7 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
     if user and await is_user_banned(user.id):
         return
 
-    if user:
+    if user and context.user_data is not None:
         # Метка активности: по ней фоновая задача убирает user_data
         # юзеров, которые давно не писали.
         context.user_data[LAST_SEEN_KEY] = time.time()
@@ -698,6 +707,7 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
         except Exception as e:
             logger.debug(f"Не удалось сообщить о позиции в очереди: {e}")
 
+    answered = False
     try:
         # В промпт уходит контекст цитаты и содержимое файла, в историю —
         # исходный текст юзера: иначе реплаи и вложения раздували бы
@@ -731,7 +741,7 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
         # цифра уходит в системный промпт: модель держит конкретное число
         # куда лучше, чем «будь кратко». Если в прошлый раз ответ вылез за
         # сценарий — следующий план жмём сильнее.
-        prev_overflow = int(context.user_data.get(ANSWER_OVERFLOW_KEY) or 0)
+        prev_overflow = int((context.user_data or {}).get(ANSWER_OVERFLOW_KEY) or 0)
         plan = plan_for(text, prev_overflow)
 
         response = await get_llm_response(
@@ -744,17 +754,6 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
             on_queue=on_queue,
         )
 
-        # Уведомление о очереди больше не нужно — убираем, чтобы в чате
-        # не висело «⏳ в очереди» рядом с уже готовым ответом.
-        if queue_notice["id"] is not None:
-            try:
-                await context.bot.delete_message(
-                    chat_id=message.chat_id, message_id=queue_notice["id"],
-                )
-            except Exception:
-                pass
-            queue_notice["id"] = None
-
         # Сервисную ошибку («Слишком много запросов!», «Все модели
         # недоступны») в историю не кладём: она не ответ бота, а заглушка
         # провайдера. Иначе модель в следующем раунде видела свою прошлую
@@ -766,7 +765,8 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
             # увидел юзер: иначе модель считает, что написала длинный
             # ответ, и продолжает в том же духе.
             response, overflow = direct(response, plan)
-            context.user_data[ANSWER_OVERFLOW_KEY] = overflow
+            if context.user_data is not None:
+                context.user_data[ANSWER_OVERFLOW_KEY] = overflow
             _append_history(context, "user", text, speaker)
             _append_history(context, "assistant", response, speaker)
         else:
@@ -777,6 +777,7 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
 
         await _send_answer(update, context, message, response, is_private,
                            speaker)
+        answered = True
 
         chat_type = "private" if is_private else "group"
         await log_message(user.id if user else 0, message.chat_id, chat_type, speaker)
@@ -785,17 +786,40 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, i
     except Exception as e:
         logger.error(f"Ошибка в {'ЛС' if is_private else 'группе'}: {e}")
         # Ошибка — тоже голосом персонажа: «Сбой системы! Попробуй позже.»
-        # звучит как техподдержка и выбивает бота из образа.
-        from utils.ai_responses import ERR_TECHNICAL
-        error_text = persona_service_error(ERR_TECHNICAL, speaker)
-        if is_private:
-            await update.message.reply_text(error_text)
-        else:
-            await message.reply_text(error_text, reply_to_message_id=message.message_id)
+        # звучит как техподдержка и выбивает бота из образа. Если ответ
+        # уже ушёл, второе сообщение об ошибке только сбивает с толку:
+        # сбой счётчика/лога не должен выглядеть как провал ответа.
+        if not answered:
+            from utils.ai_responses import ERR_TECHNICAL
+            error_text = persona_service_error(ERR_TECHNICAL, speaker)
+            try:
+                if is_private:
+                    await update.message.reply_text(error_text)
+                else:
+                    await message.reply_text(error_text, reply_to_message_id=message.message_id)
+            except Exception as send_error:
+                logger.error(f"Не удалось отправить сообщение об ошибке: {send_error}")
 
     finally:
+        # Уведомление о очереди убираем в любом случае: и после ответа,
+        # и после ошибки, иначе «⏳ в очереди» висит в чате навсегда.
+        if queue_notice["id"] is not None:
+            try:
+                await context.bot.delete_message(
+                    chat_id=message.chat_id, message_id=queue_notice["id"],
+                )
+            except Exception:
+                pass
+            queue_notice["id"] = None
+
         typing_stop.set()
         typing_task.cancel()
+        try:
+            await typing_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug(f"Индикатор набора завершился с ошибкой: {e}")
 
 
 # --------------------------------------------------------- вспомогательное

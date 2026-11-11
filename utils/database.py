@@ -766,6 +766,22 @@ async def get_stat(key: str) -> int:
     return await asyncio.to_thread(_sync_get_stat, key)
 
 
+def _sync_set_stat(key: str, value: int):
+    """Записать абсолютное значение счётчика (не приращение)."""
+    with get_db() as conn:
+        conn.execute("""
+            INSERT INTO bot_stats (key, value, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = CURRENT_TIMESTAMP
+        """, (key, int(value)))
+
+
+async def set_stat(key: str, value: int):
+    return await asyncio.to_thread(_sync_set_stat, key, value)
+
+
 def _sync_get_total_users() -> int:
     with get_db() as conn:
         row = conn.execute("SELECT COUNT(*) as cnt FROM users").fetchone()

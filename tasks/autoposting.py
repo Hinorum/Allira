@@ -15,6 +15,7 @@ global) и подставлялся в промпт. Отсюда три про�
 import logging
 import random
 import re
+import time
 import urllib.parse
 from collections import deque
 from io import BytesIO
@@ -24,13 +25,19 @@ from telegram.ext import ContextTypes
 from utils.ai_responses import generate_post_content, is_service_error
 from utils.common import escape_html
 from utils.config import DEFAULT_COLLECTIONS
-from utils.database import increment_stat
+from utils.database import _sync_get_stat, increment_stat, set_stat
 from utils.http_client import get_client
 from utils.market_data import fetch_market_facts
 
 logger = logging.getLogger(__name__)
 
 POLLINATIONS_URL = "https://image.pollinations.ai/prompt"
+
+# Когда последний пост реально ушёл в канал. Без этого после каждого
+# рестарта Render (а на free-плане их бывает много) первый пост уходил
+# через 1-5 минут, и канал получал несколько постов за сутки вместо одного
+# раз в 12-14 часов.
+LAST_POST_STAT = "autopost_last_ts"
 
 # Типы постов. Раньше формат поста не менялся вообще — каждый цикл был
 # «вставь цифры в 3-6 предложений». Теперь крутится и ТЕМА: крипта,
@@ -154,6 +161,26 @@ def sanitize_image_prompt(text: str) -> str:
     return re.sub(r"[^a-zA-ZА-Яа-яЁё0-9\s,-]", "", text or "").strip()
 
 
+def _looks_like_image(data: bytes) -> bool:
+    """Настоящая ли это картинка, а не HTML-страница ошибки с кодом 200.
+
+    Pollinations иногда отвечает 200 и текстом ошибки/заглушкой. Раньше
+    такой ответ уходил в send_photo, Telegram отклонял его, и пост терял
+    картинку уже после лишнего запроса. Проверяем сигнатуру формата.
+    """
+    if not data:
+        return False
+    if data.startswith(b"\xff\xd8\xff"):          # JPEG
+        return True
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):     # PNG
+        return True
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return True
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return True
+    return False
+
+
 async def generate_image(post_text: str, model: str, api_key: str) -> bytes | None:
     from utils.ai_responses import get_llm_response
 
@@ -209,12 +236,16 @@ async def generate_image(post_text: str, model: str, api_key: str) -> bytes | No
     try:
         client = await get_client()
         response = await client.get(url, follow_redirects=True, timeout=60.0)
-        if response.status_code == 200 and len(response.content) > 1000:
-            logger.info(f"Картинка сгенерирована ({len(response.content)} bytes)")
-            return response.content
-        else:
-            logger.warning(f"Pollinations: плохой ответ ({response.status_code})")
-            return None
+        content = response.content or b""
+        content_type = (response.headers.get("content-type") or "без типа").split(";")[0]
+        if response.status_code == 200 and len(content) > 1000 and _looks_like_image(content):
+            logger.info(f"Картинка сгенерирована ({len(content)} bytes, {content_type})")
+            return content
+        logger.warning(
+            f"Pollinations: плохой ответ ({response.status_code}, "
+            f"{content_type}, {len(content)} байт)"
+        )
+        return None
     except Exception as e:
         logger.error(f"Pollinations error: {e}")
         return None
@@ -319,8 +350,12 @@ async def do_autoposting(context: ContextTypes.DEFAULT_TYPE):
                 pass
         return
 
-    # Счётчик — отдельно от отправки: упавший счётчик не должен выглядеть
-    # как провал поста.
+    # Счётчик и метка последнего поста — отдельно от отправки: упавший
+    # счётчик не должен выглядеть как провал поста.
+    try:
+        await set_stat(LAST_POST_STAT, int(time.time()))
+    except Exception as e:
+        logger.warning(f"Не удалось сохранить время последнего поста: {e}")
     try:
         await increment_stat("total_posts")
     except Exception as e:
@@ -334,14 +369,34 @@ def setup_autoposting(application):
             job.schedule_removal()
 
     interval = get_smart_interval()
+
+    # На free-плане Render контейнер засыпает и просыпается. Раньше
+    # `first` всегда был 1-5 минут, поэтому каждый рестарт мог выдать
+    # внеочередной пост. Если прошлый пост был недавно — досчитываем
+    # остаток интервала, а не начинаем цикл заново.
+    first = random.randint(60, 300)
+    try:
+        last_ts = int(_sync_get_stat(LAST_POST_STAT) or 0)
+    except Exception as e:
+        logger.warning(f"Не удалось прочитать время последнего поста: {e}")
+        last_ts = 0
+
+    if last_ts > 0:
+        elapsed = time.time() - last_ts
+        if 0 <= elapsed < interval:
+            first = max(60, int(interval - elapsed))
+
     application.job_queue.run_repeating(
         do_autoposting,
         interval=interval,
-        first=random.randint(60, 300),
+        first=first,
         name="autoposting"
     )
 
     # Раньше здесь была задача wakeup_task с запросом к localhost/health каждые
     # 120с. На Render она бесполезна: засыпание определяется по ВНЕШНЕМУ входящему
     # трафику, а loopback-запрос внутри контейнера его не сбрасывает.
-    logger.info(f"Автопостинг настроен (интервал: {interval//3600}ч)")
+    logger.info(
+        f"Автопостинг настроен (интервал: {interval//3600}ч, "
+        f"первый пост через {max(1, first//60)} мин)"
+    )

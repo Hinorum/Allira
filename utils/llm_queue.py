@@ -43,6 +43,9 @@ WORKERS = 2
 MAX_QUEUE = 32
 
 # Больше этого времени ждать бессмысленно — пользователь уйдёт.
+# Раньше константа была объявлена, но нигде не проверялась: запрос мог
+# висеть в очереди неограниченно долго, пока воркеры заняты медленными
+# вызовами LLM.
 MAX_WAIT_SECONDS = 120
 
 
@@ -53,6 +56,9 @@ class _Job:
     on_wait: Optional[Callable[[int], Awaitable[None]]] = None
     enqueued_at: float = 0.0
     notified: bool = False
+    # Сигнал «воркер забрал задачу». Нужен, чтобы MAX_WAIT_SECONDS
+    # ограничивал только ожидание в очереди, а не время самой модели.
+    started: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 @dataclass
@@ -61,6 +67,7 @@ class QueueStats:
     active: int = 0
     processed: int = 0
     rejected: int = 0
+    timed_out: int = 0
     workers: int = WORKERS
     max_queue: int = MAX_QUEUE
     extra: dict = field(default_factory=dict)
@@ -70,18 +77,25 @@ class QueueFull(Exception):
     """Очередь переполнена — обслужить не скоро."""
 
 
+class QueueTimeout(Exception):
+    """Запрос слишком долго ждал в очереди и был отменён."""
+
+
 class LlmQueue:
     """FIFO-очередь с пулом воркеров."""
 
-    def __init__(self, workers: int = WORKERS, max_queue: int = MAX_QUEUE):
+    def __init__(self, workers: int = WORKERS, max_queue: int = MAX_QUEUE,
+                 max_wait: float = MAX_WAIT_SECONDS):
         self._workers_count = max(1, workers)
         self._max_queue = max_queue
+        self._max_wait = max(0.0, max_wait)
         self._queue: asyncio.Queue = asyncio.Queue()
         self._tasks: list[asyncio.Task] = []
         self._started = False
         self._active = 0
         self._processed = 0
         self._rejected = 0
+        self._timed_out = 0
 
     # ------------------------------------------------------- жизненный цикл
 
@@ -116,6 +130,19 @@ class LlmQueue:
             except (asyncio.CancelledError, Exception):
                 pass
         self._tasks = []
+
+        # Задачи, которые так и не начали выполняться, иначе останутся
+        # висеть с незавершёнными future: при остановке приложения их
+        # никто уже не обслужит.
+        while not self._queue.empty():
+            try:
+                job = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not job.future.done():
+                job.future.cancel()
+            self._queue.task_done()
+
         self._started = False
 
     # ---------------------------------------------------------- обслуживание
@@ -126,6 +153,10 @@ class LlmQueue:
             try:
                 if job.future.done():
                     continue
+                # Забираем задачу в работу — с этого момента MAX_WAIT_SECONDS
+                # больше не действует: ограничение относится только к
+                # ожиданию в очереди, а не к длительности вызова модели.
+                job.started.set()
                 self._active += 1
                 try:
                     result = await job.factory()
@@ -169,6 +200,9 @@ class LlmQueue:
             )
 
         position = self._queue.qsize() + 1
+        deadline = (
+            loop.time() + self._max_wait if self._max_wait > 0 else None
+        )
         job = _Job(
             factory=factory,
             future=future,
@@ -183,6 +217,32 @@ class LlmQueue:
             except Exception as e:
                 logger.debug(f"on_wait не отработал: {e}")
 
+        if deadline is None:
+            return await future
+
+        # MAX_WAIT_SECONDS ограничивает именно ожидание в очереди, а не
+        # сам вызов модели. Без этого пользователь мог ждать за чужими
+        # медленными запросами бесконечно, а с таймаутом на весь вызов
+        # первая же длинная генерация обрывалась бы как «очередь».
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            self._timed_out += 1
+            future.cancel()
+            raise QueueTimeout(
+                f"ожидание в очереди превысило {self._max_wait:.0f} с"
+            )
+        try:
+            await asyncio.wait_for(job.started.wait(), timeout=remaining)
+        except asyncio.TimeoutError:
+            # Задачу ещё никто не взял: отменяем future, чтобы воркер
+            # увидел отмену и не тратил вызов модели на никому не нужный
+            # результат.
+            self._timed_out += 1
+            future.cancel()
+            raise QueueTimeout(
+                f"ожидание в очереди превысило {self._max_wait:.0f} с"
+            )
+
         return await future
 
     # ------------------------------------------------------------- статистика
@@ -193,6 +253,7 @@ class LlmQueue:
             active=self._active,
             processed=self._processed,
             rejected=self._rejected,
+            timed_out=self._timed_out,
             workers=self._workers_count,
             max_queue=self._max_queue,
         )
