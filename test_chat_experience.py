@@ -160,6 +160,25 @@ async def main() -> int:
     check(mh.QUESTION_CHANCE > mh.RESPONSE_CHANCE,
           "На вопрос шанс ответить выше, чем на болтовню")
 
+    # --- 9. Концовка без подписи и готовой цитаты.
+    # Раньше у Лэйн в промпте лежали готовые подписи «в конце значимых
+    # диалогов», и модель ставила их почти в каждое сообщение. Живой
+    # собеседник так не делает: концовка должна продолжать мысль.
+    from prompts.loader import load_prompt
+
+    allira_prompt = load_prompt("allira")
+    lane_prompt = load_prompt("lane")
+    check("Не заканчивай ответ подписью" in allira_prompt,
+          "Аллире запрещено заканчивать подписью", allira_prompt[-300:])
+    check("Не заканчивай ответ подписью" in lane_prompt,
+          "Лэйн запрещено заканчивать подписью", lane_prompt[-300:])
+    check("Твои подписи" not in lane_prompt,
+          "Хардкод подписей Лэйн убран", lane_prompt[-300:])
+    check("▞ Лэйн" not in lane_prompt and "⋯ Lain ⋯" not in lane_prompt,
+          "Готовые подписи не попадают в промпт")
+    check("Не вставляй эти фразы дословно" in allira_prompt,
+          "Аллире запрещено цитировать заготовки")
+
     print()
     if not FAILURES:
         print("OK: ALL CHECKS PASSED")
